@@ -2,7 +2,7 @@
 
 **상위 시스템의 외부 주문을 로봇 임무에 연결하고, 작업 요청부터 실행·결과 회신까지 운영하는 미들웨어 PoC입니다.**
 
-MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기종별 케이퍼빌리티에 맞춰 작업을 수행합니다. 그 사이에는 입력 규격, 실행 버전, 배정 조건, 설비 사용 순서, 중복 요청 및 통신 단절을 처리하는 운영 계층이 필요합니다. picasso-ops는 이 흐름을 [picasso](https://github.com/LivingLikeKrillin/picasso) 기반으로 구현합니다.
+MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기종별 케이퍼빌리티에 맞춰 작업을 수행합니다. 그 사이에는 입력 규격, 실행 버전, 배정 조건, 설비 사용 순서, 중복 요청 및 통신 단절을 처리하는 운영 계층이 필요합니다. picasso-ops는 이 흐름을 [picasso](https://github.com/picasso-robotics/picasso) 기반으로 구현합니다.
 
 현재 스택은 PostgreSQL, picasso registry·mimic, 셀 대역, 실행 호스트, 운영 API, React UI로 구성됩니다. **실제 로봇 하드웨어·PLC·상용 MES 연계는 검증하지 않았습니다.**
 
@@ -60,7 +60,7 @@ MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기
   <img alt="picasso-ops 프로세스 셋, Postgres, site 런처, picasso 서브모듈 연결" src="docs/diagrams/architecture.svg">
 </picture>
 
-Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidence` 응답(스키마 `ops.station.evidence/1`)으로 제공하며, [picasso-narrator](https://github.com/LivingLikeKrillin/picasso-narrator)는 이 응답을 저장한 파일을 읽어 설명할 수 있습니다. 설명은 Ops 상태를 변경하지 않으며, 현재 Ops UI와 자동으로 연결되어 있지 않습니다.
+Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidence` 응답(스키마 `ops.station.evidence/1`)으로 제공하며, [picasso-narrator](https://github.com/picasso-robotics/incident-narrator)는 이 응답을 저장한 파일을 읽어 설명할 수 있습니다. 설명은 Ops 상태를 변경하지 않으며, 현재 Ops UI와 자동으로 연결되어 있지 않습니다.
 
 ## 운영 흐름
 
@@ -100,7 +100,7 @@ Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidenc
 서브모듈을 포함하여 저장소를 복제합니다.
 
 ```bash
-git clone --recurse-submodules https://github.com/LivingLikeKrillin/picasso-ops.git
+git clone --recurse-submodules https://github.com/picasso-robotics/mission-ops.git
 cd picasso-ops
 ```
 
@@ -248,7 +248,7 @@ npx playwright test --config=playwright.station.config.ts
 | UI | 23개 파일·213개 통과, 빌드·린트 통과 |
 | Playwright | 생애주기 1개(7.2분), 별도 스테이션 1개(2.7분) 통과 |
 
-이 기록은 해당 시점의 로컬 실행 결과입니다. 전체 E2E 재검증은 마이그레이션 목록의 오래된 기대값을 수정한 뒤 진행했습니다. 최신 CI 상태는 [Actions](https://github.com/LivingLikeKrillin/picasso-ops/actions)에서 확인하세요.
+이 기록은 해당 시점의 로컬 실행 결과입니다. 전체 E2E 재검증은 마이그레이션 목록의 오래된 기대값을 수정한 뒤 진행했습니다. 최신 CI 상태는 [Actions](https://github.com/picasso-robotics/mission-ops/actions)에서 확인하세요.
 
 ## 개발 방식
 

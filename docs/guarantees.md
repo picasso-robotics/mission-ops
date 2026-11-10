@@ -225,5 +225,5 @@ Ops 의 보류, 재작업, 현장 확인 후 해제, 격리 해제 판단과 스
 - [운영 리허설 절차](runbook.md): 운영 리허설 절차 둘(C1 운영 중 호출 계약 배포 변경과 되돌림, D1 실행 호스트·운영 서비스 재기동과 재개), 단계마다 확인할 곳, 기대하는 결과, 다를 때 할 일, 근거 시험을 설명합니다.
 - [상세 참고 문서: 시험](reference.md#시험): 시험 수와 시험 구성
 - [화면 설계서](screens/screen-design.md): 화면에서 이 상태와 판단이 보이는 자리
-- [picasso 한계 레지스터](https://github.com/LivingLikeKrillin/picasso/blob/3b5d6c5/docs/limits.md): 고정 커밋 `3b5d6c5` 기준 picasso 의 오픈 항목과 한계
-- [picasso ADR 52](https://github.com/LivingLikeKrillin/picasso/blob/3b5d6c5/docs/adr/0052-work-permit-is-a-projection.md): 작업 허가가 안전 계통 상태를 비춘 정보 프로젝션이고 새 로봇 명령만 막는다는 결정(고정 커밋 `3b5d6c5` 기준)
+- [picasso 한계 레지스터](https://github.com/picasso-robotics/picasso/blob/3b5d6c5/docs/limits.md): 고정 커밋 `3b5d6c5` 기준 picasso 의 오픈 항목과 한계
+- [picasso ADR 52](https://github.com/picasso-robotics/picasso/blob/3b5d6c5/docs/adr/0052-work-permit-is-a-projection.md): 작업 허가가 안전 계통 상태를 비춘 정보 프로젝션이고 새 로봇 명령만 막는다는 결정(고정 커밋 `3b5d6c5` 기준)
