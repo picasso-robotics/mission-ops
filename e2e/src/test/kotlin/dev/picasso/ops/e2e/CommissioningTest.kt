@@ -90,7 +90,7 @@ class CommissioningTest {
     fun `제출하면 VALIDATED 로 보이고 같은 문서를 다시 내면 같은 개정판이다`() {
         build = engineer("/api/adapters", """{"vendor":"acme","name":"fleet"}""").let {
             val adapterId = stack.get("/api/adapters")["adapters"].single()["adapterId"].asLong()
-            engineer("/api/adapters/$adapterId/versions", """{"version":"1.0.0","contractSemver":"0.9.0"}""")
+            engineer("/api/adapters/$adapterId/versions", """{"version":"1.0.0","contractSemver":"0.10.0"}""")
             stack.get("/api/adapters")["adapters"].single()["versions"].single()["adapterVersionId"].asLong()
         }
 
@@ -103,7 +103,7 @@ class CommissioningTest {
 
         val profiles = stack.get("/api/profiles")
         assertEquals("OK", profiles["registry"].asText())
-        assertEquals("0.9.0", profiles["catalog"]["contractSemver"].asText())
+        assertEquals("0.10.0", profiles["catalog"]["contractSemver"].asText())
         assertTrue(profiles["catalog"]["skillTypes"].size() > 0, "$profiles")
         profiles["revisions"].forEach { row ->
             assertEquals("VALIDATED", row["revision"]["status"].asText(), "$row")

@@ -13,7 +13,7 @@ test('공유 스테이션은 설비 준비 후 두 미션을 순차 실행하고
  await post('/api/robots',{robotId:'humanoid-01',serialNumber:'HA-0001'})
  await post('/api/adapters',{vendor:'acme',name:'station-fleet'})
  const adapter=(await (await page.request.get('/api/adapters')).json()).adapters.find((row:{name:string})=>row.name==='station-fleet')
- await post(`/api/adapters/${adapter.adapterId}/versions`,{version:'1.0.0',contractSemver:'0.9.0'})
+ await post(`/api/adapters/${adapter.adapterId}/versions`,{version:'1.0.0',contractSemver:'0.10.0'})
  const builds=(await (await page.request.get('/api/adapters')).json()).adapters.find((row:{adapterId:number})=>row.adapterId===adapter.adapterId).versions
  const build=builds[0].adapterVersionId
  const profile=JSON.parse(readFileSync(fileURLToPath(new URL('../../picasso/profile/profiles/humanoid-a.json',import.meta.url)),'utf8'))

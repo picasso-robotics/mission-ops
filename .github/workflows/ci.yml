@@ -11,9 +11,7 @@ permissions:
 # Gradle 과 npm 을 따로 돌린다(스펙 §10). job 이 둘이라 한쪽이 실패해도 다른 쪽이 돈다.
 jobs:
   gradle:
-    # ubuntu-latest(26.04)에서는 서브모듈 카탈로그의 Testcontainers 1.20.4 가 Docker 를 찾지 못한다.
-    # 서브모듈을 1.21.4 이후의 picasso 로 올릴 때 ubuntu-latest 로 되돌린다.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

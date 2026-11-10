@@ -217,6 +217,7 @@ class JudgmentRecordHostTest {
                     listOf(ApprovedStep("pick_place", place, REMEDY)),
                 ),
                 units = emptyList(),
+                cancelRequested = false,
             )
             insertRecord("JO-A", "mw-before", "exec-7", JudgmentRecordWire.encode(record))
 
@@ -256,7 +257,7 @@ class JudgmentRecordHostTest {
     fun `다른 버전의 작업 지시에 선 기록이면 picasso 의 RESUME_RECORD_MISMATCH 거부를 기록 행 번호와 함께 포기로 보고한다`() {
         HostBench().use { bench ->
             insertJournal("JO-1", HUMANOID)
-            val other = JudgmentRecord("JO-1", 2, emptyList(), null, emptyList())
+            val other = JudgmentRecord("JO-1", 2, emptyList(), null, emptyList(), cancelRequested = false)
             val id = insertRecord("JO-1", "mw-before", "exec-7", JudgmentRecordWire.encode(other))
 
             bench.restartHost()
@@ -272,7 +273,7 @@ class JudgmentRecordHostTest {
     fun `판단 기록 표는 고칠 수도 지울 수도 통째로 비울 수도 없다`() {
         HostBench().use { _ ->
             insertJournal("JO-1", HUMANOID)
-            insertRecord("JO-1", "mw-before", "exec-7", JudgmentRecordWire.encode(JudgmentRecord("JO-1", 1, emptyList(), null, emptyList())))
+            insertRecord("JO-1", "mw-before", "exec-7", JudgmentRecordWire.encode(JudgmentRecord("JO-1", 1, emptyList(), null, emptyList(), cancelRequested = false)))
             listOf(
                 "UPDATE mission.execution_judgment_record SET record = 'x'",
                 "DELETE FROM mission.execution_judgment_record",
