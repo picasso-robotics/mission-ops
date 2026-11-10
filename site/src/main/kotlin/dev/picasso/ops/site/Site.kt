@@ -31,6 +31,8 @@ class Site private constructor(
     private val mimic: MimicCli.Started,
     private val cell: SiteCell,
     private val runner: AutoCloseable,
+    /** mimic 의 발행을 registry 로 보내는 연계. 생존 보고와 태스크 관측은 이 연계의 적재 큐를 거쳐 따로 도는 스레드가 보낸다. */
+    private val link: RegistryLink,
     val registryUrl: String,
     val robotIds: Set<String>,
 ) : AutoCloseable {
@@ -55,16 +57,32 @@ class Site private constructor(
      * 셀 대역이 태스크를 훑는다.
      *
      * 시험용으로 남긴다. 이것으로 밀면 가상 시각이 실제 시각보다 앞서며, 그때 실행 호스트도 이 현장의 시계를 써야 한다.
+     *
+     * 민 뒤에는 잠금 밖에서 적재 큐가 빌 때까지 기다린다. picasso 의 `RegistryLink.http` 가 생존 보고를 큐로 보내므로
+     * (picasso §15.210), 기다리지 않으면 돌아온 직후 registry 에 그 보고가 아직 없다.
      */
-    fun advance(by: Duration) = mimic.server.exclusive {
+    fun advance(by: Duration) {
+        mimic.server.exclusive { advanceLocked(by) }
+        drain()
+    }
+
+    /** [target] 이 가상 시각보다 뒤일 때만 그 차이만큼 민다. 같거나 앞이면 아무것도 하지 않는다(되감지 않는다). */
+    fun advanceTo(target: Instant) {
+        mimic.server.exclusive {
+            val now = clock.now()
+            if (target.isAfter(now)) advanceLocked(Duration.between(now, target))
+        }
+        drain()
+    }
+
+    private fun advanceLocked(by: Duration) {
         mimic.server.advance(by)
         cell.scan()
     }
 
-    /** [target] 이 가상 시각보다 뒤일 때만 그 차이만큼 민다. 같거나 앞이면 아무것도 하지 않는다(되감지 않는다). */
-    fun advanceTo(target: Instant) = mimic.server.exclusive {
-        val now = clock.now()
-        if (target.isAfter(now)) advance(Duration.between(now, target))
+    /** 적재 큐가 빌 때까지 기다린다. 제한 안에 못 비우면 그대로 돌아온다 — 큐는 이어서 민다. */
+    private fun drain() {
+        link.drain(DRAIN_TIMEOUT)
     }
 
     /**
@@ -105,7 +123,8 @@ class Site private constructor(
                 cell.close()
             } finally {
                 try {
-                    mimic.server.shutdown()
+                    // 서버를 내리고 적재 큐를 비운다(MimicCli.Started.close).
+                    mimic.close()
                 } finally {
                     if (registry.isActive) registry.close()
                 }
@@ -138,6 +157,8 @@ class Site private constructor(
             // ③ mimic 을 가상 시계로 띄운다. 실시간 시계는 advance 에서 오류를 낸다(스펙 §6 ③).
             // ④ 사이트 id 는 .env 의 SITE_ID 하나에서 온다.
             val err = StringBuilder()
+            // 폴백 디렉터리는 두지 않는다. 생존 보고는 폴백이 없고, S1 은 태스크 관측을 쓰지 않는다.
+            val link = RegistryLink.http(registryUrl, config.ingestToken, config.siteId, null)
             val mimic = try {
                 MimicCli().start(
                     robots = config.roster.associate { it.robotId to config.profile(it) },
@@ -147,16 +168,17 @@ class Site private constructor(
                     virtual = true,
                     seed = 0L,
                     err = err,
-                    // 폴백 디렉터리는 두지 않는다. 생존 보고는 폴백이 없고, S1 은 태스크 관측을 쓰지 않는다.
-                    link = RegistryLink.http(registryUrl, config.ingestToken, config.siteId, null),
+                    link = link,
                     broker = null,
                     site = config.siteId,
                 )
             } catch (e: Exception) {
+                link.close()
                 registry.close()
                 throw e
             }
             if (mimic == null) {
+                link.close()
                 registry.close()
                 error("mimic 기동 거부: $err")
             }
@@ -167,7 +189,7 @@ class Site private constructor(
             val cell = try {
                 SiteCell(mimic, config.cell, config.cellPort)
             } catch (e: Exception) {
-                mimic.server.shutdown()
+                mimic.close()
                 registry.close()
                 throw e
             }
@@ -182,12 +204,12 @@ class Site private constructor(
                 ).start(RUNNER_INTERVAL)
             } catch (e: Exception) {
                 cell.close()
-                mimic.server.shutdown()
+                mimic.close()
                 registry.close()
                 throw e
             }
             // ⑧ 가상 시계를 실제 시각까지 한 번 민다(S3a 스펙 §6.1). 한 번에 크게 밀어도 된다(MimicServer.advance).
-            val site = Site(registry, mimic, cell, runner, registryUrl, mimic.robotIds)
+            val site = Site(registry, mimic, cell, runner, link, registryUrl, mimic.robotIds)
             try {
                 site.advanceTo(Instant.now())
             } catch (e: Exception) {
@@ -199,6 +221,9 @@ class Site private constructor(
 
         /** 실행기 이름. 시험 결과의 실행 주체로 화면에 보인다. */
         const val RUNNER_NAME = "site-runner"
+
+        /** [advance] 뒤 적재 큐를 기다리는 최대 시간(실제 시간). 적재 요청 하나의 제한(연결 2초 + 요청 3초)보다 길게 둔다. */
+        val DRAIN_TIMEOUT: Duration = Duration.ofSeconds(10)
 
         /** 실행기의 폴링 간격(실제 시간). */
         val RUNNER_INTERVAL: Duration = Duration.ofSeconds(1)

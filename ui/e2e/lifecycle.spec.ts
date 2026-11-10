@@ -94,7 +94,7 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   const build = page.getByRole('form', { name: '빌드 선언' })
   await build.getByLabel('제품').selectOption('acme/fleet')
   await build.getByLabel('버전').fill('1.0.0')
-  await build.getByLabel('계약 semver').fill('0.9.0')
+  await build.getByLabel('계약 semver').fill('0.10.0')
   await build.getByRole('button', { name: '빌드 선언' }).click()
   await expect(page.getByText('acme/fleet 1.0.0 빌드 선언: 반영됨', { exact: true })).toBeVisible()
 
