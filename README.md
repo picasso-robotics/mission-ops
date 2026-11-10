@@ -101,7 +101,7 @@ Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidenc
 
 ```bash
 git clone --recurse-submodules https://github.com/picasso-robotics/mission-ops.git
-cd picasso-ops
+cd mission-ops
 ```
 
 복제한 뒤 서브모듈을 초기화하고 갱신합니다.
