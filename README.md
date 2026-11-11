@@ -1,8 +1,8 @@
-# picasso-ops
+# mission-ops
 
 **상위 시스템의 외부 주문을 로봇 임무에 연결하고, 작업 요청부터 실행·결과 회신까지 운영하는 미들웨어 PoC입니다.**
 
-MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기종별 케이퍼빌리티에 맞춰 작업을 수행합니다. 그 사이에는 입력 규격, 실행 버전, 배정 조건, 설비 사용 순서, 중복 요청 및 통신 단절을 처리하는 운영 계층이 필요합니다. picasso-ops는 이 흐름을 [picasso](https://github.com/picasso-robotics/picasso) 기반으로 구현합니다.
+MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기종별 케이퍼빌리티에 맞춰 작업을 수행합니다. 그 사이에는 입력 규격, 실행 버전, 배정 조건, 설비 사용 순서, 중복 요청 및 통신 단절을 처리하는 운영 계층이 필요합니다. mission-ops는 이 흐름을 [picasso](https://github.com/picasso-robotics/picasso) 기반으로 구현합니다.
 
 현재 스택은 PostgreSQL, picasso registry·mimic, 셀 대역, 실행 호스트, 운영 API, React UI로 구성됩니다. **실제 로봇 하드웨어·PLC·상용 MES 연계는 검증하지 않았습니다.**
 
@@ -57,10 +57,10 @@ MES·WMS 같은 상위 시스템은 외부 주문을 전달하고, 로봇은 기
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture.dark.svg">
-  <img alt="picasso-ops 프로세스 셋, Postgres, site 런처, picasso 서브모듈 연결" src="docs/diagrams/architecture.svg">
+  <img alt="mission-ops 프로세스 셋, Postgres, site 런처, picasso 서브모듈 연결" src="docs/diagrams/architecture.svg">
 </picture>
 
-Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidence` 응답(스키마 `ops.station.evidence/1`)으로 제공하며, [picasso-narrator](https://github.com/picasso-robotics/incident-narrator)는 이 응답을 저장한 파일을 읽어 설명할 수 있습니다. 설명은 Ops 상태를 변경하지 않으며, 현재 Ops UI와 자동으로 연결되어 있지 않습니다.
+Ops는 공유 스테이션 실행 근거를 `GET /api/stations/runs/{id}/evidence` 응답(스키마 `ops.station.evidence/1`)으로 제공하며, [incident-narrator](https://github.com/picasso-robotics/incident-narrator)는 이 응답을 저장한 파일을 읽어 설명할 수 있습니다. 설명은 Ops 상태를 변경하지 않으며, 현재 Ops UI와 자동으로 연결되어 있지 않습니다.
 
 ## 운영 흐름
 

@@ -1,4 +1,4 @@
-# picasso-ops 화면 설계서
+# mission-ops 화면 설계서
 
 문서 기준은 picasso-ops `main` = `bb1d8b5`(PR #23 머지, 2026-10-13), 서브모듈 picasso = `74e4d3d` 입니다. 이 문서는 지금 화면을 기술합니다. 리터치는 끝났고 지금 UI 가 최종입니다. 스크린숏 21장은 `img/` 에 있고, 목록은 `img/INDEX.md` 에 있습니다. 표기에서 «…» 는 화면·코드 글자 그대로이며, `${…}` 는 값이 끼워지는 자리입니다. 파일 위치는 따로 적지 않으면 `ui/src/components/` 기준입니다. `App.tsx`, `api.ts`, `areas.ts`, `labels.ts`, `poll.ts`, `jobOrderDraft.ts`, `manualRequests.ts`, `missionTemplates.ts`, `styles.css` 는 `ui/src/` 바로 아래에 있습니다. 행 번호는 적지 않고 파일 이름까지만 적습니다.
 
@@ -16,7 +16,7 @@
 
 ### 1.1 무엇인가
 
-picasso-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 연결하고, 작업 요청부터 실행·결과 회신까지 운영하는 미들웨어 PoC 입니다(저장소 `README.md` 첫 줄). 스택 구성은 다음과 같습니다.
+mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 연결하고, 작업 요청부터 실행·결과 회신까지 운영하는 미들웨어 PoC 입니다(저장소 `README.md` 첫 줄). 스택 구성은 다음과 같습니다.
 - PostgreSQL
 - picasso registry·mimic
 - 셀 대역

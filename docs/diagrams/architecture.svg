@@ -16,8 +16,8 @@
   <g font-family="'Helvetica Neue', Helvetica, Arial, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', 'Noto Sans CJK KR', sans-serif" fill="#262626">
 
     <!-- title block -->
-    <text x="20" y="36" font-size="17" font-weight="700" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace">picasso-ops</text>
-    <text x="20" y="56" font-size="12" fill="#6f6f6f">picasso-ops 프로세스 구성과 연계 구조</text>
+    <text x="20" y="36" font-size="17" font-weight="700" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace">mission-ops</text>
+    <text x="20" y="56" font-size="12" fill="#6f6f6f">mission-ops 프로세스 구성과 연계 구조</text>
 
     <!-- row A: external caller, screen, external reader -->
     <rect x="48" y="84" width="200" height="52" fill="#ffffff" stroke="#bdbdbd"/>
@@ -27,7 +27,7 @@
     <text x="332" y="107" font-size="12.5" font-weight="700" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace">ui :5173</text>
     <text x="332" y="123" font-size="11" fill="#6f6f6f">9개 메뉴 운영 화면과 API 프록시</text>
     <rect x="616" y="84" width="184" height="52" fill="#ffffff" stroke="#bdbdbd"/>
-    <text x="628" y="107" font-size="12" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace">picasso-narrator</text>
+    <text x="628" y="107" font-size="12" font-family="Menlo, Consolas, 'DejaVu Sans Mono', monospace">incident-narrator</text>
     <text x="628" y="123" font-size="11" fill="#6f6f6f">근거 응답 파일 읽기와 설명 생성</text>
 
     <!-- row B: ops-service -->
