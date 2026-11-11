@@ -474,6 +474,10 @@ class WorkRequestsTest {
   }
   // 출처는 결과 모양과 따로 돈다: 모양마다 상위 출처 행이 있어야 «최신이 확인된 이전 미확인 버전» 이 필터에 닿는다.
   assertEquals(setOf(0,1,2,3,4,5),(1..84).filter{sources[(it/6)%3]!="ops:manual"}.map{it%6}.toSet())
+  // LIKE wildcards and the escape character in ids: the search must take them literally, as strpos did.
+  for((n,ext) in listOf("EXT_%A","EXT\\B","EXT%C_").withIndex()) jdbc.sql("""INSERT INTO ops.work_request(receipt_id,source_system_id,external_order_id,payload_hash,payload,job_order_id,state,received_at,updated_at)
+    VALUES(:id,'mock-mes',:ext,'h','{}'::jsonb,:job,'ACCEPTED',timestamptz '2026-10-15 00:00:00+00'+:n*interval '1 second',now())""")
+   .param("id",UUID.nameUUIDFromBytes("wild-$n".toByteArray())).param("ext",ext).param("job","JO-W$n").param("n",n).update()
   fun before(search:String,state:String?,offset:Int,limit:Int,result:String?):Pair<Long,List<String>> {
    val stateFilter=if(state=="NEEDS_CONFIRMATION") "state IN ('RECEIVED','DISPATCHING','IN_DOUBT')" else "(:state IS NULL OR state=:state)"
    val resultFilter=if(result=="unacknowledged") " AND source_system_id NOT LIKE 'ops:%' AND (SELECT acknowledged_at IS NULL FROM ops.work_result WHERE receipt_id=ops.work_request.receipt_id ORDER BY version DESC LIMIT 1)" else ""
@@ -483,13 +487,18 @@ class WorkRequestsTest {
     q("SELECT receipt_id FROM ops.work_request WHERE $where ORDER BY received_at DESC,receipt_id LIMIT :limit OFFSET :offset").param("limit",limit).param("offset",offset).query(String::class.java).list()
   }
   var compared=0
-  for(search in listOf("","EXT-1","JO-7","ops:","mes","none")) for(state in listOf(null,"ACCEPTED","IN_DOUBT","WAITING_RESOURCE","NEEDS_CONFIRMATION")) for(result in listOf(null,"unacknowledged")) for((offset,limit) in listOf(0 to 100,5 to 7,30 to 20)) {
+  val searches=listOf("","EXT-1","JO-7","ops:","mes","none","%","_","\\","T_%","T%C","EXT%","X_B","T\\B")
+  // Both page plans: reading and sorting the narrowed matches (default threshold) and walking the received-at index (threshold 0).
+  for(threshold in listOf(service.narrowPageRows,0L)) for(search in searches) for(state in listOf(null,"ACCEPTED","IN_DOUBT","WAITING_RESOURCE","NEEDS_CONFIRMATION")) for(result in listOf(null,"unacknowledged")) for((offset,limit) in listOf(0 to 100,5 to 7,30 to 20)) {
+   service.narrowPageRows=threshold
    val now=service.list(search,state,offset,limit,result)
    @Suppress("UNCHECKED_CAST") val ids=(now["requests"] as List<Receipt>).map{it.receiptId.toString()}
-   assertEquals(before(search,state,offset,limit,result),now["total"] as Long to ids,"search=$search state=$state result=$result offset=$offset")
+   assertEquals(before(search,state,offset,limit,result),now["total"] as Long to ids,"threshold=$threshold search=$search state=$state result=$result offset=$offset")
    compared++
   }
-  assertEquals(6*5*2*3,compared)
+  service.narrowPageRows=1000L
+  assertEquals(2*searches.size*5*2*3,compared)
+  assertEquals(3L,service.list("EXT",null,0,100)["total"].let{it as Long}-service.list("EXT-",null,0,100)["total"].let{it as Long})
   assertTrue(before("",null,0,100,"unacknowledged").first>0)
   val pendingBefore=jdbc.sql("""SELECT count(*) FROM ops.work_request r JOIN LATERAL
    (SELECT acknowledged_at FROM ops.work_result WHERE receipt_id=r.receipt_id ORDER BY version DESC LIMIT 1) v ON true

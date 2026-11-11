@@ -241,9 +241,12 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         val exists = jdbc.sql("SELECT count(*) FROM mission.result_outbox WHERE instance_id=:instance AND response_id=:response")
             .param("instance",instance).param("response",responseId).query(Long::class.java).single() > 0
         if (exists) return
-        val sequence = jdbc.sql("UPDATE mission.result_producer SET last_sequence=last_sequence+1 WHERE singleton RETURNING last_sequence").query(Long::class.java).single()
-        jdbc.sql("INSERT INTO mission.result_outbox(sequence,instance_id,response_id,snapshot) VALUES(:sequence,:instance,:response,CAST(:snapshot AS JSONB))")
-            .param("sequence",sequence).param("instance",instance).param("response",responseId).param("snapshot",snapshot.toString()).update()
+        // The counter step and the outbox row in one statement (one round trip per result in the pump's transaction; HA design §10).
+        val inserted = jdbc.sql(
+            "WITH next AS (UPDATE mission.result_producer SET last_sequence=last_sequence+1 WHERE singleton RETURNING last_sequence) " +
+                "INSERT INTO mission.result_outbox(sequence,instance_id,response_id,snapshot) SELECT last_sequence,:instance,:response,CAST(:snapshot AS JSONB) FROM next",
+        ).param("instance",instance).param("response",responseId).param("snapshot",snapshot.toString()).update()
+        check(inserted == 1) { "result_producer row missing" }
     }
 
     fun resultEvents(after: Long, limit: Int): Map<String,Any> {
@@ -482,6 +485,25 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             WHERE job_order_id = :jobOrderId AND disposition = 'SENT' ORDER BY log_id DESC LIMIT 1
             """.trimIndent(),
         )
+            .param("jobOrderId", jobOrderId)
+            .query { rs, _ -> logRow(rs) }
+            .optional()
+            .orElse(null)
+
+    /**
+     * The row a restart duplicate is judged against, in one statement: the job order's latest sent row ([lastSent]) when [instanceId]
+     * has no row for the job order yet ([loggedIn] false), otherwise `null`. The pump calls this once per response.
+     */
+    fun firstResponseBasis(instanceId: String, jobOrderId: String): ResponseLogRow? =
+        jdbc.sql(
+            """
+            SELECT $LOG_COLUMNS FROM mission.job_response_log
+            WHERE job_order_id = :jobOrderId AND disposition = 'SENT'
+              AND NOT EXISTS (SELECT 1 FROM mission.job_response_log WHERE instance_id = :instanceId AND job_order_id = :jobOrderId)
+            ORDER BY log_id DESC LIMIT 1
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
             .param("jobOrderId", jobOrderId)
             .query { rs, _ -> logRow(rs) }
             .optional()
@@ -855,6 +877,31 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .param("record", record)
             .query { rs, _ -> recordRow(rs) }
             .single()
+
+    /** A judgment record to write: (job order, execution, record text). */
+    data class JudgmentRecordWrite(val jobOrderId: String, val executionId: String, val record: String)
+
+    /**
+     * [judgmentRecord] for several rows in one statement, in the order given (record ids follow it). The pump writes every changed
+     * record of one pump this way, one round trip instead of one per execution (HA design §10).
+     */
+    fun judgmentRecords(instanceId: String, wireVersion: String, rows: List<JudgmentRecordWrite>) {
+        if (rows.isEmpty()) return
+        val written = jdbc.sql(
+            """
+            INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record)
+            SELECT x.job_order_id, :instanceId, x.execution_id, :wireVersion, x.record
+            FROM ROWS FROM (jsonb_to_recordset(CAST(:rows AS jsonb)) AS (job_order_id text, execution_id text, record text))
+                WITH ORDINALITY AS x(job_order_id, execution_id, record, ord)
+            ORDER BY x.ord
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("wireVersion", wireVersion)
+            .param("rows", json.writeValueAsString(rows.map { mapOf("job_order_id" to it.jobOrderId, "execution_id" to it.executionId, "record" to it.record) }))
+            .update()
+        check(written == rows.size) { "judgment records written $written of ${rows.size}" }
+    }
 
     /** 그 작업 지시의 가장 최근 판단 기록(인스턴스 무관). 없으면 `null` 이다. 기동 복원이 `resume` 에 넘긴다. */
     fun latestJudgmentRecord(jobOrderId: String): JudgmentRecordRow? =

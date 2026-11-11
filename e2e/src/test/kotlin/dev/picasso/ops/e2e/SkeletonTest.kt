@@ -53,7 +53,7 @@ class SkeletonTest {
         val versions = PostgresSupport.queryAll(
             "SELECT version FROM ops.flyway_schema_history WHERE success AND version IS NOT NULL ORDER BY installed_rank",
         ) { it.getString(1) }
-        assertEquals((1..23).map(Int::toString), versions)
+        assertEquals((1..24).map(Int::toString), versions)
         assertEquals(0, stack.get("/api/operations").size())
     }
 

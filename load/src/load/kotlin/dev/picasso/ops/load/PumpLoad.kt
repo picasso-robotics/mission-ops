@@ -27,7 +27,9 @@ object PumpLoad {
         val idle = mutableListOf<List<String>>()
         val stmtDetails = mutableListOf<Pair<String, List<Stmt>>>()
         val combined = mutableListOf<List<String>>()
-        for (plan in plans) LoadStack(robots = plan.robots, withOps = combinedStations > 0 && plan == plans.last()).use { stack ->
+        val gc = mutableListOf<List<String>>()
+        val wall = WallSampler()
+        for (plan in plans) GcPauses().use { pauses -> LoadStack(robots = plan.robots, withOps = combinedStations > 0 && plan == plans.last()).use { stack ->
             report.floor(stack, "세트(기체 ${plan.robots})")
             val host = stack.missionHost
             host.close()
@@ -60,12 +62,12 @@ object PumpLoad {
                         stack.mimic.server.advance(Duration.ofSeconds(5))
                         repeat(2) {
                             Thread.sleep(20)
-                            activePumps.time { host.pumpOnce() }
+                            activePumps.time { wall.during(plan.robots) { host.pumpOnce() } }
                             pumps++
                         }
                     }
                     // 정착 뒤 기록(응답 기록·정착 이벤트)이 마저 적히게 한 번 더
-                    activePumps.time { host.pumpOnce() }
+                    activePumps.time { wall.during(plan.robots) { host.pumpOnce() } }
                     pumps++
                     activeStmts += stats.read().calls()
                     activeCount += pumps
@@ -105,10 +107,18 @@ object PumpLoad {
                 val (r, _) = StationTickLoad.measure(stack, combinedStations, listOf("active"), combinedRounds, " (호스트 종결 실행 $order)") { host.pumpOnce() }
                 combined += r
             }
-        }
+            gc += listOf("${plan.robots}", "${pauses.maxMs()}")
+        } }
+        wall.close()
         report.line("### 일하는 pump (주기 안의 모든 pumpOnce)")
         report.line()
         report.table(listOf("기체 M", "실행 수 구간", "pump 수", "p50 ms", "p95 ms", "max ms", "DB 문장/pump"), active)
+        report.line("### 일하는 pump 의 벽시계 표본 (2 ms 마다, `WallSampler`)")
+        report.line()
+        report.table(listOf("기체 M", "단계", "표본", "비율 %"), wall.rows())
+        report.line("### 세트마다 가장 긴 GC 정지 (G1 동시 주기 제외)")
+        report.line()
+        report.table(listOf("기체 M", "최대 GC 정지 ms"), gc)
         report.line("### idle pump 와 크기")
         report.line()
         report.table(
