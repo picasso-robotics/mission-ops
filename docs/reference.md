@@ -668,7 +668,7 @@ cd ui && npx playwright test -c playwright.screens.config.ts
 - 종결: 실행이 종료 상태에 도달함을 뜻합니다. 일지 이벤트 `SETTLED`는 `PHYSICALLY_DONE`, `UNVERIFIED`, `FAILED`, `ABORTED`에만 기록되며, `PARTIAL`은 제외됩니다. `PARTIAL`은 미들웨어가 계속 돌리므로(`pumps`) 종결로 적지 않고 판정에서 기체를 쥔 것으로 봅니다. 운영자가 취소한 `PARTIAL`은 다음 pump에 `ABORTED`로 종결해 `SETTLED`(사유 `ABORTED`)가 적힙니다. 종결을 적는 같은 트랜잭션에서 잔여 파지 표시가 설 수 있습니다.
 - 봉인: 라운드 종료 시 `sealIncidents`로 인시던트를 확정하는 작업입니다. `unresolved`는 봉인 시점에 단위가 OPERATOR_HOLD 또는 IN_DOUBT였는지를 나타내는 칸이며, 봉인 뒤에는 그 값을 유지합니다(picasso `docs/glossary.md` 206행).
 - 근거 등급: E2는 셀 슬롯 관측 근거로 확인된 등급이고, E0은 판단 기록 없이 복원한 앞선 단위 등과 같이 설비 근거가 없는 등급입니다(판단 기록이 있으면 기록의 근거 등급 그대로).
-- P/S: P는 picasso 저장소 단계, S는 picasso-ops 단계를 뜻합니다.
+- P/S: P는 picasso 저장소 단계, S는 mission-ops 단계를 뜻합니다.
 - 인스턴스(`instanceId`): 실행 호스트를 기동할 때마다 새로 생성되는 `Middleware`이며, `exec-N`, `resp-N`, `incident-N` 식별자는 1부터 시작합니다. 운영 서비스 인스턴스(`ops-<UUID>`, 운영 서비스 프로세스마다 새로)도 있습니다. 두 인스턴스 모두 심장박동을 적습니다(실행 호스트 `mission.host_instance`, 운영 서비스 `ops.service_instance`). 살아 있음은 행이 있고 멈춤(`stopped_at`)이 없으며 만료(`expires_at`)가 DB 시각보다 뒤인 것입니다. 리스가 아닙니다.
 - 작업 요청(`work_request`): 외부 주문, 호출 계약 호출, 화면 수동 요청이 운영 서비스에 남기는 영속 기록입니다. 작업 지시 id는 `JO-<작업 요청 id>`입니다.
 - 스테이션 작업(`station_run`): 공유 스테이션 하나를 차례로 점유하는 단위입니다. 필수 자원 경로에서는 작업 요청과 같은 id입니다.
