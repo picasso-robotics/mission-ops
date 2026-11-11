@@ -1336,8 +1336,11 @@ class MissionHost(
         try {
             records.inTransaction {
                 marked.clear()
-                // 판단 기록을 송신 기록과 같이 커밋한다. 상위가 받은 응답의 판정은 기록에도 있다.
-                judgments.forEach { (execution, text) -> writeRecord(execution, text) }
+                // 판단 기록을 송신 기록과 같이 커밋한다. 상위가 받은 응답의 판정은 기록에도 있다. 이 pump 의 것을 한 문장으로 적는다.
+                records.judgmentRecords(
+                    instanceId, JudgmentRecordWire.SCHEMA_VERSION,
+                    judgments.map { (execution, text) -> HostRecords.JudgmentRecordWrite(execution.order.jobOrderId, execution.executionId, text) },
+                )
                 pending.forEach(::logResponse)
                 copies.forEach { (bundle, detail) ->
                     records.copyIncident(instanceId, bundle.incidentId, bundle.executionId, bundle.jobOrderId, bundle.unitId, detail)
@@ -1447,7 +1450,7 @@ class MissionHost(
 
     private fun logResponse(response: JobResponse) {
         val content = contentOf(response)
-        val duplicate = !records.loggedIn(instanceId, response.jobOrderId) && records.lastSent(response.jobOrderId)?.content == content
+        val duplicate = records.firstResponseBasis(instanceId, response.jobOrderId)?.content == content
         records.logResponse(
             instanceId, response.jobResponseId, response.executionId, content,
             if (duplicate) ResponseDisposition.RESTART_DUPLICATE else ResponseDisposition.SENT,

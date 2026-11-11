@@ -451,23 +451,31 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
  fun get(id:UUID,source:String?=null):Receipt = jdbc.sql("SELECT * FROM ops.work_request WHERE receipt_id=:id AND (:source IS NULL OR source_system_id=:source)")
   .param("id",id).param("source",source,java.sql.Types.VARCHAR).query(::row).optional()
   .orElseThrow { RequestRejected("RECEIPT_NOT_FOUND","작업 요청을 찾을 수 없습니다",404) }
+ /** Up to this many rows matching a search, the list page reads and sorts the matches instead of walking the received-at index. Tests lower it. */
+ internal var narrowPageRows=1000L
  fun list(search:String, state:String?, offset:Int, limit:Int, result:String?=null):Map<String,Any> {
   if(search.length>160 || offset<0 || limit !in 1..100 || state!=null && state !in STATES && state!="NEEDS_CONFIRMATION" || result!=null && result!="unacknowledged") throw RequestRejected("BAD_FILTER","조회 조건이 잘못되었습니다")
   // Only the filters asked for: an empty search matches every row, and a fixed state predicate can use the state index.
   val filters=buildList {
    if(state=="NEEDS_CONFIRMATION") add("state IN ('RECEIVED','DISPATCHING','IN_DOUBT')") else if(state!=null) add("state=:state")
-   if(search.isNotEmpty()) add("(strpos(external_order_id,:search)>0 OR strpos(job_order_id,:search)>0 OR strpos(source_system_id,:search)>0)")
+   // A substring match through the trigram indexes (V24). LIKE with the search escaped matches the rows strpos matched.
+   if(search.isNotEmpty()) add("(external_order_id LIKE :search OR job_order_id LIKE :search OR source_system_id LIKE :search)")
    if(result=="unacknowledged") add("source_system_id NOT LIKE 'ops:%' AND EXISTS($UNACKNOWLEDGED_LATEST AND u.receipt_id=ops.work_request.receipt_id)")
   }
   val where=if(filters.isEmpty()) "" else " WHERE "+filters.joinToString(" AND ")
   fun query(sql:String):JdbcClient.StatementSpec {
    var statement=jdbc.sql(sql)
-   if(search.isNotEmpty()) statement=statement.param("search",search)
+   if(search.isNotEmpty()) statement=statement.param("search",containing(search))
    if(state!=null && state!="NEEDS_CONFIRMATION") statement=statement.param("state",state)
    return statement
   }
   val count=query("SELECT count(*) FROM ops.work_request$where").query(Long::class.java).single()
-  val rows=query("SELECT * FROM ops.work_request$where ORDER BY received_at DESC,receipt_id LIMIT :limit OFFSET :offset")
+  // The page plan for a search follows the exact count, not the planner's estimate of a substring match, which can be far off either
+  // way. Few matches: read them through the trigram indexes and sort them (OFFSET 0 keeps the planner from walking the received-at
+  // index instead). Many: walk the received-at index, which reaches a page of matches early.
+  val page=if(search.isNotEmpty() && count<=narrowPageRows) "SELECT * FROM (SELECT * FROM ops.work_request$where OFFSET 0) w"
+   else "SELECT * FROM ops.work_request$where"
+  val rows=query("$page ORDER BY received_at DESC,receipt_id LIMIT :limit OFFSET :offset")
    .param("limit",limit).param("offset",offset).query(::row).list()
   return mapOf("total" to count,"requests" to rows,"offset" to offset,"limit" to limit)
  }
@@ -738,5 +746,7 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
    */
   private const val UNACKNOWLEDGED_LATEST="SELECT 1 FROM ops.work_result u WHERE u.acknowledged_at IS NULL"+
    " AND NOT EXISTS(SELECT 1 FROM ops.work_result n WHERE n.receipt_id=u.receipt_id AND n.version>u.version)"
+  /** A LIKE pattern matching [search] anywhere, with the LIKE wildcards and the escape character (backslash) taken literally. */
+  fun containing(search:String):String = "%"+search.replace("\\","\\\\").replace("%","\\%").replace("_","\\_")+"%"
   val STATES=setOf("WAITING_RESOURCE","RECEIVED","DISPATCHING","ACCEPTED","REJECTED","UNASSIGNED","IN_DOUBT") }
 }
