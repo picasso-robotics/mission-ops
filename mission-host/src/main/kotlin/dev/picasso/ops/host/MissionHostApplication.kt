@@ -3,6 +3,8 @@ package dev.picasso.ops.host
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.picasso.client.PicassoClient
 import dev.picasso.middleware.ClientRobotPort
+import dev.picasso.middleware.IssuingRobotPort
+import dev.picasso.middleware.PrefetchingRobotPort
 import dev.picasso.middleware.RobotPort
 import dev.picasso.ops.host.cell.CellBandClient
 import dev.picasso.ops.host.mission.MissionVersions
@@ -53,10 +55,18 @@ open class MissionHostApplication {
         return ManagedChannelBuilder.forAddress("127.0.0.1", port).usePlaintext().build()
     }
 
-    /** 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다. */
-    @Bean
+    /**
+     * 기체 포트. gRPC 포트([ClientRobotPort])를 picasso 의 두 데코레이터로 감싼다(picasso §15.237·§15.267, 한계 §15.279).
+     * [PrefetchingRobotPort] 는 기체마다 스냅숏·재생·선언 읽기를 자기 스레드에서 돌려 pump 가 호스트 잠금 아래에서 기체 답을 기다리지
+     * 않게 하고, [IssuingRobotPort] 는 출발·취소 명령을 잠금 밖으로 보낸다. 미리 읽은 값은 받은 지 `maxAge`(기본 2초) 안에서만 쓴다.
+     * 두 데코레이터의 시계는 미들웨어와 같은 [HostClock] 이다.
+     *
+     * 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다.
+     */
+    @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean(RobotPort::class)
-    open fun robotPort(channel: ManagedChannel): RobotPort = ClientRobotPort(PicassoClient(channel, CLIENT_ID))
+    open fun robotPort(channel: ManagedChannel, clock: HostClock): RobotPort =
+        HostRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), clock)
 
     @Bean
     open fun cellBand(@Value("\${host.cell.url}") url: String): CellBandClient = CellBandClient(url)

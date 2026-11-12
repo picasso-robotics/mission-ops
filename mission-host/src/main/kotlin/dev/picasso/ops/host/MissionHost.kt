@@ -73,6 +73,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
+/** 출발 관문 앞에 설 수 있는 단위 상태(`MissionHost.startingRobots`). */
+private val STARTING_UNIT_STATES = setOf(UnitState.PENDING, UnitState.IN_DOUBT, UnitState.OPERATOR_HOLD)
+
 /** 스킬 적합 판정(S3a 스펙 §7.6). [UNKNOWN] 은 기체 케이퍼빌리티를 못 물어봤다는 뜻이고 적합이 아니다. */
 enum class SkillFit { FIT, MISSING, UNKNOWN }
 
@@ -863,6 +866,7 @@ class MissionHost(
                 // 다시 돈 실행의 기록이 커밋되기 전에는 미들웨어 pump 를 돌리지 않는다(그 실행의 로봇 명령이 pump 에서 나간다).
                 recordReruns()
                 if (journalBlocked().isNotEmpty()) return@withLock
+                (robots as? HostRobotPort)?.readNowFor(startingRobots())
                 middleware.pump()
                 pumpedAt = at
                 recordAfterPump()
@@ -871,6 +875,16 @@ class MissionHost(
             log.warn("pump 실패: {}", e.toString())
         }
     }
+
+    /**
+     * 출발 관문을 지날 수 있는 기체: 정착하지 않은 실행에서 아직 내지 않았거나(`PENDING`), 미확정이라 다시 조회하거나(`IN_DOUBT`),
+     * 운영자 보류에서 풀리면 나갈(`OPERATOR_HOLD`) 로봇 단위의 기체. [HostRobotPort] 는 이 기체를 미리 읽은 값 대신 지금 읽는다.
+     */
+    private fun startingRobots(): Set<String> =
+        middleware.executions().asSequence()
+            .filter { !it.physicalState.isSettled }
+            .flatMap { e -> e.units.asSequence().filter { it.route == Route.ROBOT && it.state in STARTING_UNIT_STATES }.map { e.robotOf(it) } }
+            .toSet()
 
     /** 기체마다 호스트 판정을 낸다. [order] 의 WorkMaster 는 부르는 쪽이 [WORK_MASTERS] 로 거른다. */
     private fun selectedMission(workMaster:String,version:String?):dev.picasso.middleware.ActiveMission? {
