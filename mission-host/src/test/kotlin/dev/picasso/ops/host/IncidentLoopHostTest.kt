@@ -1,6 +1,7 @@
 package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.JsonNode
+import dev.picasso.host.FileEntitlements
 import dev.picasso.middleware.ApprovalOutcome
 import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.EquipmentRequirement
@@ -8,6 +9,8 @@ import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.Middleware
 import dev.picasso.ops.host.HostBench.Companion.HUMANOID
 import dev.picasso.ops.host.HostBench.Companion.JSON
+import dev.picasso.ops.host.HostBench.Companion.QUADRUPED
+import dev.picasso.ops.host.HostBench.Companion.ROOT
 import dev.picasso.ops.host.HostBench.Companion.inspect
 import dev.picasso.ops.host.HostBench.Companion.request
 import dev.picasso.ops.host.incident.ApprovalWindow
@@ -35,6 +38,24 @@ class IncidentLoopHostTest {
     private val settledStates = setOf("PHYSICALLY_DONE", "FAILED", "UNVERIFIED", "ABORTED", "PARTIAL")
 
     private val empty = HostFootprint(0, 0, 0, 0, 0, 0, 0)
+
+    @Test
+    fun `견본 선언은 recovery 와 운영자를 이 현장 기체로 선언하고 조치는 비워 둔다`() {
+        // 견본은 복사해 고쳐 쓰는 출발점이다(`mission-host/incident-loop/README.md`). 읽히지 않으면 기동이 멈추므로 여기서 읽어 본다.
+        val declared = FileEntitlements.read(EXAMPLE)
+        assertEquals(setOf(AGENT, "operator-1"), declared.approvers())
+        listOf(AGENT, "operator-1").forEach { id ->
+            val one = checkNotNull(declared.declaredFor(id))
+            assertEquals(setOf(HUMANOID, QUADRUPED), one.robotIds, id)
+            // 이 호스트의 기본 임무로는 조치 제안이 서지 않는다 — 덮을 조치를 지어내지 않는다.
+            assertTrue(one.actions.isEmpty(), "$id 의 조치가 비어 있지 않다: ${one.actions}")
+            assertNull(one.revocation, id)
+        }
+        HostBench(incidentLoop = mapOf("entitlements" to EXAMPLE.toString(), "approval-port" to "0")).use { bench ->
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            assertEquals("REFUSED", approve(port, AGENT, "JO-1").second["outcome"].asText())
+        }
+    }
 
     @Test
     fun `설정을 비우면 승인 호스트를 열지 않는다`() {
@@ -166,6 +187,7 @@ class IncidentLoopHostTest {
 
     private companion object {
         const val AGENT = "recovery-1"
+        val EXAMPLE: Path = ROOT.resolve("mission-host/incident-loop/entitlements.example.json")
         val HTTP: HttpClient = HttpClient.newHttpClient()
     }
 }

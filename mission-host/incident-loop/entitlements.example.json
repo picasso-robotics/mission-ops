@@ -1,0 +1,16 @@
+{
+  "entitlements": [
+    {
+      "approverId": "recovery-1",
+      "robotIds": ["humanoid-01", "quadruped-01"],
+      "expiresAt": "2026-12-31T00:00:00Z",
+      "actions": []
+    },
+    {
+      "approverId": "operator-1",
+      "robotIds": ["humanoid-01", "quadruped-01"],
+      "expiresAt": "2026-12-31T00:00:00Z",
+      "actions": []
+    }
+  ]
+}
