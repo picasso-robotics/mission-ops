@@ -1,0 +1,40 @@
+name: picasso-main
+
+# 조기 경보. 고정 커밋 대신 picasso main 의 끝으로 서브모듈을 바꿔 같은 Gradle 빌드를 돈다.
+# 서브모듈 고정 커밋은 바꾸지 않는다. 이 작업이 빨가면 다음 서브모듈 올림에서 고칠 것이 생겼다는 뜻이다.
+# PR 과 push 에는 걸지 않는다. picasso 의 변경이 mission-ops 의 PR 을 막지 않게 하려는 것이다.
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 매일 03:00 KST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gradle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Move submodule to picasso main
+        run: |
+          git -C picasso fetch --depth 1 origin main
+          git -C picasso checkout --detach FETCH_HEAD
+          echo "고정: $(git ls-tree HEAD picasso | awk '{print $3}')"
+          echo "시험: $(git -C picasso rev-parse HEAD)"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Gradle build
+        run: ./gradlew build --console=plain --continue
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picasso-main-test-results
+          path: '**/build/test-results/test/*.xml'
