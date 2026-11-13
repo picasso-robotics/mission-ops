@@ -138,6 +138,71 @@ class IncidentLoopHostTest {
         }
     }
 
+    /**
+     * 든 채 실패하고 잔여 파지 표시를 사람이 «빈손 확인» 으로 잘못 푼 기체(2026-11-13 조사 장면). 손은 여전히 든 채다. 그 기체에 빈손을 요구하는
+     * 순회를 내면 picasso 관문이 기체 스냅숏의 손으로 거절하고 조치 제안을 세운다(picasso §15.316, 계약 0.11.0).
+     */
+    private fun misclearedThenPatrol(bench: HostBench): JsonNode {
+        bench.awaitPump()
+        val rack = bench.post("/host/job-orders", request(HostBench.rack("JO-R", "RACK-204.S01"), "candidates", HUMANOID)).body!!
+        assertEquals("ACCEPTED", rack["result"].asText(), rack.toString())
+        var running: String? = null
+        repeat(20) {
+            if (running == null) {
+                bench.mimic.server.advance(java.time.Duration.ofSeconds(1)); bench.awaitPump()
+                running = bench.mimic.server.exclusive {
+                    bench.mimic.instance(HUMANOID)!!.tasks.all.firstOrNull { it.machine.state == dev.picasso.mimic.engine.TaskState.RUNNING }?.taskId
+                }
+            }
+        }
+        bench.mimic.server.exclusive { bench.mimic.instance(HUMANOID)!!.tasks.forceFault("SKILL_EXECUTION_FAILED", checkNotNull(running)) }
+        assertEquals("FAILED", bench.driveUntil(rack["executionId"].asText(), setOf("FAILED", "UNVERIFIED", "ABORTED", "PARTIAL", "PHYSICALLY_DONE"))["physicalState"].asText())
+        bench.eventually("잔여 파지 표시") { bench.get("/host/robots/residual-holds")["holds"].size() == 1 }
+        val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
+        assertEquals(200, bench.post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""").status)
+        bench.awaitPump()
+        return bench.post("/host/job-orders", request(inspect("JO-P", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
+    }
+
+    /** 내려놓기 조치를 덮는 선언 — 목적지는 선언이, 대상은 지금 손이 채운다. */
+    private val putDown = """[{"skillType":"pick_place","parameters":{"destination":"RACK-204.S04"}}]"""
+
+    @Test
+    fun `잘못 푼 표시 뒤의 순회는 관문이 스냅숏 손으로 막아 제안이 서고, 값 없이 승인하면 실행이 일지에 적힌다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            val patrol = misclearedThenPatrol(bench)
+            assertTrue(patrol["result"].asText() != "ACCEPTED", "든 채인 기체에 빈손을 요구하는 순회를 받았다: $patrol")
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, approved) = approve(port, AGENT, "JO-P", saw = listOf("pick_place"))
+            assertEquals("APPROVED", approved["outcome"].asText(), approved.toString())
+            val executionId = approved["executionId"].asText()
+            assertEquals(
+                listOf("JO-P" to executionId),
+                PostgresSupport.queryAll("SELECT job_order_id, execution_id FROM mission.execution_journal WHERE job_order_id = 'JO-P'") {
+                    it.getString(1) to it.getString(2)
+                },
+            )
+        }
+    }
+
+    @Test
+    fun `승인도 실행 호스트 판정이 막은 기체에는 실행을 세우지 않는다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            misclearedThenPatrol(bench)
+            // 같은 기체에 다른 일이 선다 — 판정은 이 기체를 «진행 중인 실행» 으로 막는다. 미들웨어 관문은 그 제한을 모른다.
+            val other = bench.post("/host/job-orders", request(HostBench.rack("JO-X", "RACK-204.S02"), "candidates", HUMANOID)).body!!
+            assertEquals("ACCEPTED", other["result"].asText(), other.toString())
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, refused) = approve(port, AGENT, "JO-P", saw = listOf("pick_place"))
+            assertEquals(listOf("REFUSED", "REFUSED_BY_GATE"), listOf(refused["outcome"].asText(), refused["refusal"].asText()), refused.toString())
+            assertTrue("실행 호스트 판정" in refused["reason"].asText() && "진행 중인 실행" in refused["reason"].asText(), refused.toString())
+            assertTrue(
+                PostgresSupport.queryAll("SELECT count(*) FROM mission.execution_journal WHERE job_order_id = 'JO-P'") { it.getInt(1) }.single() == 0,
+                "판정이 막은 기체에 승인이 실행을 세웠다",
+            )
+        }
+    }
+
     /** 작업 지시 하나를 정착시키고 picasso 메모리에서 놓일 때까지 기다린다. 그 작업 응답 id 를 돌려준다. */
     private fun settle(bench: HostBench, jobOrderId: String): String {
         val reply = bench.post("/host/job-orders", request(inspect(jobOrderId, "T1" to "bay-7"), "candidates", HUMANOID)).body!!
@@ -151,23 +216,23 @@ class IncidentLoopHostTest {
         if (!Files.exists(file)) emptySet() else file.readLines().filter { it.isNotBlank() }.map { JSON.readTree(it)["jobResponseId"].asText() }.toSet()
 
     /** 선언 파일을 쓰고 승인 호스트를 빈 포트로 여는 설정. */
-    private fun loop(): Map<String, String> {
+    private fun loop(actions: String = """[{"skillType":"inspect","parameters":{}}]"""): Map<String, String> {
         val file = Files.createTempFile("entitlements", ".json")
         Files.writeString(
             file,
             """
             {"entitlements":[{"approverId":"$AGENT","robotIds":["$HUMANOID"],"expiresAt":"2099-01-01T00:00:00Z",
-              "actions":[{"skillType":"inspect","parameters":{}}]}]}
+              "actions":$actions}]}
             """.trimIndent(),
         )
         return mapOf("entitlements" to file.toString(), "approval-port" to "0")
     }
 
-    private fun approve(port: Int, approverId: String, jobOrderId: String): Pair<Int, JsonNode> {
+    private fun approve(port: Int, approverId: String, jobOrderId: String, saw: List<String> = listOf("inspect")): Pair<Int, JsonNode> {
         val body = JSON.writeValueAsString(
             linkedMapOf(
                 "approverId" to approverId, "approverKind" to "AGENT", "robotId" to HUMANOID, "jobOrderId" to jobOrderId,
-                "sawSkillTypes" to listOf("inspect"),
+                "sawSkillTypes" to saw,
             ),
         )
         val response = HTTP.send(
