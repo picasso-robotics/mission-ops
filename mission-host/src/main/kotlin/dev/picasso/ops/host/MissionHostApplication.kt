@@ -2,11 +2,14 @@ package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.picasso.client.PicassoClient
+import dev.picasso.host.FileEntitlements
 import dev.picasso.middleware.ClientRobotPort
+import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.IssuingRobotPort
 import dev.picasso.middleware.PrefetchingRobotPort
 import dev.picasso.middleware.RobotPort
 import dev.picasso.ops.host.cell.CellBandClient
+import dev.picasso.ops.host.incident.ApprovalWindow
 import dev.picasso.ops.host.mission.MissionVersions
 import dev.picasso.ops.host.mission.MockRunner
 import dev.picasso.ops.host.mission.StoredMissionCatalog
@@ -136,6 +139,9 @@ open class MissionHostApplication {
      * [MissionHost.DEFAULT_REVISABLE_RETENTION]). 음수면 기동이 멈춘다.
      *
      * [retirements] 는 registry 주소를 설정했을 때만 미들웨어에 넘긴다([RegistryRetirements.declared]).
+     *
+     * [entitlementsPath]·[exportDir] 는 인시던트 고리다(`host.incident-loop.entitlements`·`.export`, picasso 한계 §15.176). 비우면 선언 없음,
+     * 내보내기 없음이다. 선언 파일 경로가 있는데 못 읽으면 기동이 멈춘다(picasso `FileEntitlements` 는 빈 목록으로 접지 않는다).
      */
     @Bean(destroyMethod = "close")
     open fun missionHost(
@@ -152,11 +158,31 @@ open class MissionHostApplication {
         @Value("\${host.instance.heartbeat-period}") heartbeatPeriod: Duration,
         @Value("\${host.instance.heartbeat-expiry}") heartbeatExpiry: Duration,
         @Value("\${host.settled.revisable-retention}") revisableRetention: Duration,
+        @Value("\${host.incident-loop.entitlements}") entitlementsPath: String,
+        @Value("\${host.incident-loop.export}") exportDir: String,
     ): MissionHost = MissionHost(
         robots, cellBand, clock, catalog, timings, records, store, json, workPermits(permitMapping, clock),
         HostHeartbeat(heartbeatPeriod, heartbeatExpiry), revisableRetention,
         retirements.takeIf { it.declared },
+        entitlements(entitlementsPath), path(exportDir),
     ).start()
+
+    /**
+     * 승인 호스트(picasso `host-kit`, `POST /approvals`). [port](`host.incident-loop.approval-port`)가 비면 열지 않는다. 열려면 자격 선언
+     * 파일(`host.incident-loop.entitlements`)도 있어야 한다 — 없으면 모든 시도가 `NOT_DECLARED` 라 여는 뜻이 없으므로 기동을 멈춘다.
+     * 루프백에만 붙고 신원을 인증하지 않는다(picasso §15.3).
+     */
+    @Bean(destroyMethod = "close")
+    open fun approvalWindow(
+        host: MissionHost,
+        @Value("\${host.incident-loop.approval-port}") port: String,
+        @Value("\${host.incident-loop.entitlements}") entitlementsPath: String,
+    ): ApprovalWindow {
+        val chosen = port.trim().takeIf { it.isNotEmpty() } ?: return ApprovalWindow.CLOSED
+        require(entitlementsPath.isNotBlank()) { "승인 호스트를 열려면 자격 선언 파일(host.incident-loop.entitlements)이 있어야 한다" }
+        val number = requireNotNull(chosen.toIntOrNull()) { "승인 호스트 포트(host.incident-loop.approval-port)가 숫자가 아니다: $chosen" }
+        return ApprovalWindow.open(host, number)
+    }
 
     /**
      * 모의 실행기(S3b 스펙 §6.4). 프로파일과 스키마 경로는 작업 디렉터리 기준으로 푼다. `:mission-host:run` 은 저장소 루트에서
@@ -186,6 +212,12 @@ open class MissionHostApplication {
         /** 작업 허가 대응 경로에서 포트를 짓는다. 비어 있으면 `null`(선언하지 않은 현장)이다. 경로는 작업 디렉터리 기준이다. */
         fun workPermits(mapping: String, clock: HostClock): CellWorkPermits? =
             mapping.trim().takeIf { it.isNotEmpty() }?.let { CellWorkPermits(WorkPermitMap.read(Path.of(it).toAbsolutePath().normalize()), clock.now()) }
+
+        /** 자격 선언 파일에서 선언을 읽는다. 비어 있으면 선언 없음이다. 경로는 작업 디렉터리 기준이다. */
+        fun entitlements(path: String): Entitlements = path(path)?.let { FileEntitlements.read(it) } ?: Entitlements.None
+
+        /** 비어 있으면 `null`, 아니면 작업 디렉터리 기준 절대 경로. */
+        fun path(value: String): Path? = value.trim().takeIf { it.isNotEmpty() }?.let { Path.of(it).toAbsolutePath().normalize() }
 
         /**
          * 설정 파일 이름을 `mission-host` 로 둔다. 같은 JVM 의 registry `application.properties`·운영 서비스 설정과 가리지 않게.
