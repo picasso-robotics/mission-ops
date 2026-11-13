@@ -916,14 +916,23 @@ class MissionHost(
      *
      * 실행이 없는 작업 지시가 실행 일지에 이미 있으면(정착했거나 포기한 작업 지시) 미들웨어에 넘기지 않고 `REMEDY_NOT_APPLIED` 로 거부한다.
      * 제출의 [journalRefusal] 과 같은 확인이고, 제안을 소모하지 않는다.
+     *
+     * **판정이 막은 기체에는 승인으로도 실행을 세우지 않는다.** picasso 0.11.0 부터 도는 단위 없는 기체에도 제안이 서므로(§15.316) 이 경로가 실제로
+     * 닿는다. 승인 접수는 미들웨어 관문을 다시 지나지만 관문은 이 호스트의 제한(진행 중인 실행, 복원 못 한 행, 증언 종결 확인 전, 잔여 파지 표시,
+     * 현장 시간값 미적용, 실행 일지 막힘)을 모르므로 [robotRestrictions] 로 먼저 보고 `REFUSED_BY_GATE` 로 거부한다. 제안은 지우지 않는다.
      */
     fun attemptApproval(attempt: ApprovalAttempt): ApprovalOutcome = lock.withLock {
         if (journalBlocked().isNotEmpty()) {
             return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 일지 저장 실패: 호스트 복구 전 승인 차단")
         }
-        val existed = middleware.executions().any { it.order.jobOrderId == attempt.jobOrderId }
+        val existing = middleware.executions().firstOrNull { it.order.jobOrderId == attempt.jobOrderId }
+        val existed = existing != null
         if (!existed) {
             journalRefusal(attempt.jobOrderId)?.let { return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REMEDY_NOT_APPLIED, it) }
+        }
+        // **승인도 판정이 막은 기체에는 실행을 세우지 않는다.** 미들웨어 관문은 이 호스트의 제한을 모른다. 제안은 지우지 않는다(관문 거절과 같다).
+        robotRestrictions(attempt.robotId, siteTimings.current() != null, revising = existing?.executionId).takeIf { it.isNotEmpty() }?.let { reasons ->
+            return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 호스트 판정: ${reasons.joinToString("; ")}")
         }
         val outcome = approve(middleware, attempt)
         if (outcome is ApprovalOutcome.Approved) {
@@ -1834,25 +1843,36 @@ class MissionHost(
             missing.isEmpty() -> SkillFit.FIT
             else -> SkillFit.MISSING
         }
-        val running = middleware.executions()
-            .firstOrNull { it.robotId == robotId && it.physicalState.occupiesRobot && it.executionId != revising }?.executionId
-
+        val running = runningOn(robotId, revising)
         val reasons = buildList {
             when (fit) {
                 SkillFit.FIT -> Unit
                 SkillFit.MISSING -> add("모자란 스킬: ${missing.joinToString(", ")}")
                 SkillFit.UNKNOWN -> add("기체 케이퍼빌리티를 못 물어봤다")
             }
-            if (running != null) add("진행 중인 실행이 있다: $running")
-            val (unrestored, closedUnconfirmed) = unrestoredOn(robotId)
-            unrestored.takeIf { it.isNotEmpty() }?.let { add("$UNRESTORED_REASON: ${it.joinToString(", ")}") }
-            closedUnconfirmed.takeIf { it.isNotEmpty() }?.let { add("$CLOSED_UNCONFIRMED_REASON: ${it.joinToString(", ")}") }
-            openHolds.filter { it.robotId == robotId }.takeIf { it.isNotEmpty() }
-                ?.let { holds -> add("$RESIDUAL_HOLD_REASON: ${holds.joinToString(", ") { "${it.jobOrderId} ${it.unitId}" }}") }
-            if (!applied) add(UNAPPLIED_REASON)
-            if (journalBlocked().isNotEmpty()) add("실행 일지 저장 실패: 호스트 복구 전 배정 차단")
+            addAll(robotRestrictions(robotId, applied, revising))
         }
         return HostEligibility(robotId, fit, missing, running, passed = reasons.isEmpty(), reasons = reasons, requiredSkills = needed.toList(), availableSkills = declared?.sorted())
+    }
+
+    /** 이 기체를 쥔 실행(개정할 [revising] 자신은 빼고). */
+    private fun runningOn(robotId: String, revising: String?): String? = middleware.executions()
+        .firstOrNull { it.robotId == robotId && it.physicalState.occupiesRobot && it.executionId != revising }?.executionId
+
+    /**
+     * 작업 지시와 무관한 **기체 단위의 호스트 제한** — 진행 중인 실행, 복원 못 한 행, 증언 종결 확인 전, 잔여 파지 표시, 현장 시간값 미적용, 실행
+     * 일지 막힘. 판정([judge])과 값 없는 승인([attemptApproval])이 같은 함수를 쓴다: 승인 접수는 미들웨어 관문을 다시 지나지만 관문은 이 호스트의
+     * 제한을 모르므로, 여기서 따로 보지 않으면 승인이 판정이 막은 기체에 실행을 세운다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun robotRestrictions(robotId: String, applied: Boolean, revising: String? = null): List<String> = buildList {
+        runningOn(robotId, revising)?.let { add("진행 중인 실행이 있다: $it") }
+        val (unrestored, closedUnconfirmed) = unrestoredOn(robotId)
+        unrestored.takeIf { it.isNotEmpty() }?.let { add("$UNRESTORED_REASON: ${it.joinToString(", ")}") }
+        closedUnconfirmed.takeIf { it.isNotEmpty() }?.let { add("$CLOSED_UNCONFIRMED_REASON: ${it.joinToString(", ")}") }
+        openHolds.filter { it.robotId == robotId }.takeIf { it.isNotEmpty() }
+            ?.let { holds -> add("$RESIDUAL_HOLD_REASON: ${holds.joinToString(", ") { "${it.jobOrderId} ${it.unitId}" }}") }
+        if (!applied) add(UNAPPLIED_REASON)
+        if (journalBlocked().isNotEmpty()) add("실행 일지 저장 실패: 호스트 복구 전 배정 차단")
     }
 
     /**
