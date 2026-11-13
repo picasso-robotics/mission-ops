@@ -47,4 +47,5 @@ tasks.withType<Test>().configureEach {
     inputs.dir(rootProject.file("picasso/profile/profiles")).withPropertyName("profiles")
     inputs.dir(rootProject.file("picasso/profile/schema")).withPropertyName("profileSchema")
     inputs.dir(rootProject.file("mission-host/mock-run")).withPropertyName("mockRunProfile")
+    inputs.dir(rootProject.file("mission-host/incident-loop")).withPropertyName("incidentLoopExample")
 }
