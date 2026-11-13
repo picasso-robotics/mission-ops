@@ -19,6 +19,8 @@ dependencies {
     // 모의 실행이 프로세스 안에 별도 mimic 과 가상 시계를 띄운다(S3b 스펙 §6.4). 하네스가 in-process 로 세우고 mimic 은 그 안에서 돈다.
     implementation("dev.picasso:harness")
     implementation("dev.picasso:mimic")
+    // 인시던트 고리(picasso H1). 승인 호스트·자격 선언 파일·번들 쓰기. 설정을 비우면 붙지 않는다(`host.incident-loop.*`).
+    implementation("dev.picasso:host-kit")
 
     // 운영 서비스와 같이 BOM 만 쓰고 Spring Boot 플러그인은 붙이지 않는다. 판이 picasso 카탈로그 밖으로 나가지 않는다.
     implementation(platform(libs.spring.boot.bom))

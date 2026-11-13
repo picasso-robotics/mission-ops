@@ -11,8 +11,12 @@ import dev.picasso.contracts.v1.Fault
 import dev.picasso.contracts.v1.HoldKind
 import dev.picasso.contracts.v1.TaskState
 import dev.picasso.middleware.ActiveMission
+import dev.picasso.middleware.ApprovalAttempt
+import dev.picasso.middleware.ApprovalOutcome
+import dev.picasso.middleware.ApprovalRefusal
 import dev.picasso.middleware.Approver
 import dev.picasso.middleware.ApproverKind
+import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.ExecutionUnit
 import dev.picasso.middleware.ForgetOutcome
@@ -39,6 +43,7 @@ import dev.picasso.ops.host.cell.CellBandClient
 import dev.picasso.ops.host.cell.CellBandSignals
 import dev.picasso.ops.host.cell.CellSnapshot
 import dev.picasso.ops.host.cell.SourceConfirmation
+import dev.picasso.ops.host.incident.IncidentExport
 import dev.picasso.ops.host.mission.SiteInputs
 import dev.picasso.ops.host.mission.StoredMissionCatalog
 import dev.picasso.ops.host.permit.CellWorkPermits
@@ -64,6 +69,7 @@ import dev.picasso.ops.host.store.ResponseLogRow
 import dev.picasso.ops.host.store.ResidualHoldRow
 import dev.picasso.ops.host.store.SettledRow
 import org.slf4j.LoggerFactory
+import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -500,6 +506,13 @@ data class HostFootprint(
  * [retirements] 는 registry 주소를 설정했을 때만 있다. 있으면 미들웨어의 퇴역 포트로 붙인다. 포트의 읽기는 읽기 주기가 잠금 밖에서 읽어
  * 둔 스냅숏이라 잠금 아래에서 기다리지 않는다. 미들웨어는 퇴역한 기체로 새 로봇 명령을 내지 않고(`Execution.permitBlock`, 까닭 `RETIRED`)
  * 재할당 후보에서도 뺀다. 도는 단위는 끊지 않는다. 없으면 붙이지 않아 발행 동작이 오늘 그대로다.
+ *
+ * ## 인시던트 고리(picasso H1 `host-kit`, 한계 §15.176)
+ *
+ * [entitlements] 는 자동 승인 자격 선언이다. 미들웨어에 그대로 넘긴다. 기본값은 선언 없음이라 값 없는 승인([attemptApproval])은 모두
+ * `NOT_DECLARED` 로 거부된다. [export] 를 주면 pump 마다 잠금 아래에서 인시던트 대장·조치 탐색 대장·안내·작업 응답을 그 디렉터리에
+ * 쓴다([IncidentExport]). 둘 다 기본값이면 오늘의 동작 그대로다. 승인 호스트(`POST /approvals`)는 이 클래스 밖에서 열고
+ * [attemptApproval] 을 부른다.
  */
 class MissionHost(
     private val robots: RobotPort,
@@ -514,6 +527,8 @@ class MissionHost(
     private val heartbeat: HostHeartbeat = HostHeartbeat.DEFAULT,
     private val revisableRetention: Duration = DEFAULT_REVISABLE_RETENTION,
     private val retirements: RetirementPort? = null,
+    private val entitlements: Entitlements = Entitlements.None,
+    export: Path? = null,
 ) : AutoCloseable {
     init {
         require(!revisableRetention.isNegative) { "개정판을 받을 실행을 두는 폭은 음수가 아니어야 한다: $revisableRetention" }
@@ -524,8 +539,11 @@ class MissionHost(
 
     private val middleware = Middleware(
         robots = robots, cell = signals, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
-        retirements = retirements,
+        retirements = retirements, entitlements = entitlements,
     )
+
+    /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
+    private val exported: IncidentExport? = export?.let { IncidentExport(it, middleware.instanceId) }
 
     private var pumpedAt: Instant? = null
     private var latestCell: CellSnapshot? = null
@@ -869,11 +887,55 @@ class MissionHost(
                 (robots as? HostRobotPort)?.readNowFor(startingRobots())
                 middleware.pump()
                 pumpedAt = at
+                // 기록 뒤에는 정착한 실행을 놓아 그 작업 응답이 아웃박스에서 빠질 수 있다. 그 전에 사본에 담는다.
+                exportIncidents()
                 recordAfterPump()
             }
         } catch (e: Exception) {
             log.warn("pump 실패: {}", e.toString())
         }
+    }
+
+    /**
+     * 인시던트 고리로 파일을 낸다. pump 직후, 기록과 놓기([recordAfterPump]) 전에 부른다. 실패는 pump 를 멈추지 않는다 — 다음 pump 가 같은
+     * 사본을 다시 쓴다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun exportIncidents() {
+        val export = exported ?: return
+        try {
+            export.observe(middleware.incidents(), middleware.remedySearches(), middleware.responses(), clock.now())
+        } catch (e: Exception) {
+            log.warn("인시던트 고리 내보내기 실패: {}", e.toString())
+        }
+    }
+
+    /**
+     * 값 없는 승인 시도(picasso `Middleware.attemptApproval`, ADR 44). 승인 호스트가 부른다. 호스트 잠금 아래에서 판정하고, 승인으로 새 실행이
+     * 서면 제출과 같이 실행 일지를 적는다 — 적지 않으면 일지에 없는 실행이 생겨 pump 와 제출이 막힌다([journalBlocked]). 일지 쓰기가
+     * 실패하면 [JournalWriteFailed] 가 나가고 제출과 같이 호스트 복구 전까지 막힌다.
+     *
+     * 실행이 없는 작업 지시가 실행 일지에 이미 있으면(정착했거나 포기한 작업 지시) 미들웨어에 넘기지 않고 `REMEDY_NOT_APPLIED` 로 거부한다.
+     * 제출의 [journalRefusal] 과 같은 확인이고, 제안을 소모하지 않는다.
+     */
+    fun attemptApproval(attempt: ApprovalAttempt): ApprovalOutcome = lock.withLock {
+        if (journalBlocked().isNotEmpty()) {
+            return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 일지 저장 실패: 호스트 복구 전 승인 차단")
+        }
+        val existed = middleware.executions().any { it.order.jobOrderId == attempt.jobOrderId }
+        if (!existed) {
+            journalRefusal(attempt.jobOrderId)?.let { return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REMEDY_NOT_APPLIED, it) }
+        }
+        val outcome = approve(middleware, attempt)
+        if (outcome is ApprovalOutcome.Approved) {
+            if (!existed) {
+                val execution = middleware.executions().first { it.executionId == outcome.executionId }
+                journal(execution)
+                persistRecord(execution.executionId)
+            } else {
+                recordReruns()?.let { throw JournalWriteFailed(outcome.executionId, it) }
+            }
+        }
+        outcome
     }
 
     /**
@@ -1416,6 +1478,10 @@ class MissionHost(
         if (!settleRecorded(execution, latest) || active(execution)) return false
         return forgetDue(execution.physicalState, settleMarks.getValue(execution.executionId).at, now, revisableRetention)
     }
+
+    /** picasso `Middleware.attemptApproval` 을 부르는 자리. 시험이 승인으로 선 실행을 주입하려고 바꾼다. 호스트 잠금 아래에서 부른다. */
+    @Volatile
+    internal var approve: (Middleware, ApprovalAttempt) -> ApprovalOutcome = { m, attempt -> m.attemptApproval(attempt) }
 
     /** picasso `Middleware.forget` 를 부르는 자리. 시험이 거절과 모름을 주입하려고 바꾼다. 호스트 잠금 아래에서 부른다. */
     @Volatile

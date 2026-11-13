@@ -49,6 +49,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * @param registryUrl 주면 호스트가 이 주소의 registry 진단 읽기로 기체 퇴역을 읽는다(`host.registry.url`). 안 주면 비워서 포트를 붙이지
  *   않는다. 기본 설정의 `REGISTRY_PORT` 는 이 기계에 뜬 실제 registry 일 수 있다.
  * @param retirementInterval 주면 퇴역 읽기 주기를 이것으로 덮는다(`host.retirement.read-interval`).
+ * @param incidentLoop 인시던트 고리 설정(`host.incident-loop.<키>`). 키는 `entitlements`·`approval-port`·`export` 다.
  */
 class HostBench(
     private val mockVirtualLimit: Duration? = null,
@@ -59,6 +60,7 @@ class HostBench(
     private val heartbeat: Pair<Duration, Duration>? = null,
     private val registryUrl: String? = null,
     private val retirementInterval: Duration? = null,
+    private val incidentLoop: Map<String, String> = emptyMap(),
 ) : AutoCloseable {
 
     /** [gated] 일 때 스냅숏을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
@@ -223,6 +225,7 @@ class HostBench(
             permitMapping?.let { add("--host.work-permit.mapping=$it") }
             add("--host.registry.url=${registryUrl.orEmpty()}")
             retirementInterval?.let { add("--host.retirement.read-interval=$it") }
+            incidentLoop.forEach { (key, value) -> add("--host.incident-loop.$key=$value") }
             heartbeat?.let { (period, expiry) ->
                 add("--host.instance.heartbeat-period=$period")
                 add("--host.instance.heartbeat-expiry=$expiry")

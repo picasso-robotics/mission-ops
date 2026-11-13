@@ -162,6 +162,8 @@ env -u PICASSO_INGEST_TOKEN -u PICASSO_OPERATOR_TOKEN mission-host/build/install
 
 현장이 작업 허가 대응을 선언하려면 실행 호스트 명령 끝에 `--host.work-permit.mapping=<파일>`(작업 디렉터리 기준 경로)을 덧붙입니다. 선택 설정이며 비우면 지금처럼 동작합니다. 선언하면 대응에 없는 기체는 새 명령이 막히므로 기체를 빠짐없이 넣습니다. 파일 모양은 [상세 참고 문서](docs/reference.md)의 «기타 구성 및 설정» 에 있습니다.
 
+현장이 incident-recovery·incident-narrator를 실제 실행 호스트에 붙이려면 실행 호스트 명령 끝에 `--host.incident-loop.entitlements=<파일>`·`--host.incident-loop.approval-port=<포트>`·`--host.incident-loop.export=<디렉터리>`를 덧붙입니다. 선택 설정이며 비우면 지금처럼 동작하는 인증 없는 개념 증명입니다. 자세한 것은 [상세 참고 문서](docs/reference.md)의 «기타 구성 및 설정»에 있습니다.
+
 6. 터미널 3에서 운영 서비스를 실행합니다. 실행 호스트는 운영 서비스가 `ops` 스키마를 올리기 전까지 미적용 상태를 유지하며 작업 지시를 거부합니다. 운영 서비스 기동 뒤 현장 설정의 적용 상태를 확인합니다.
 
 Mock MES 주문(외부 주문 API, `scripts/mock-mes.mjs`)을 쓰려면 운영 서비스를 띄우기 전에 같은 터미널에서 `PICASSO_INTEGRATION_TOKEN`을 비어 있지 않은 값으로 설정해야 합니다(배포 기본값으로 켜지 않기 위해 `.env`에는 일부러 넣지 않았습니다). Mock MES를 실행하는 터미널에도 같은 값을 설정합니다. 비워 두면 외부 주문 API는 꺼진 채로 뜨고 나머지 화면은 그대로 쓸 수 있습니다. 결과 콜백까지 보려면 `PICASSO_LOCAL_CALLBACK_URL`(루프백 http 주소)과 `PICASSO_LOCAL_CALLBACK_TOKEN`을 설정합니다(선택).
