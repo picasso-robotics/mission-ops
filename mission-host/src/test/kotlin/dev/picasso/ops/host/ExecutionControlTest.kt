@@ -329,9 +329,10 @@ class ExecutionControlTest {
 
     @Test
     fun `잔여 파지 단위는 로봇 단위의 마지막 파지 관측이고 플릿 단위의 HOLDING 은 보지 않는다`() {
-        fun unit(id: String, route: Route, hold: HoldKind?) = ExecutionUnit(id, route, "s", emptyMap(), null, null, null).apply {
-            if (hold != null) this.hold = HoldState.newBuilder().setKind(hold).setObjectRef("C-1").build()
-        }
+        fun unit(id: String, route: Route, hold: HoldKind?) = ExecutionUnit(
+            id, route, "s", emptyMap(), null, null, null,
+            hold = hold?.let { HoldState.newBuilder().setKind(it).setObjectRef("C-1").build() } ?: HoldState.getDefaultInstance(),
+        )
         val robotHeld = unit("r1", Route.ROBOT, HoldKind.HOLD_KIND_HOLDING)
         val robotEmpty = unit("r2", Route.ROBOT, HoldKind.HOLD_KIND_EMPTY)
         val fleetHeld = unit("f1", Route.FLEET, HoldKind.HOLD_KIND_HOLDING)
