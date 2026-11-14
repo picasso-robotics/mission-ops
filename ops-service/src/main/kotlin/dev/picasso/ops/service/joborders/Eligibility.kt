@@ -25,6 +25,8 @@ enum class HostState { OK, HOST_SILENT }
  * @param host 호스트 판정 행. 스킬 적합(모자란 스킬)과 도는 실행이 여기 있다
  * @param eligible 네 칸이 다 알려졌고 다 통과했다. «모름» 이 하나라도 있으면 거짓이다
  * @param reasons 배정 가능이 아닌 이유(화면 표시용). 시운전, 연결, 호스트 판정 순서다. 배정 가능이면 비어 있다
+ * @param gateTrial 배정 가능이지만 **관문 확인용**이다(호스트 [HostEligibility.gateTrial]). 남은 이유가 잔여 파지 표시뿐이라 일반 배정은 서지
+ *   않고 조치 제안만 얻는다. 그 표시 사유는 [reasons] 가 아니라 호스트 행에 있다
  */
 data class RobotEligibility(
     val robotId: String,
@@ -34,6 +36,7 @@ data class RobotEligibility(
     val host: HostEligibility?,
     val eligible: Boolean,
     val reasons: List<String>,
+    val gateTrial: Boolean = false,
 )
 
 /**
@@ -117,6 +120,7 @@ class JobOrderEligibility(
             when {
                 hostRows == null -> add("실행 호스트가 답하지 않아 스킬 적합·진행 중인 실행을 모른다")
                 hostRow == null -> add("실행 호스트가 이 기체를 판정하지 않았다")
+                hostRow.gateTrial -> Unit
                 else -> addAll(hostRow.reasons)
             }
         }
@@ -131,6 +135,7 @@ class JobOrderEligibility(
             host = hostRow,
             eligible = eligible,
             reasons = reasons,
+            gateTrial = eligible && hostRow?.gateTrial == true,
         )
     }
 }

@@ -64,6 +64,8 @@ data class HostEligibility(
     val reasons: List<String> = emptyList(),
     val requiredSkills: List<String>? = null,
     val availableSkills: List<String>? = null,
+    /** 관문 확인용으로만 넘기는 기체(남은 이유가 잔여 파지 표시뿐). [passed] 가 참이어도 일반 배정은 서지 않고 조치 제안만 얻는다. 칸이 없던 호스트 본문은 거짓이다. */
+    val gateTrial: Boolean = false,
 )
 
 /** `POST /host/eligibility` 의 답. */
@@ -82,6 +84,9 @@ enum class HostSubmitResult { ACCEPTED, IDEMPOTENT, REJECTED, UNASSIGNED }
  * @param alternativeLocations 그 자재를 든 다른 자리. 빈 목록(든 자리 없음)과 `null`(답 없음 또는 출발 결품 아님)을 접지 않는다
  * @param sourceMissing 이 기체가 출발 결품으로 떨어졌으면 그 자리와 관측. 아니면 `null`
  * @param sourceUnobserved 이 기체가 출발 미관측으로 떨어졌으면 그 자리와 설비가 말한 것. 아니면 `null`(이 칸이 없던 호스트 본문 포함)
+ * @param remedy 이 기체에서 이번 제출이 얻은 조치 탐색 응답(`kind` 가 `FOUND`·`NONE`). 해석하지 않고 그대로 옮긴다. 없으면 `null`
+ * @param remedyWithheld 이 기체의 조치 시퀀스를 계산했으나 사람이 먼저 진단하도록 보류했다
+ * @param residualHoldMarkers 관문 확인용으로 넘긴 표시 기체면 그때 열려 있던 잔여 파지 표시 id. 표시는 이 거절로 풀리지 않는다
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class HostRefusal(
@@ -90,6 +95,9 @@ data class HostRefusal(
     val alternativeLocations: List<String>? = null,
     val sourceMissing: HostSourceMissing? = null,
     val sourceUnobserved: HostSourceUnobserved? = null,
+    val remedy: JsonNode? = null,
+    val remedyWithheld: Boolean = false,
+    val residualHoldMarkers: List<Long> = emptyList(),
 )
 
 /**

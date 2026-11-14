@@ -1,5 +1,6 @@
 import type { Delivered, JobOrderOutcome } from '../api'
 import { FORGOTTEN_JOB_ORDER_TEXT, SUBMIT_RESULT_LABEL, alternativesLabel, kindLabel, sourceMissingLabel, sourceUnobservedLabel } from '../labels'
+import { UnassignedRemedies } from './RejectionSummary'
 
 interface Props {
   /** 어느 임무의 작업 지시인지. 예: `InspectAsset 작업 지시` */
@@ -93,6 +94,7 @@ export function JobOrderNotice({ what, sent }: Props) {
               </li>
             ))}
           </ul>
+          <UnassignedRemedies refusals={outcome.refusals} />
         </>
       )}
       {outcome.excluded.length > 0 && (

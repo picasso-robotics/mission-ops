@@ -30,6 +30,7 @@ import dev.picasso.middleware.OperatorDecision
 import dev.picasso.middleware.PhysicalState
 import dev.picasso.middleware.PrepareSequencedRack
 import dev.picasso.middleware.RemedyOutcome
+import dev.picasso.middleware.RemedySearchRecord
 import dev.picasso.middleware.Route
 import dev.picasso.middleware.ResolveOutcome
 import dev.picasso.middleware.RetirementPort
@@ -91,8 +92,10 @@ enum class SkillFit { FIT, MISSING, UNKNOWN }
  * @param missingSkills [skillFit] 이 [SkillFit.MISSING] 일 때 모자란 스킬. 그 밖에는 비어 있다.
  * @param runningExecutionId 이 기체를 쥔 실행(picasso `PhysicalState.occupiesRobot`). 정착하지 않은 실행과, 리비전으로 다시 돌 수 있는
  *   부분 완료(`PARTIAL`) 실행이다. 없으면 `null`.
- * @param passed 스킬 적합이고 도는 실행이 없으며 판정 이유가 하나도 없다(미해소 잔여 파지 표시 포함, P0-b2).
- * @param reasons 통과하지 못한 이유. 화면에 그대로 보인다.
+ * @param passed 스킬 적합이고 도는 실행이 없으며 판정 이유가 하나도 없다(미해소 잔여 파지 표시 포함, P0-b2). [gateTrial] 이면 예외로 참이다.
+ * @param reasons 통과하지 못한 이유. 화면에 그대로 보인다. [gateTrial] 이면 잔여 파지 표시 사유 하나가 남아 있다.
+ * @param gateTrial **관문 확인용**으로만 넘긴다. 남은 이유가 잔여 파지 표시뿐인 새 접수의 기체다. picasso `assign` 의 `trialOnly` 로 넘겨, 관문이
+ *   사슬 위반으로 거절하면 조치 제안을 얻고([Refusal.remedy]) 통과하면 실행 없이 표시 사유로 뺀다([submit]). 이 기체에 일반 배정은 서지 않는다.
  */
 data class HostEligibility(
     val robotId: String,
@@ -103,6 +106,7 @@ data class HostEligibility(
     val reasons: List<String>,
     val requiredSkills: List<String>? = null,
     val availableSkills: List<String>? = null,
+    val gateTrial: Boolean = false,
 )
 
 /** 미들웨어 `Submission` 넷의 이름(S3a 스펙 §7.6). */
@@ -121,6 +125,11 @@ enum class SubmitResult { ACCEPTED, IDEMPOTENT, REJECTED, UNASSIGNED }
  *   아니다. 둘을 접지 않는다. 어느 `null` 인지는 [sourceMissing] 으로 가른다. 출발 미관측이면 대체 자리를 계산하지 않으므로 `null` 이다.
  * @param sourceMissing 이 기체가 출발 결품으로 떨어졌으면 그 자리와 관측. 아니면 `null` 이다.
  * @param sourceUnobserved 이 기체가 출발 미관측으로 떨어졌으면 그 자리와 설비가 말한 것. 아니면 `null` 이다.
+ * @param remedy 이 기체에서 이번 제출이 조치 탐색 기록에 적은 응답([SubmitOutcome.remedy] 와 같은 모양). 제안은 (기체, 작업 지시)마다 서므로
+ *   후보마다 따로 싣는다. 탐색하지 않았거나 보류했으면 `null` 이다.
+ * @param remedyWithheld 이 기체의 조치 시퀀스를 계산했으나 사람이 먼저 진단하도록 보류했다.
+ * @param residualHoldMarkers 관문 확인용([HostEligibility.gateTrial])으로 넘긴 기체면 그때 열려 있던 잔여 파지 표시 id. 표시는 이 거절로 풀리지
+ *   않는다. 그 밖의 기체는 비어 있다.
  */
 data class Refusal(
     val robotId: String,
@@ -128,6 +137,9 @@ data class Refusal(
     val alternativeLocations: List<String>? = null,
     val sourceMissing: SourceMissingView? = null,
     val sourceUnobserved: SourceUnobservedView? = null,
+    val remedy: RemedyView? = null,
+    val remedyWithheld: Boolean = false,
+    val residualHoldMarkers: List<Long> = emptyList(),
 ) {
     companion object {
         /**
@@ -612,6 +624,13 @@ class MissionHost(
     private val openHolds = mutableListOf<ResidualHoldRow>()
 
     /**
+     * 관문 확인용으로 넘긴 표시 기체에 이번 인스턴스가 세운 조치 제안과 그때 열려 있던 표시 id. (기체, 작업 지시)에서. 값 없는 승인의 표시 예외는
+     * 여기 있는 제안에만 준다([attemptApproval]) — 표시가 서기 전에 선 묵은 제안이나, 뒤 시도에서 관문이 통과시킨 기체의 남은 제안은 받지 않는다.
+     * 메모리에만 둔다. picasso 의 제안 장부도 메모리라 재기동 뒤에는 같이 없다.
+     */
+    private val trialProposals = mutableMapOf<Pair<String, String>, Set<Long>>()
+
+    /**
      * 이 인스턴스에서 건 운영자 취소. 실행 id 에서. 이전 인스턴스의 취소는 그 작업 지시를 다시 지은 실행에 다시 건 것만 싣는다([carryCancel]).
      * 놓은 실행의 것은 지운다(정착 이벤트의 본문과 `execution_cancel` 표에 남는다).
      */
@@ -931,12 +950,20 @@ class MissionHost(
             journalRefusal(attempt.jobOrderId)?.let { return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REMEDY_NOT_APPLIED, it) }
         }
         // **승인도 판정이 막은 기체에는 실행을 세우지 않는다.** 미들웨어 관문은 이 호스트의 제한을 모른다. 제안은 지우지 않는다(관문 거절과 같다).
-        robotRestrictions(attempt.robotId, siteTimings.current() != null, revising = existing?.executionId).takeIf { it.isNotEmpty() }?.let { reasons ->
+        // 잔여 파지 표시만은 예외가 있다: 관문 확인으로 이번 인스턴스가 세운 제안이고 지금 열린 표시가 모두 그때 열려 있던 것이면 표시 사유를 뺀다.
+        val markers = openHolds.filter { it.robotId == attempt.robotId }.map { it.markerId }
+        val excepted = !existed && markers.isNotEmpty() && trialProposals[attempt.robotId to attempt.jobOrderId]?.containsAll(markers) == true
+        robotRestrictions(attempt.robotId, siteTimings.current() != null, revising = existing?.executionId, holds = !excepted).takeIf { it.isNotEmpty() }?.let { reasons ->
             return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 호스트 판정: ${reasons.joinToString("; ")}")
         }
         val outcome = approve(middleware, attempt)
         if (outcome is ApprovalOutcome.Approved) {
-            if (!existed) {
+            if (!existed && excepted) {
+                // 표시 기체의 회복 실행은 일지·판단 기록·표시 연결을 한 트랜잭션에 적는다 — 승인된 조치 열이 복원 기록에서 빠지지 않게.
+                val execution = middleware.executions().first { it.executionId == outcome.executionId }
+                journalRecovery(execution, markers, attempt.approver.id)
+                trialProposals.remove(attempt.robotId to attempt.jobOrderId)
+            } else if (!existed) {
                 val execution = middleware.executions().first { it.executionId == outcome.executionId }
                 journal(execution)
                 persistRecord(execution.executionId)
@@ -972,7 +999,7 @@ class MissionHost(
     }
     private fun eligibilityCurrent(order: JobOrder, robotIds: List<String>): List<HostEligibility> = lock.withLock {
         val applied = siteTimings.current() != null
-        robotIds.distinct().map { judge(order, it, applied) }
+        robotIds.distinct().map { judge(order, it, applied, trialable = true) }
     }
 
     /**
@@ -1017,7 +1044,7 @@ class MissionHost(
         // 판정 없이 그 기체로 넘겨 picasso 의 IDEMPOTENT·거부를 그대로 낸다.
         val revising = existing?.takeIf { revises(it, order) }
         val judged = when {
-            existing == null -> candidates.distinct().map { judge(order, it, applied) }
+            existing == null -> candidates.distinct().map { judge(order, it, applied, trialable = true) }
             revising != null -> listOf(judge(order, revising.robotId, applied, revising = revising.executionId))
             else -> emptyList()
         }
@@ -1034,9 +1061,11 @@ class MissionHost(
         // 개정할 기존 실행의 기체가 빠졌다. 개정은 그 기체에서만 일어나므로 `assign` 을 부르지 않는다.
         if (existed && passed.isEmpty()) return@withLock SubmitOutcome(SubmitResult.UNASSIGNED, null, null, null, emptyList(), excluded)
         val searched = middleware.remedySearches().size
+        // 관문 확인용 기체(새 접수만, [HostEligibility.gateTrial]). picasso 가 통과시켜도 채택하지 않는다 — 판정과 기록이 한 호출이라 틈이 없다(§15.317).
+        val trial = judged.filter { it.gateTrial }.associate { e -> e.robotId to openHolds.filter { it.robotId == e.robotId }.map { it.markerId } }
         signals.confirmations = confirmations.associateBy { it.source }
         val assigned = try {
-            middleware.assign(order, passed)
+            middleware.assign(order, passed, trialOnly = trial.keys)
         } finally {
             signals.confirmations = emptyMap()
         }
@@ -1062,15 +1091,58 @@ class MissionHost(
                 middleware.remedySearches().drop(searched).lastOrNull { it.jobOrderId == order.jobOrderId }?.outcome,
                 excluded,
             )
-            is Unassigned -> SubmitOutcome(
-                SubmitResult.UNASSIGNED, null, null, null,
-                submission.refusals.map { (robotId, reason) ->
-                    Refusal.of(robotId, reason, submission.sourceMissing[robotId], submission.sourceUnobserved[robotId])
-                },
-                excluded,
-            )
+            is Unassigned -> unassigned(order, submission, judged, excluded, trial, middleware.remedySearches().drop(searched))
         }
     }
+
+    /**
+     * UNASSIGNED 를 옮긴다. 관문 확인용 기체([trial], 기체에서 그때 열린 표시 id)는 **사슬 위반으로 거절됐을 때만** 거절과 조치로 싣는다. 사슬 위반은
+     * 이번 제출이 조치 탐색 기록에 그 (기체, 작업 지시)의 줄을 남겼거나(찾음·못 찾음) 제안이 보류된 것이다. 열쇠로 서 있는 제안을 읽지 않는다 —
+     * 앞선 시도의 제안이 이번 답으로 보인다. 관문이 통과시켰거나(`trialPassed`) 다른 사유(자리·구역·결품)로 거절한 확인용 기체는 표시 사유로 뺀
+     * 판정을 [SubmitOutcome.excluded] 에 둔다 — 표시가 막았다는 것이 그 기체의 답이다.
+     */
+    private fun unassigned(
+        order: JobOrder,
+        submission: Unassigned,
+        judged: List<HostEligibility>,
+        excluded: List<HostEligibility>,
+        trial: Map<String, List<Long>>,
+        noted: List<RemedySearchRecord>,
+    ): SubmitOutcome {
+        val refusals = mutableListOf<Refusal>()
+        val held = mutableListOf<HostEligibility>()
+        submission.refusals.forEach { (robotId, reason) ->
+            val base = Refusal.of(robotId, reason, submission.sourceMissing[robotId], submission.sourceUnobserved[robotId])
+            val line = noted.lastOrNull { it.robotId == robotId && it.jobOrderId == order.jobOrderId }?.outcome
+            val remedy = when (line) {
+                is RemedyOutcome.Found -> RemedyView.Found(line.steps.map(RemedyStepView::of))
+                is RemedyOutcome.None -> RemedyView.None(line.cause.name, line.unmet.map(UnmetView::of))
+                else -> null
+            }
+            val withheld = line == RemedyOutcome.Withheld
+            val markers = trial[robotId]
+            when {
+                markers == null -> refusals += base.copy(remedy = remedy, remedyWithheld = withheld)
+                remedy != null || withheld -> {
+                    refusals += base.copy(remedy = remedy, remedyWithheld = withheld, residualHoldMarkers = markers)
+                    // 승인할 수 있는 제안(찾음·보류)만 표시 예외의 근거다. 못 찾음은 제안이 없다.
+                    if (remedy is RemedyView.Found || withheld) trialProposals[robotId to order.jobOrderId] = markers.toSet()
+                    else trialProposals.remove(robotId to order.jobOrderId)
+                }
+                else -> {
+                    held += heldBack(judged, robotId)
+                    trialProposals.remove(robotId to order.jobOrderId)
+                }
+            }
+        }
+        submission.trialPassed.forEach { held += heldBack(judged, it) }
+        (trial.keys - submission.refusals.keys).forEach { trialProposals.remove(it to order.jobOrderId) }
+        return SubmitOutcome(SubmitResult.UNASSIGNED, null, null, null, refusals, excluded + held)
+    }
+
+    /** 관문 확인용으로 넘겼으나 표시가 막은 기체의 판정 — 통과 표시를 거둔다. 사유는 판정이 이미 든 표시 사유다. */
+    private fun heldBack(judged: List<HostEligibility>, robotId: String): HostEligibility =
+        judged.first { it.robotId == robotId }.copy(passed = false, gateTrial = false)
 
     /**
      * picasso 가 [order] 로 [execution] 을 실제로 개정하는가. picasso `Middleware.revise` 가 개정 전에 돌려보내는 조건을 그 순서대로 옮긴
@@ -1122,6 +1194,29 @@ class MissionHost(
             throw JournalWriteFailed(execution.executionId, e)
         }
         journaled[order.jobOrderId] = order.version
+    }
+
+    /**
+     * 표시 기체의 회복 실행(값 없는 승인의 표시 예외, [attemptApproval])을 적는다. 실행 일지, 판단 기록, 표시와 실행의 연결을 **한 트랜잭션**에 둔다.
+     * 판단 기록을 따로 적으면 그 실패가 경고로 끝나 다음 pump 전에 죽을 때 승인된 조치 열이 복원 기록에서 빠진다. 실패는 [JournalWriteFailed] 다.
+     */
+    private fun journalRecovery(execution: Middleware.Execution, markers: List<Long>, approverId: String) {
+        val order = execution.order
+        val text = changedRecords().firstOrNull { it.first.executionId == execution.executionId }?.second
+        try {
+            records.inTransaction {
+                records.journal(
+                    order.jobOrderId, execution.robotId, orderJson(order), order.workMasterId, execution.missionVersion,
+                    middleware.instanceId, execution.executionId,
+                )
+                text?.let { writeRecord(execution, it) }
+                markers.forEach { records.residualHoldRecovery(it, execution.executionId, order.jobOrderId, approverId) }
+            }
+        } catch (e: Exception) {
+            throw JournalWriteFailed(execution.executionId, e)
+        }
+        journaled[order.jobOrderId] = order.version
+        text?.let { recorded[order.jobOrderId] = it }
     }
 
     private fun orderJson(order: JobOrder): String = json.writeValueAsString(
@@ -1833,7 +1928,7 @@ class MissionHost(
     }
 
     /** [revising] 은 개정할 기존 실행이다. 그 실행 자신은 그 기체를 쥐어도 도는 실행으로 세지 않는다([submit]). */
-    private fun judge(order: JobOrder, robotId: String, applied: Boolean, revising: String? = null): HostEligibility {
+    private fun judge(order: JobOrder, robotId: String, applied: Boolean, revising: String? = null, trialable: Boolean = false): HostEligibility {
         val active = requireNotNull(catalog.active(order.workMasterId)) { "카탈로그에 없는 WorkMaster 다: ${order.workMasterId}" }
         val needed = active.capability.plan(order).filter { it.route == Route.ROBOT }.map { it.skillType }.toSortedSet()
         val declared = robots.capabilities(robotId)?.skillsList?.map { it.skillType }?.toSet()
@@ -1852,7 +1947,12 @@ class MissionHost(
             }
             addAll(robotRestrictions(robotId, applied, revising))
         }
-        return HostEligibility(robotId, fit, missing, running, passed = reasons.isEmpty(), reasons = reasons, requiredSkills = needed.toList(), availableSkills = declared?.sorted())
+        // 남은 이유가 잔여 파지 표시 하나뿐인 새 접수면 관문 확인용으로 넘긴다(§15.317). 개정([revising])에는 쓰지 않는다 — picasso 도 막지만 이 호스트가 먼저 막는다.
+        val trial = trialable && revising == null && reasons.size == 1 && reasons.single().startsWith(RESIDUAL_HOLD_REASON)
+        return HostEligibility(
+            robotId, fit, missing, running, passed = reasons.isEmpty() || trial, reasons = reasons,
+            requiredSkills = needed.toList(), availableSkills = declared?.sorted(), gateTrial = trial,
+        )
     }
 
     /** 이 기체를 쥔 실행(개정할 [revising] 자신은 빼고). */
@@ -1864,12 +1964,12 @@ class MissionHost(
      * 일지 막힘. 판정([judge])과 값 없는 승인([attemptApproval])이 같은 함수를 쓴다: 승인 접수는 미들웨어 관문을 다시 지나지만 관문은 이 호스트의
      * 제한을 모르므로, 여기서 따로 보지 않으면 승인이 판정이 막은 기체에 실행을 세운다. 호스트 잠금 아래에서 부른다.
      */
-    private fun robotRestrictions(robotId: String, applied: Boolean, revising: String? = null): List<String> = buildList {
+    private fun robotRestrictions(robotId: String, applied: Boolean, revising: String? = null, holds: Boolean = true): List<String> = buildList {
         runningOn(robotId, revising)?.let { add("진행 중인 실행이 있다: $it") }
         val (unrestored, closedUnconfirmed) = unrestoredOn(robotId)
         unrestored.takeIf { it.isNotEmpty() }?.let { add("$UNRESTORED_REASON: ${it.joinToString(", ")}") }
         closedUnconfirmed.takeIf { it.isNotEmpty() }?.let { add("$CLOSED_UNCONFIRMED_REASON: ${it.joinToString(", ")}") }
-        openHolds.filter { it.robotId == robotId }.takeIf { it.isNotEmpty() }
+        openHolds.filter { holds && it.robotId == robotId }.takeIf { it.isNotEmpty() }
             ?.let { holds -> add("$RESIDUAL_HOLD_REASON: ${holds.joinToString(", ") { "${it.jobOrderId} ${it.unitId}" }}") }
         if (!applied) add(UNAPPLIED_REASON)
         if (journalBlocked().isNotEmpty()) add("실행 일지 저장 실패: 호스트 복구 전 배정 차단")
