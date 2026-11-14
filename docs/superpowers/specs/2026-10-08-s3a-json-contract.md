@@ -343,7 +343,9 @@ InspectAsset 예:
 
 ### 5.4 `POST /host/robots/{robotId}/residual-holds/{markerId}/clear`(P0-b2)
 
-`markerId` 가 양의 정수가 아니면 400 `BAD_REQUEST`(«markerId 는 양의 정수다: <값>»). 본문 `{approverId, reason, requestId?}`(규칙은 5.2 와 같음). 200 본문 칸 3개 `hold`(5.3 의 표시 하나)·`clearing`(4칸 `approverId`·`approverKind`·`reason`·`clearedAt`)·`requestId`. 404 `RESIDUAL_HOLD_NOT_FOUND`(그 기체에 그 표시 없음, «기체 <robotId> 에 잔여 파지 표시 <markerId> 가 없다»), 409 `RESIDUAL_HOLD_ALREADY_CLEARED`(«잔여 파지 표시 <markerId> 는 이미 해소했다(<approverId>, <clearedAt>)»), 403 `APPROVER_REFUSED`(에이전트 승인자, REST 로는 안 남). 해소하면 판정이 곧바로 그 기체를 다시 봄.
+`markerId` 가 양의 정수가 아니면 400 `BAD_REQUEST`(«markerId 는 양의 정수다: <값>»). 본문 `{approverId, reason, requestId?, cited?}`(앞 셋 규칙은 5.2 와 같음, `requestId` 는 해소·충돌 행에 정규형으로 적고 없으면 호스트가 만듦). `cited`(B2)는 없거나 null 이거나 객체 `{conflictRequestId(UUID 문자열), kind(비어 있지 않은 문자열), objectRef?(문자열|null, 빈 문자열은 null), session?(문자열|null), sequence?(10진 정수 문자열|null, 하위 호환으로 JSON 정수도 받음)}` 이고 모양이 틀리면 400 `BAD_REQUEST`. 200 본문 칸 3개 `hold`(5.3 의 표시 하나)·`clearing`(8칸 `approverId`·`approverKind`·`reason`·`clearedAt`·`requestId`·`observation`·`conflictRequestId`·`acknowledgedMismatch`)·`requestId`(해소 행의 요청 id). 404 `RESIDUAL_HOLD_NOT_FOUND`(그 기체에 그 표시 없음, «기체 <robotId> 에 잔여 파지 표시 <markerId> 가 없다»), 409 `RESIDUAL_HOLD_ALREADY_CLEARED`(«잔여 파지 표시 <markerId> 는 이미 해소했다(<approverId>, <clearedAt>)»), 403 `APPROVER_REFUSED`(에이전트 승인자, REST 로는 안 남). 해소하면 판정이 곧바로 그 기체를 다시 봄.
+
+관측 대조(B2): 표시·이미 해소 확인 뒤 호스트 잠금 아래에서 1) 같은 `requestId` 의 충돌 행이 있으면 그 저장된 충돌을 그대로 409 로 돌려줌(재전송·재기동 뒤에도, 새 행 없음. 다른 표시의 충돌이면 409 `REQUEST_ID_REUSED`). 2) `cited` 가 있으면 저장된 충돌 `cited.conflictRequestId` 와 대조: 있음, 같은 표시, 같은 승인자, `kind`·`objectRef`·`session`·`sequence` 가 저장값과 같음(null 끼리 같음). 하나라도 어긋나면 400 `RESIDUAL_HOLD_CITATION_INVALID`(행 없음). 3) 기체 스냅숏을 지금 한 번 읽음(못 읽으면 `UNREADABLE`, 손을 말하지 않으면 `UNSPECIFIED`, 관측 불가 `NOT_OBSERVABLE`). 4) 지금 `HOLDING` 이고 `cited` 가 없거나 손이 다르면(물품 이름 다름, 세션 한쪽만 미상, 다른 세션, 같은 세션에서 순번 역행) 이번 `requestId` 로 충돌 행을 적고 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`. 지금 `HOLDING` 이고 같은 손이면 해소(`acknowledgedMismatch` 참, `conflictRequestId` 연결). 지금 `HOLDING` 이 아니면 해소(`acknowledgedMismatch` 거짓, `cited` 가 있었으면 그 충돌 연결). 409 본문 칸 6개 이 순서 `error`·`detail`·`robotId`·`markerId`·`conflictRequestId`·`observation`. `observation`(해소 행 `clearing.observation` 도 같음) 칸 8개 이 순서 `observedKind`·`observedObjectRef`·`observedDetail`·`snapshotSession`·`snapshotSequence`·`snapshotOccurredAt`(발신자 시계의 응답 시각)·`hostReadStartedAt`·`hostReadReceivedAt`. `snapshotSequence` 는 10진 문자열이다(2^53 을 넘으면 JS 숫자가 정밀도를 잃어 화면 왕복 뒤 지목이 저장값과 달라진다). 화면은 그 문자열을 그대로 `cited.sequence` 로 돌려보낸다. 다른 표시의 해소 행에 이미 쓴 요청 id 도 409 `REQUEST_ID_REUSED`. V15 전 옛 해소 행은 `requestId` null, `observedKind` `NOT_RECORDED`.
 
 ```json
 {"approverId": "park", "reason": "현장에서 기체 빈손 확인", "requestId": "0b7d4c55-9a51-4f3e-8d5c-6b7a6f1c2a9e"}
@@ -361,7 +363,23 @@ InspectAsset 예:
 {"error": "RESIDUAL_HOLD_ALREADY_CLEARED", "detail": "잔여 파지 표시 1 는 이미 해소했다(park, 2026-10-14T01:10:00.000001Z)"}
 ```
 
-(예의 시각·id 값은 보기다. 근거 시험: `ExecutionControlTest` 여섯, 칸 순서는 거기서 대조.)
+```json
+{
+  "error": "RESIDUAL_HOLD_OBSERVATION_MISMATCH",
+  "detail": "발신자는 기체 humanoid-01 가 지금 C-1 를 들고 있다고 말한다. 현장에서 빈손을 확인했으면 이 관측(충돌 0b7d4c55-...)을 지목해 다시 확인한다. ...",
+  "robotId": "humanoid-01",
+  "markerId": 1,
+  "conflictRequestId": "0b7d4c55-9a51-4f3e-8d5c-6b7a6f1c2a9e",
+  "observation": {"observedKind": "HOLDING", "observedObjectRef": "C-1", "observedDetail": null, "snapshotSession": "s-1", "snapshotSequence": "42",
+    "snapshotOccurredAt": "2026-10-14T01:09:59.900Z", "hostReadStartedAt": "2026-10-14T01:10:00Z", "hostReadReceivedAt": "2026-10-14T01:10:00Z"}
+}
+```
+
+### 5.4a `GET /host/robots/{robotId}/residual-holds/{markerId}`(B2)
+
+호스트 잠금을 잡고 DB 를 읽음(처리 중인 해소가 잠금 안에서 스냅숏을 읽는 동안 기다림. 그래서 응답 없음 뒤 재조회가 처리 중인 해소를 «해소 행 없음» 으로 확정하지 않음. 운영 서비스는 시간 초과면 모름). 200 본문 칸 2개 `hold`(5.3 의 표시 하나)·`clearing`(5.4 의 해소 행, 해소하지 않았으면 null). 그 기체에 그 표시가 없으면 404 `RESIDUAL_HOLD_NOT_FOUND`, `markerId` 가 양의 정수가 아니면 400 `BAD_REQUEST`. 운영 서비스의 응답 없음 뒤 재조회가 씀.
+
+(예의 시각·id 값은 보기다. 근거 시험: `ExecutionControlTest`, 칸 순서는 거기서 대조.)
 
 ### 5.5 실행의 `permitBlock` 칸(ADR 52)
 
@@ -502,7 +520,8 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 | `POST /host/executions/{executionId}/cancel` | 결과 넷 전부(5.2) | `BAD_REQUEST`(그 밖 409 `INSTANCE_MISMATCH`, 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `POST /host/executions/{executionId}/release` | 결과 다섯 전부(5.10) | `BAD_REQUEST`(그 밖 409 `INSTANCE_MISMATCH`, 409 `REQUEST_ID_REUSED`, 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `GET /host/robots/residual-holds` | 늘 | 없음 | 없음 |
-| `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` | 해소함 | `BAD_REQUEST`(그 밖 404 `RESIDUAL_HOLD_NOT_FOUND`, 409 `RESIDUAL_HOLD_ALREADY_CLEARED`, 403 `APPROVER_REFUSED`(REST 로는 안 남), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
+| `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` | 해소함 | `BAD_REQUEST`(그 밖 400 `RESIDUAL_HOLD_CITATION_INVALID`, 404 `RESIDUAL_HOLD_NOT_FOUND`, 409 `RESIDUAL_HOLD_ALREADY_CLEARED`, 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`, 409 `REQUEST_ID_REUSED`, 403 `APPROVER_REFUSED`(REST 로는 안 남), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
+| `GET /host/robots/{robotId}/residual-holds/{markerId}` | 늘 | `BAD_REQUEST`(그 밖 404 `RESIDUAL_HOLD_NOT_FOUND`) | 없음 |
 | 현장 `GET /cell` | 늘 | 없음(405·404 는 위 1절) | 없음 |
 
 호스트가 안 닿으면(연결 실패) 운영 서비스가 503·NO_RESPONSE 로 다룬다(스펙 §8). 취소·해소(P0-b2)·결함 수용(5.10) 기록 실패는 500 `RECORD_WRITE_FAILED`, 실행 일지 쓰기 실패는 500 `JOURNAL_WRITE_FAILED`(S4b H6, 이 PR 전부터)다. 운영 서비스는 호스트 5xx 를 응답 없음으로 다루고 재조회한다.
@@ -711,9 +730,9 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 - `GET /api/robots/residual-holds`: 모드 헤더 없이 됨. 호스트 5.3 본문 그대로. 호스트가 안 닿으면 503 `HOST_SILENT`(«실행 호스트가 답하지 않는다: <cause>»).
 - 두 POST 공통: 운영자 모드만. 판정 순서 1) 400 `ACTOR_REQUIRED` 2) 403 `MODE_NOT_ALLOWED` 3) 본문(취소: 본문이 객체가 아니거나 `instanceId` 가 비어 있지 않은 문자열이 아니면 400 `CANCEL_BAD_REQUEST` «instanceId 는 비어 있지 않은 문자열이다(실행 목록의 instanceId)»; 해소: `markerId` 가 양의 정수가 아니면 400 `CLEAR_BAD_REQUEST` «markerId 는 양의 정수다: <값>») 4) 사유(앞뒤 공백 뗀 뒤 비면 400 `REASON_REQUIRED`, «취소 사유가 없다»·«빈손 확인 사유가 없다»). 1~4 는 조작 기록에 남지 않음. 그 뒤는 호스트가 무엇을 답했든 200. 승인자는 본문에 없고 `X-Ops-User`. 요청 id 는 운영 서비스가 만들어 호스트에 넘김.
 - 취소 본문 `{instanceId, reason}`, 200 칸 7개 이 순서 `requestId`·`executionId`·`result`·`confirmation`·`outcome`(호스트 `result` 이름, 호스트가 200 으로 답했을 때만)·`answer`(호스트 200 본문)·`rejection`(호스트 4xx 일 때 `{status, error, detail}`).
-- 빈손 확인 본문 `{reason}`, 200 칸 7개 이 순서 `requestId`·`robotId`·`markerId`·`result`·`confirmation`·`answer`·`rejection`.
-- `result`: 취소는 `CANCELED` → `SUCCEEDED`, `NOT_CANCELABLE`·`NOT_FOUND`·`REFUSED` 와 호스트 4xx → `REJECTED`. 빈손 확인은 200 본문에 객체 `clearing` 이 있으면 `SUCCEEDED`, 404·409 → `REJECTED`. 둘 다 연결 실패·시간 초과·5xx·200 인데 본문을 못 읽음 → `NO_RESPONSE` 와 1초 뒤 재조회 한 번: 취소는 `GET /host/executions` 의 인스턴스가 요청 인스턴스와 같고 그 실행의 `cancel.approverId` 가 행위자이며 `recordedAt` ≥ 보내기 직전 운영 서비스 시각이면 `CONFIRMED_APPLIED`, 실행이 없거나 그런 `cancel` 이 없으면 `CONFIRMED_NOT_APPLIED`, 인스턴스가 다르거나 못 읽으면 null(확인 행 없음). 빈손 확인은 `GET /host/robots/residual-holds` 에 그 `markerId` 가 없으면 `CONFIRMED_APPLIED`, 있으면 `CONFIRMED_NOT_APPLIED`, 못 읽으면 null.
-- 조작 기록: 취소 `target` = 실행 id, `request` = `{"op":"CANCEL_EXECUTION","executionId","approverId","instanceId"}`; 빈손 확인 `target` = `<robotId>/<markerId>`, `request` = `{"op":"CONFIRM_ROBOT_EMPTY","robotId","markerId"(수),"approverId"}`; `reason` = 입력 사유; `targetResponse` 와 재조회 행 규칙은 9.3 과 같음(재조회 행 `observed` 는 취소면 그 실행, 빈손 확인이면 남아 있는 표시 또는 null).
+- 빈손 확인 본문 `{reason, cited?}`, 200 칸 7개 이 순서 `requestId`·`robotId`·`markerId`·`result`·`confirmation`·`answer`·`rejection`. `cited`(B2)는 호스트 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 의 충돌을 다시 확인할 때 지목하는 것이고 요청 본문에서만 옴(운영 서비스가 호스트 응답이나 목록으로 채우지 않음). 모양(5.4)이 틀리면 3)의 본문 단계에서 400 `CLEAR_BAD_REQUEST`. 다섯 칸만 옮겨 호스트에 보냄. `rejection` 은 `{status, error, detail}` 에 더해 호스트 4xx 본문에 `error`·`detail` 밖의 칸이 있으면 `fields`(그 칸들, 어긋남이면 `robotId`·`markerId`·`conflictRequestId`·`observation`)를 실음. 없으면 `fields` 칸이 없음.
+- `result`: 취소는 `CANCELED` → `SUCCEEDED`, `NOT_CANCELABLE`·`NOT_FOUND`·`REFUSED` 와 호스트 4xx → `REJECTED`. 빈손 확인은 200 본문에 객체 `clearing` 이 있으면 `SUCCEEDED`, 400·404·409(어긋남 포함) → `REJECTED`. 둘 다 연결 실패·시간 초과·5xx·200 인데 본문을 못 읽음 → `NO_RESPONSE` 와 1초 뒤 재조회 한 번: 취소는 `GET /host/executions` 의 인스턴스가 요청 인스턴스와 같고 그 실행의 `cancel.approverId` 가 행위자이며 `recordedAt` ≥ 보내기 직전 운영 서비스 시각이면 `CONFIRMED_APPLIED`, 실행이 없거나 그런 `cancel` 이 없으면 `CONFIRMED_NOT_APPLIED`, 인스턴스가 다르거나 못 읽으면 null(확인 행 없음). 빈손 확인은 읽기만 함(다시 보내지 않음): `GET /host/robots/{robotId}/residual-holds/{markerId}`(5.4a)의 `clearing.requestId` 가 이 요청 id 면 `CONFIRMED_APPLIED`, 해소 행이 없거나(표시 없음 404 포함) 다른 요청의 해소면 `CONFIRMED_NOT_APPLIED`, 못 읽으면 null.
+- 조작 기록: 취소 `target` = 실행 id, `request` = `{"op":"CANCEL_EXECUTION","executionId","approverId","instanceId"}`; 빈손 확인 `target` = `<robotId>/<markerId>`, `request` = `{"op":"CONFIRM_ROBOT_EMPTY","robotId","markerId"(수),"approverId","cited"(있을 때만)}`; `reason` = 입력 사유; `targetResponse` 와 재조회 행 규칙은 9.3 과 같음(재조회 행 `observed` 는 취소면 그 실행, 빈손 확인이면 5.4a 본문 또는 null).
 
 ```json
 {

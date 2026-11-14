@@ -14,6 +14,7 @@ import type {
 } from '../api'
 import { CANCEL_RESULT_LABEL, EXECUTION_CONTROL_TEXT as TEXT, RELEASE_RESULT_LABEL } from '../labels'
 import { executionsView, holdResolved, installFakeOps } from '../testing/fakeOps'
+import { ResidualHolds } from './ExecutionControls'
 import { OperationsArea } from './OperationsArea'
 
 const operator: Session = { mode: 'operator', user: 'kim' }
@@ -542,6 +543,155 @@ describe('잔여 파지 확인', () => {
     await within(read).findByRole('table', { name: '미해소 잔여 파지' })
     expect(within(read).queryByRole('button', { name: TEXT.emptyButton })).toBeNull()
     expect(within(read).getByText(TEXT.emptyOperatorOnly)).toBeInTheDocument()
+  })
+
+  it('어긋남이면 폼을 열어 둔 채 관측을 보이고 체크를 켜야 그 응답의 지목으로 다시 확인하며 또 어긋나면 새 관측으로 바꾸고 체크를 끈다', async () => {
+    const observation = (sequence: string, objectRef: string | null) => ({
+      observedKind: 'HOLDING', observedObjectRef: objectRef, observedDetail: null, snapshotSession: 's-1', snapshotSequence: sequence,
+      snapshotOccurredAt: '2026-10-13T09:00:00Z', hostReadStartedAt: '2026-10-13T09:00:00Z', hostReadReceivedAt: '2026-10-13T09:00:00.100Z',
+    })
+    const mismatched = (conflictRequestId: string, sequence: string, objectRef: string | null) =>
+      emptied({
+        result: 'REJECTED',
+        rejection: {
+          status: 409, error: 'RESIDUAL_HOLD_OBSERVATION_MISMATCH', detail: '발신자는 지금 든 채라고 말한다',
+          fields: { robotId: 'humanoid-01', markerId: 7, conflictRequestId, observation: observation(sequence, objectRef) },
+        },
+      })
+    const fake = installFakeOps(emptyList)
+    fake.residualHolds = { holds: [hold()] }
+    fake.answers.set(CLEAR, { status: 200, body: mismatched('c-1', '9007199254740993', 'C-1') })
+    open()
+    const region = await screen.findByRole('region', { name: TEXT.holdsHeading })
+    await userEvent.click(await within(region).findByRole('button', { name: TEXT.emptyButton }))
+    const form = within(region).getByRole('form', { name: TEXT.emptyButton })
+    await userEvent.type(within(form).getByLabelText(TEXT.emptyReason), '그리퍼 비어 있음 육안 확인')
+    await userEvent.click(within(form).getByLabelText(TEXT.emptyConfirm))
+    await userEvent.click(within(form).getByRole('button', { name: TEXT.emptyButton }))
+
+    expect(await within(region).findByRole('status', { name: '빈손 확인 결과' })).toHaveTextContent(TEXT.mismatchResult)
+    const box = await within(form).findByRole('group', { name: TEXT.mismatchHeading })
+    expect(box).toHaveTextContent('HOLDING')
+    expect(box).toHaveTextContent('s-1')
+    expect(box).toHaveTextContent('9007199254740993')
+    expect(box).toHaveTextContent('2026-10-13T09:00:00.100Z')
+    const acknowledge = within(box).getByLabelText(TEXT.mismatchAcknowledge('C-1'))
+    const again = within(box).getByRole('button', { name: TEXT.reconfirmButton })
+    expect(acknowledge).not.toBeChecked()
+    expect(again).toBeDisabled()
+    await userEvent.click(acknowledge)
+    expect(again).toBeEnabled()
+
+    // 또 어긋남: 새 관측으로 바꾸고 체크를 끈다.
+    fake.answers.set(CLEAR, { status: 200, body: mismatched('c-2', '15', null) })
+    await userEvent.click(again)
+    const renewed = await within(form).findByLabelText(TEXT.mismatchAcknowledge(TEXT.objectUnnamed))
+    expect(renewed).not.toBeChecked()
+    expect(within(form).getByRole('button', { name: TEXT.reconfirmButton })).toBeDisabled()
+
+    await userEvent.click(renewed)
+    fake.answers.set(CLEAR, { status: 200, body: emptied() })
+    fake.residualHolds = { holds: [] }
+    await userEvent.click(within(form).getByRole('button', { name: TEXT.reconfirmButton }))
+    expect(await within(region).findByText(TEXT.holdsEmpty)).toBeInTheDocument()
+    expect(within(region).getByRole('status', { name: '빈손 확인 결과' })).toHaveTextContent(TEXT.emptyDone)
+
+    expect(posts(fake, CLEAR).map((call) => call.body)).toEqual([
+      { reason: '그리퍼 비어 있음 육안 확인' },
+      { reason: '그리퍼 비어 있음 육안 확인', cited: { conflictRequestId: 'c-1', kind: 'HOLDING', objectRef: 'C-1', session: 's-1', sequence: '9007199254740993' } },
+      { reason: '그리퍼 비어 있음 육안 확인', cited: { conflictRequestId: 'c-2', kind: 'HOLDING', objectRef: null, session: 's-1', sequence: '15' } },
+    ])
+  })
+
+  it('폼을 닫으면 지목을 버려 다음 확인은 지목 없이 보내고 지목 무효는 그 이름으로 알린다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.residualHolds = { holds: [hold()] }
+    fake.answers.set(CLEAR, {
+      status: 200,
+      body: emptied({
+        result: 'REJECTED',
+        rejection: {
+          status: 409, error: 'RESIDUAL_HOLD_OBSERVATION_MISMATCH', detail: 'x',
+          fields: {
+            conflictRequestId: 'c-1',
+            observation: {
+              observedKind: 'HOLDING', observedObjectRef: 'C-1', observedDetail: null, snapshotSession: null, snapshotSequence: '3',
+              snapshotOccurredAt: null, hostReadStartedAt: 't', hostReadReceivedAt: 't',
+            },
+          },
+        },
+      }),
+    })
+    open()
+    const region = await screen.findByRole('region', { name: TEXT.holdsHeading })
+    const fill = async () => {
+      const form = within(region).getByRole('form', { name: TEXT.emptyButton })
+      await userEvent.type(within(form).getByLabelText(TEXT.emptyReason), '확인')
+      await userEvent.click(within(form).getByLabelText(TEXT.emptyConfirm))
+      return form
+    }
+    await userEvent.click(await within(region).findByRole('button', { name: TEXT.emptyButton }))
+    const form = await fill()
+    await userEvent.click(within(form).getByRole('button', { name: TEXT.emptyButton }))
+    const box = await within(form).findByRole('group', { name: TEXT.mismatchHeading })
+    await userEvent.click(within(box).getByRole('button', { name: '닫기' }))
+    expect(within(region).queryByRole('form', { name: TEXT.emptyButton })).toBeNull()
+
+    fake.answers.set(CLEAR, {
+      status: 200,
+      body: emptied({ result: 'REJECTED', rejection: { status: 400, error: 'RESIDUAL_HOLD_CITATION_INVALID', detail: '저장값과 다르다' } }),
+    })
+    await userEvent.click(within(region).getByRole('button', { name: TEXT.emptyButton }))
+    const reopened = await fill()
+    expect(within(reopened).queryByRole('group', { name: TEXT.mismatchHeading })).toBeNull()
+    await userEvent.click(within(reopened).getByRole('button', { name: TEXT.emptyButton }))
+    expect(await within(region).findByRole('status', { name: '빈손 확인 결과' })).toHaveTextContent(TEXT.citationInvalidResult)
+    expect(posts(fake, CLEAR).map((call) => call.body)).toEqual([{ reason: '확인' }, { reason: '확인' }])
+  })
+
+  it('고른 표시가 목록에서 사라지면 지목과 체크와 선택을 버려 다시 보여도 살아나지 않는다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.residualHolds = { holds: [hold()] }
+    fake.answers.set(CLEAR, {
+      status: 200,
+      body: emptied({
+        result: 'REJECTED',
+        rejection: {
+          status: 409, error: 'RESIDUAL_HOLD_OBSERVATION_MISMATCH', detail: 'x',
+          fields: {
+            conflictRequestId: 'c-1',
+            observation: {
+              observedKind: 'HOLDING', observedObjectRef: 'C-1', observedDetail: null, snapshotSession: 's-1', snapshotSequence: '3',
+              snapshotOccurredAt: null, hostReadStartedAt: 't', hostReadReceivedAt: 't',
+            },
+          },
+        },
+      }),
+    })
+    const holdsAt = (tick: number) => <ResidualHolds session={operator} tick={tick} onConfirmed={() => undefined} />
+    const view = render(holdsAt(0))
+    const region = await screen.findByRole('region', { name: TEXT.holdsHeading })
+    await userEvent.click(await within(region).findByRole('button', { name: TEXT.emptyButton }))
+    const form = within(region).getByRole('form', { name: TEXT.emptyButton })
+    await userEvent.type(within(form).getByLabelText(TEXT.emptyReason), '확인')
+    await userEvent.click(within(form).getByLabelText(TEXT.emptyConfirm))
+    await userEvent.click(within(form).getByRole('button', { name: TEXT.emptyButton }))
+    await userEvent.click(await within(form).findByLabelText(TEXT.mismatchAcknowledge('C-1')))
+
+    // 다른 손으로 해소되어 목록에서 사라진다(주기 재조회). 그 뒤 같은 표시가 다시 보인다.
+    fake.residualHolds = { holds: [] }
+    view.rerender(holdsAt(1))
+    expect(await within(region).findByText(TEXT.holdsEmpty)).toBeInTheDocument()
+    fake.residualHolds = { holds: [hold()] }
+    view.rerender(holdsAt(2))
+    const back = region
+    await within(back).findByRole('table', { name: '미해소 잔여 파지' })
+    expect(within(back).queryByRole('form', { name: TEXT.emptyButton })).toBeNull()
+    await userEvent.click(within(back).getByRole('button', { name: TEXT.emptyButton }))
+    const reopened = within(back).getByRole('form', { name: TEXT.emptyButton })
+    expect(within(reopened).queryByRole('group', { name: TEXT.mismatchHeading })).toBeNull()
+    expect(within(reopened).getByLabelText(TEXT.emptyConfirm)).not.toBeChecked()
+    expect(within(reopened).getByLabelText(TEXT.emptyReason)).toHaveValue('')
   })
 
   it('표시가 없으면 없다고 보인다', async () => {

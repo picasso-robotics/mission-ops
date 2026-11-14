@@ -2,9 +2,11 @@ package dev.picasso.ops.host
 
 import dev.picasso.ops.host.store.CancelRow
 import dev.picasso.ops.host.store.CloseRow
+import dev.picasso.ops.host.store.HoldObservation
 import dev.picasso.ops.host.store.ResidualHoldClearingRow
 import dev.picasso.ops.host.store.ResidualHoldRow
 import java.time.Instant
+import java.util.UUID
 
 /**
  * 운영자 실행 취소의 결과 이름(P0-b2).
@@ -68,15 +70,43 @@ data class ResidualHoldView(
 /** `GET /host/robots/residual-holds` 의 본문. 표시를 적은 순서다. */
 data class ResidualHoldsView(val holds: List<ResidualHoldView>)
 
-/** 해소 한 행. [clearedAt] 은 적은 DB 시각이다. */
-data class ResidualHoldClearingView(val approverId: String, val approverKind: String, val reason: String, val clearedAt: Instant) {
+/**
+ * 해소 한 행. [clearedAt] 은 적은 DB 시각이다. [requestId] 는 V15 전 옛 행만 `null` 이고 그 행의 [observation] 은 `NOT_RECORDED` 다.
+ * [observation] 은 해소할 때 실행 호스트가 지금 읽은 기체 손이다. [conflictRequestId] 는 지목한 충돌이고 [acknowledgedMismatch] 는 발신자가 지금 든 채라고
+ * 말하는 것을 알고 해소했는가다(관측이 HOLDING 일 때만 참).
+ */
+data class ResidualHoldClearingView(
+    val approverId: String,
+    val approverKind: String,
+    val reason: String,
+    val clearedAt: Instant,
+    val requestId: String?,
+    val observation: HoldObservation,
+    val conflictRequestId: String?,
+    val acknowledgedMismatch: Boolean,
+) {
     companion object {
-        fun of(row: ResidualHoldClearingRow) = ResidualHoldClearingView(row.approverId, row.approverKind, row.reason, row.clearedAt)
+        fun of(row: ResidualHoldClearingRow) = ResidualHoldClearingView(
+            row.approverId, row.approverKind, row.reason, row.clearedAt, row.requestId?.toString(), row.observation,
+            row.conflictRequestId?.toString(), row.acknowledgedMismatch,
+        )
     }
 }
 
-/** `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` 의 200 본문. 해소한 표시와 해소 행이다. */
+/**
+ * `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` 의 200 본문. 해소한 표시와 해소 행이다. [requestId] 는 해소 행의 요청 id 다(요청이 싣지
+ * 않았으면 호스트가 만든 것).
+ */
 data class ResidualHoldClearedView(val hold: ResidualHoldView, val clearing: ResidualHoldClearingView, val requestId: String?)
+
+/** `GET /host/robots/{robotId}/residual-holds/{markerId}` 의 200 본문. 표시와 그 해소 행이다. 해소하지 않았으면 [clearing] 이 `null` 이다. */
+data class ResidualHoldRecordView(val hold: ResidualHoldView, val clearing: ResidualHoldClearingView?)
+
+/**
+ * 빈손 확인에서 지목하는 저장된 충돌의 키(B2). [conflictRequestId] 는 앞서 409 를 받은 요청 id 이고 나머지는 그 409 의 관측을 그대로 옮긴 것이다
+ * (`observedKind`·`observedObjectRef`·`snapshotSession`·`snapshotSequence`). 호스트는 저장된 충돌과 하나라도 다르면 400 으로 막는다.
+ */
+data class CitedConflict(val conflictRequestId: UUID, val kind: String, val objectRef: String?, val session: String?, val sequence: Long?)
 
 /** 잔여 파지 표시 해소의 결과. REST 는 [Cleared] 만 200 이고 나머지는 4xx 다. */
 sealed interface ClearOutcome {
@@ -90,6 +120,18 @@ sealed interface ClearOutcome {
 
     /** 승인자가 사람이 아니다. REST 는 늘 사람 승인자를 만들므로 이 메서드를 직접 부를 때만 난다. */
     data class Refused(val reason: String) : ClearOutcome
+
+    /**
+     * 발신자가 지금 든 채라고 말한다(V15 충돌 행). 해소하지 않았고 표시는 그대로다. [conflictRequestId] 는 그 충돌 행의 요청 id 이고 [observation] 은
+     * 저장한 관측이다. 같은 요청 id 의 재전송도 이 저장된 충돌을 그대로 돌려준다.
+     */
+    data class ObservationMismatch(val conflictRequestId: String, val observation: HoldObservation, val markerId: Long, val robotId: String) : ClearOutcome
+
+    /** 지목한 충돌이 없거나 저장값과 다르다(다른 표시, 다른 승인자, 다른 관측 키). 아무것도 적지 않았다. */
+    data class CitationInvalid(val reason: String) : ClearOutcome
+
+    /** 그 요청 id 를 다른 표시의 충돌이나 해소에 이미 썼다. 아무것도 적지 않았다. */
+    data class RequestReused(val reason: String) : ClearOutcome
 }
 
 /**

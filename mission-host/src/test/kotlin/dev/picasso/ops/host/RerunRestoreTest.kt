@@ -61,7 +61,8 @@ class RerunRestoreTest {
         assertEquals("FAILED", driveUntil(executionId, settledStates)["physicalState"].asText())
         eventually("정착 기록과 잔여 파지 표시") { events(jobOrderId).map { it[0] } == listOf("SETTLED") && get("/host/robots/residual-holds")["holds"].size() == 1 }
         val markerId = get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
-        val cleared = post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""")
+        // mimic 손은 든 채라 첫 확인은 어긋남이다(B2). 현장 확인을 지목해 다시 확인한다.
+        val cleared = clearHeldCiting(HUMANOID, markerId)
         assertEquals(200, cleared.status, cleared.body.toString())
         return executionId
     }

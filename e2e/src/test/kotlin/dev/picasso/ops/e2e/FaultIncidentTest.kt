@@ -156,12 +156,30 @@ class FaultIncidentTest {
         assertEquals(true to true, excluded["eligible"].asBoolean() to excluded["gateTrial"].asBoolean(), "$excluded")
         assertTrue(excluded["host"]["reasons"].any { it.asText() == "잔여 파지 확인 필요: $jobOrderId RACK-204.S01" }, "$excluded")
 
-        // 운영자가 현장에서 빈손을 확인해 표시를 푼다. 그 뒤 단계의 작업 지시가 humanoid-01 에 배정된다.
+        // 운영자가 현장에서 빈손을 확인해 표시를 푼다. 그 뒤 단계의 작업 지시가 humanoid-01 에 배정된다. mimic 손은 아직 든 채라 첫 확인은 어긋남이다(B2):
+        // 실행 호스트가 충돌을 적고 거부하며 그 관측이 호출 결과에 실린다. 운영자가 그 관측을 지목해 다시 확인해야 풀린다.
         val markerId = hold["markerId"].asLong()
-        val cleared = stack.send("POST", "/api/robots/$HUMANOID/residual-holds/$markerId/clear", "operator", body = """{"reason":"현장 빈손 확인"}""")
+        val refused = stack.send("POST", "/api/robots/$HUMANOID/residual-holds/$markerId/clear", "operator", body = """{"reason":"현장 빈손 확인"}""")
+        assertEquals(200 to "REJECTED", refused.status to refused.body!!["result"].asText(), "${refused.body}")
+        val rejection = refused.body["rejection"]
+        assertEquals("RESIDUAL_HOLD_OBSERVATION_MISMATCH", rejection["error"].asText(), "$rejection")
+        val seen = rejection["fields"]["observation"]
+        assertEquals("HOLDING", seen["observedKind"].asText(), "$rejection")
+        assertEquals(1, stack.get("/api/robots/residual-holds")["holds"].size())
+        val cited = json.createObjectNode()
+            .put("conflictRequestId", rejection["fields"]["conflictRequestId"].asText())
+            .put("kind", seen["observedKind"].asText())
+        cited.set<JsonNode>("objectRef", seen["observedObjectRef"])
+        cited.set<JsonNode>("session", seen["snapshotSession"])
+        cited.set<JsonNode>("sequence", seen["snapshotSequence"])
+        val body = json.createObjectNode().put("reason", "현장 빈손 확인")
+        body.set<JsonNode>("cited", cited)
+        val cleared = stack.send("POST", "/api/robots/$HUMANOID/residual-holds/$markerId/clear", "operator", body = body.toString())
         assertEquals(200 to "SUCCEEDED", cleared.status to cleared.body!!["result"].asText(), "${cleared.body}")
+        assertEquals(true, cleared.body["answer"]["clearing"]["acknowledgedMismatch"].asBoolean(), "${cleared.body}")
         assertEquals(0, stack.get("/api/robots/residual-holds")["holds"].size())
-        val clearedRow = operations("CONFIRM_ROBOT_EMPTY").single()
+        assertEquals(listOf("SUCCEEDED", "REJECTED"), operations("CONFIRM_ROBOT_EMPTY").map { it["result"].asText() }.sortedDescending())
+        val clearedRow = operations("CONFIRM_ROBOT_EMPTY").single { it["result"].asText() == "SUCCEEDED" }
         assertEquals(
             listOf("OPERATOR", "kim", "$HUMANOID/$markerId", "SUCCEEDED", "현장 빈손 확인"),
             listOf("mode", "user", "target", "result", "reason").map { clearedRow[it].asText() },

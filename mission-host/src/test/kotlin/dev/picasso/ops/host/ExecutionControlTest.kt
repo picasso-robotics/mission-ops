@@ -17,8 +17,10 @@ import dev.picasso.ops.host.HostBench.Companion.SOURCE
 import dev.picasso.ops.host.HostBench.Companion.inspect
 import dev.picasso.ops.host.HostBench.Companion.rack
 import dev.picasso.ops.host.HostBench.Companion.request
+import dev.picasso.ops.host.web.HostRequests
 import dev.picasso.registry.PostgresSupport
 import java.time.Duration
+import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -171,7 +173,8 @@ class ExecutionControlTest {
             assertEquals("RESIDUAL_HOLD_NOT_FOUND", wrongRobot.body!!["error"].asText())
             assertEquals(1, bench.holds().size)
 
-            val cleared = bench.clear(HUMANOID, markerId)
+            // 든 채 실패라 mimic 손은 아직 HOLDING 이다. 첫 확인은 어긋남이고(B2) 그 관측을 지목해 다시 확인해야 푼다.
+            val cleared = bench.clearHeldCiting(HUMANOID, markerId, reason = "현장에서 기체 빈손 확인")
             assertEquals(200, cleared.status, cleared.body.toString())
             assertEquals(listOf("hold", "clearing", "requestId"), cleared.body!!.fieldNames().asSequence().toList())
             assertEquals(hold, cleared.body["hold"])
@@ -183,6 +186,156 @@ class ExecutionControlTest {
             assertEquals(409, again.status)
             assertEquals("RESIDUAL_HOLD_ALREADY_CLEARED", again.body!!["error"].asText())
             assertEquals(1, count("robot_residual_hold_clearing"))
+            assertEquals(1, count("robot_residual_hold_conflict"))
+        }
+    }
+
+    /** 슬롯 하나 랙을 든 채 실패로 정착시킨다. 그 표시 id 를 돌려준다. mimic 손은 HOLDING 으로 남는다(실패는 파지를 바꾸지 않는다). */
+    private fun HostBench.heldFailure(jobOrderId: String): Long {
+        val executionId = submit(e0Rack(jobOrderId, S01))
+        forceFailure(awaitRunning(S01))
+        assertEquals("FAILED", driveUntil(executionId, SETTLED)["physicalState"].asText())
+        eventually("잔여 파지 표시") { holds().isNotEmpty() }
+        return holds().single()["markerId"].asLong()
+    }
+
+    /**
+     * B2: 발신자가 지금 든 채라고 말하는 기체의 빈손 확인은 해소하지 않고 그 관측을 충돌 행으로 남긴다. 같은 요청 id 의 재전송은 같은 충돌이고, 저장된
+     * 충돌과 다른 지목(물품 이름, 승인자, 없는 충돌)은 400 이며 아무것도 적지 않는다. 재기동 뒤에도 그 충돌을 지목한 새 요청은 어긋남을 알고 해소한다.
+     */
+    @Test
+    fun `든 채인 기체의 빈손 확인은 충돌로 남고 그 충돌을 지목한 재확인만 어긋남을 알고 해소한다`() {
+        HostBench().use { bench ->
+            val markerId = bench.heldFailure("JO-1")
+            val first = UUID.randomUUID().toString()
+
+            // (a) 지목 없는 확인 → 409, 충돌 1행, 해소 0행, 표시 열림
+            val refused = bench.clearHold(HUMANOID, markerId, requestId = first)
+            assertEquals(409, refused.status, refused.body.toString())
+            val body = refused.body!!
+            assertEquals(
+                listOf("error", "detail", "robotId", "markerId", "conflictRequestId", "observation"),
+                body.fieldNames().asSequence().toList(),
+            )
+            assertEquals(listOf("RESIDUAL_HOLD_OBSERVATION_MISMATCH", HUMANOID, first), listOf(body["error"], body["robotId"], body["conflictRequestId"]).map { it.asText() })
+            assertEquals(markerId, body["markerId"].asLong())
+            val seen = body["observation"]
+            assertEquals(
+                listOf(
+                    "observedKind", "observedObjectRef", "observedDetail", "snapshotSession", "snapshotSequence", "snapshotOccurredAt",
+                    "hostReadStartedAt", "hostReadReceivedAt",
+                ),
+                seen.fieldNames().asSequence().toList(),
+            )
+            assertEquals("HOLDING", seen["observedKind"].asText())
+            assertTrue(!seen["hostReadReceivedAt"].isNull && seen["snapshotSequence"].isTextual, seen.toString())
+            assertTrue("현장에서 빈손을 확인했으면" in body["detail"].asText(), body.toString())
+            assertEquals(1 to 0, count("robot_residual_hold_conflict") to count("robot_residual_hold_clearing"))
+            assertEquals(listOf(markerId), bench.holds().map { it["markerId"].asLong() })
+            assertTrue(bench.get("/host/robots/$HUMANOID/residual-holds/$markerId")["clearing"].isNull)
+
+            // (b) 같은 요청 id 재전송 → 같은 409, 충돌 행 그대로
+            val again = bench.clearHold(HUMANOID, markerId, requestId = first)
+            assertEquals(409 to body, again.status to again.body)
+            assertEquals(1, count("robot_residual_hold_conflict"))
+
+            // (d) 대조군: 저장값과 다른 지목, 다른 승인자, 없는 충돌은 400 이고 아무것도 적지 않는다
+            val cited = HostBench.cite(body)
+            listOf(
+                bench.clearHold(HUMANOID, markerId, cited = cited + ("objectRef" to "OTHER-9")),
+                bench.clearHold(HUMANOID, markerId, approverId = "lee", cited = cited),
+                bench.clearHold(HUMANOID, markerId, cited = cited + ("conflictRequestId" to UUID.randomUUID().toString())),
+            ).forEach { reply ->
+                assertEquals(400, reply.status, reply.body.toString())
+                assertEquals("RESIDUAL_HOLD_CITATION_INVALID", reply.body!!["error"].asText())
+            }
+            assertEquals(1 to 0, count("robot_residual_hold_conflict") to count("robot_residual_hold_clearing"))
+            assertEquals(1, bench.holds().size)
+
+            // (c) 재기동 뒤 그 충돌을 지목한 새 요청 → 200, 해소 행 HOLDING·어긋남 인지·충돌 연결
+            bench.restartHost()
+            val second = UUID.randomUUID().toString()
+            val cleared = bench.clearHold(HUMANOID, markerId, requestId = second, cited = cited)
+            assertEquals(200, cleared.status, cleared.body.toString())
+            val clearing = cleared.body!!["clearing"]
+            assertEquals(
+                listOf(
+                    "approverId", "approverKind", "reason", "clearedAt", "requestId", "observation", "conflictRequestId", "acknowledgedMismatch",
+                ),
+                clearing.fieldNames().asSequence().toList(),
+            )
+            assertEquals(listOf(second, first, "HOLDING"), listOf(clearing["requestId"], clearing["conflictRequestId"], clearing["observation"]["observedKind"]).map { it.asText() })
+            assertEquals(true, clearing["acknowledgedMismatch"].asBoolean())
+            assertEquals(second, cleared.body["requestId"].asText())
+            assertEquals(
+                listOf(listOf("HOLDING", "true", first, second)),
+                PostgresSupport.queryAll(
+                    "SELECT observed_kind, acknowledged_mismatch, conflict_request_id, request_id FROM mission.robot_residual_hold_clearing",
+                ) { listOf(it.getString(1), it.getBoolean(2).toString(), it.getString(3), it.getString(4)) },
+            )
+            assertEquals(emptyList(), bench.holds())
+            assertEquals(clearing, bench.get("/host/robots/$HUMANOID/residual-holds/$markerId")["clearing"])
+            assertEquals(404, bench.fetch("/host/robots/$QUADRUPED/residual-holds/$markerId").status)
+            assertEquals(1, count("robot_residual_hold_conflict"))
+        }
+    }
+
+    /**
+     * B2: 관측 JSON 의 순번은 10진 문자열이라 2^53 을 넘어도 왕복에서 바뀌지 않는다. 시험 스레드의 스냅숏 읽기만 큰 순번으로 바꾸고 호스트를 직접 부른다.
+     * 409 본문의 순번 문자열로 만든 지목을 요청 본문 읽기로 되읽어 다시 확인하면 어긋남을 알고 해소한다.
+     */
+    @Test
+    fun `2의 53승을 넘는 스냅숏 순번도 문자열로 왕복해 지목 재확인이 통과한다`() {
+        HostBench(gated = true).use { bench ->
+            val markerId = bench.heldFailure("JO-1")
+            val big = 9_007_199_254_740_993L
+            bench.snapshotOverride = Thread.currentThread() to { read -> read?.copy(sequence = big) }
+            val first = UUID.randomUUID().toString()
+            val refused = bench.host.clearResidualHold(HUMANOID, markerId, Approver("park", ApproverKind.PERSON), "빈손 확인", first)
+            assertIs<ClearOutcome.ObservationMismatch>(refused)
+            assertEquals(big, refused.observation.snapshotSequence)
+            // 같은 요청 id 재전송(REST)은 저장된 충돌을 그대로 돌려준다. 순번은 문자열이다.
+            val body = bench.clearHold(HUMANOID, markerId, requestId = first).body!!
+            assertEquals("9007199254740993", body["observation"]["snapshotSequence"].textValue(), body.toString())
+            val request = HostRequests.clearing(
+                JSON.valueToTree(linkedMapOf("approverId" to "park", "reason" to "빈손 확인", "requestId" to UUID.randomUUID().toString(), "cited" to HostBench.cite(body))),
+            )
+            assertEquals(big, request.cited!!.sequence)
+            val cleared = bench.host.clearResidualHold(HUMANOID, markerId, Approver("park", ApproverKind.PERSON), "빈손 확인", request.requestId, request.cited)
+            assertIs<ClearOutcome.Cleared>(cleared)
+            assertEquals(true to big, cleared.view.clearing.acknowledgedMismatch to cleared.view.clearing.observation.snapshotSequence)
+            assertEquals("9007199254740993", bench.get("/host/robots/$HUMANOID/residual-holds/$markerId")["clearing"]["observation"]["snapshotSequence"].textValue())
+            // 하위 호환: JSON 정수 순번도 받는다.
+            val legacy = HostRequests.clearing(JSON.readTree("""{"approverId":"p","reason":"r","cited":{"conflictRequestId":"$CONFLICT","kind":"HOLDING","sequence":12}}"""))
+            assertEquals(12L, legacy.cited!!.sequence)
+        }
+    }
+
+    /**
+     * B2: 표시 조회(GET)는 호스트 잠금을 잡는다. 해소는 잠금 안에서 스냅숏을 읽느라 늦을 수 있어, 잠금 없이 읽으면 운영 서비스의 응답 없음 뒤 재조회가 처리 중인
+     * 해소를 «해소 행 없음» 으로 확정한다. 잠금을 쥔 동안 낸 조회는 기다렸다가 그 사이 적은 해소를 본다.
+     */
+    @Test
+    fun `표시 조회는 호스트 잠금을 기다려 처리 중인 해소를 없음으로 내지 않는다`() {
+        HostBench().use { bench ->
+            val markerId = bench.heldFailure("JO-1")
+            val refused = bench.clearHold(HUMANOID, markerId).body!!
+            val request = UUID.randomUUID()
+            val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+            try {
+                val read = bench.host.exclusive {
+                    val pending = pool.submit<JsonNode> { bench.get("/host/robots/$HUMANOID/residual-holds/$markerId") }
+                    Thread.sleep(500)
+                    assertTrue(!pending.isDone, "잠금을 쥔 동안 조회가 끝났다")
+                    // 잠금은 재진입된다. 해소를 잠금 안에서 마친 뒤 놓는다.
+                    val cited = HostRequests.clearing(JSON.valueToTree(linkedMapOf("approverId" to "park", "reason" to "r", "cited" to HostBench.cite(refused)))).cited
+                    assertIs<ClearOutcome.Cleared>(bench.host.clearResidualHold(HUMANOID, markerId, Approver("park", ApproverKind.PERSON), "r", request.toString(), cited))
+                    pending
+                }.get(10, java.util.concurrent.TimeUnit.SECONDS)
+                assertEquals(request.toString(), read["clearing"]["requestId"].asText(), read.toString())
+            } finally {
+                pool.shutdownNow()
+            }
         }
     }
 
@@ -211,7 +364,7 @@ class ExecutionControlTest {
             assertNull(bench.recordsMark("JO-1", executionId))
             assertEquals(1, count("robot_residual_hold"))
 
-            assertEquals(200, bench.clear(HUMANOID, markerId).status)
+            assertEquals(200, bench.clearHeldCiting(HUMANOID, markerId).status)
             bench.restartHost()
             assertEquals(emptyList(), bench.holds())
             assertEquals(true, bench.judge()["passed"].asBoolean(), bench.judge().toString())
@@ -317,6 +470,12 @@ class ExecutionControlTest {
                 "1" to """{"approverId":"kim"}""",
                 "x" to """{"approverId":"kim","reason":"r"}""",
                 "0" to """{"approverId":"kim","reason":"r"}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":"x"}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":{"conflictRequestId":"not-a-uuid","kind":"HOLDING"}}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":{"conflictRequestId":"$CONFLICT"}}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":{"conflictRequestId":"$CONFLICT","kind":"HOLDING","sequence":1.5}}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":{"conflictRequestId":"$CONFLICT","kind":"HOLDING","sequence":"12x"}}""",
+                "1" to """{"approverId":"kim","reason":"r","cited":{"conflictRequestId":"$CONFLICT","kind":"HOLDING","objectRef":3}}""",
             ).forEach { (marker, body) ->
                 val reply = bench.post("/host/robots/$HUMANOID/residual-holds/$marker/clear", body)
                 assertEquals(400, reply.status, "$marker $body")
@@ -356,6 +515,7 @@ class ExecutionControlTest {
         const val S01 = "RACK-204.S01"
         const val S02 = "RACK-204.S02"
         const val S03 = "RACK-204.S03"
+        const val CONFLICT = "11111111-1111-1111-1111-111111111111"
         val SETTLED = setOf("PHYSICALLY_DONE", "FAILED", "UNVERIFIED", "ABORTED", "PARTIAL")
 
         /** 그 작업 지시의 일지 이벤트(종류, 실행 id, 사유). */

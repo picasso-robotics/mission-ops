@@ -23,7 +23,7 @@ class MissionStoreTest {
     @BeforeTest
     fun freshSchema() {
         PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        assertEquals(14, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+        assertEquals(15, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
     }
 
     private fun draft(workMaster: String = PSR) = store.saveDraft(workMaster, "{}", "lee", UUID.randomUUID())
@@ -40,7 +40,7 @@ class MissionStoreTest {
                 "draft", "execution_cancel", "execution_close", "execution_close_confirmed", "execution_fault_release", "execution_journal", "execution_journal_event", "execution_journal_revision", "execution_judgment_record",
                 "flyway_schema_history",
                 "host_instance", "incident_copy", "incident_copy_resolution", "job_response_log", "mission_version", "mock_run", "result_outbox",
-                "result_producer", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_recovery",
+                "result_producer", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
             ),
             placed,
         )
@@ -174,6 +174,60 @@ class MissionStoreTest {
             "INSERT INTO mission.robot_residual_hold_clearing (marker_id, approver_id, approver_kind, reason) " +
                 "SELECT marker_id, 'lee', 'PERSON', '또' FROM mission.robot_residual_hold",
         ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+    }
+
+    /**
+     * V15: 충돌표는 HOLDING 관측만 적고 덧붙이기만 한다. 해소 행의 어긋남 인지는 지금 HOLDING 일 때만이고 늘 같은 표시의 충돌을 지목한다.
+     * 관측을 적지 않은 것(NOT_RECORDED)은 호스트가 읽은 시각이 없는 옛 행뿐이다.
+     */
+    @Test
+    fun `V15 충돌표와 해소 행의 관측 칸은 어긋남 인지와 지목을 DB 제약으로 묶는다`() {
+        PostgresSupport.execute(
+            "INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, instance_id, execution_id) " +
+                "VALUES ('JO-1', 'r', '{}', 'PrepareSequencedRack', 'mw-1', 'exec-1'), ('JO-2', 'r', '{}', 'PrepareSequencedRack', 'mw-1', 'exec-2')",
+        )
+        PostgresSupport.execute(
+            "INSERT INTO mission.robot_residual_hold (robot_id, job_order_id, execution_id, instance_id, unit_id) " +
+                "VALUES ('r', 'JO-1', 'exec-1', 'mw-1', 'S01'), ('r', 'JO-2', 'exec-2', 'mw-1', 'S01')",
+        )
+        val (first, second) = PostgresSupport.queryAll("SELECT marker_id FROM mission.robot_residual_hold ORDER BY marker_id") { it.getLong(1) }
+        val read = "host_read_started_at, host_read_received_at"
+        val conflict = "11111111-1111-1111-1111-111111111111"
+        PostgresSupport.execute(
+            "INSERT INTO mission.robot_residual_hold_conflict (request_id, marker_id, approver_id, approver_kind, reason, observed_kind, observed_object_ref, $read) " +
+                "VALUES ('$conflict', $first, 'park', 'PERSON', '빈손 확인', 'HOLDING', 'C-1', now(), now())",
+        )
+        listOf("UPDATE mission.robot_residual_hold_conflict SET reason = 'x'", "DELETE FROM mission.robot_residual_hold_conflict", "TRUNCATE mission.robot_residual_hold_conflict CASCADE")
+            .forEach { sql ->
+                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                assertTrue("덧붙이기만 한다" in e.message!!, "$sql: ${e.message}")
+            }
+        fun clearing(marker: Long, request: String, kind: String, ack: Boolean, cites: String?, readAt: Boolean = true) =
+            "INSERT INTO mission.robot_residual_hold_clearing (marker_id, approver_id, approver_kind, reason, request_id, observed_kind, conflict_request_id, " +
+                "acknowledged_mismatch${if (readAt) ", $read" else ""}) VALUES ($marker, 'park', 'PERSON', '빈손 확인', '$request', '$kind', " +
+                "${cites?.let { "'$it'" } ?: "NULL"}, $ack${if (readAt) ", now(), now()" else ""})"
+        listOf(
+            // 충돌표는 HOLDING 만, 빈 물품 이름 없음
+            "INSERT INTO mission.robot_residual_hold_conflict (request_id, marker_id, approver_id, approver_kind, reason, observed_kind, $read) " +
+                "VALUES ('44444444-4444-4444-4444-444444444444', $first, 'park', 'PERSON', '빈손 확인', 'EMPTY', now(), now())",
+            "INSERT INTO mission.robot_residual_hold_conflict (request_id, marker_id, approver_id, approver_kind, reason, observed_kind, observed_object_ref, $read) " +
+                "VALUES ('55555555-5555-5555-5555-555555555555', $first, 'park', 'PERSON', '빈손 확인', 'HOLDING', '', now(), now())",
+            // 어긋남 인지인데 EMPTY, HOLDING 인데 인지 없음, 지목 없는 인지
+            clearing(first, "22222222-2222-2222-2222-222222222222", "EMPTY", true, conflict),
+            clearing(first, "22222222-2222-2222-2222-222222222222", "HOLDING", false, conflict),
+            clearing(first, "22222222-2222-2222-2222-222222222222", "HOLDING", true, null),
+            // 다른 표시의 충돌 지목, 제 요청 id 지목, 없는 종류, 새 관측인데 읽은 시각 없음, 옛 행 표지인데 읽은 시각 있음
+            clearing(second, "22222222-2222-2222-2222-222222222222", "HOLDING", true, conflict),
+            clearing(first, conflict, "HOLDING", true, conflict),
+            clearing(first, "22222222-2222-2222-2222-222222222222", "MAYBE", false, null),
+            clearing(first, "22222222-2222-2222-2222-222222222222", "EMPTY", false, null, readAt = false),
+            clearing(first, "22222222-2222-2222-2222-222222222222", "NOT_RECORDED", false, null),
+        ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+        assertEquals(0, PostgresSupport.queryOne("SELECT count(*) FROM mission.robot_residual_hold_clearing") { it.getInt(1) })
+
+        // 지목한 충돌로 어긋남을 알고 해소하는 행과, 지목 뒤 손이 비어 인지 없이 해소하는 행은 받는다.
+        PostgresSupport.execute(clearing(first, "22222222-2222-2222-2222-222222222222", "HOLDING", true, conflict))
+        PostgresSupport.execute(clearing(second, "33333333-3333-3333-3333-333333333333", "EMPTY", false, null))
     }
 
     @Test

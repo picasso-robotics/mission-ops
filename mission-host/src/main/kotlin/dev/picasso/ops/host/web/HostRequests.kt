@@ -6,6 +6,7 @@ import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.MaterialRequirement
 import dev.picasso.middleware.OperatorDecision
+import dev.picasso.ops.host.CitedConflict
 import dev.picasso.ops.host.FaultReferenceView
 import dev.picasso.ops.host.FaultSighting
 import dev.picasso.ops.host.MissionHost
@@ -44,8 +45,8 @@ data class CloseRequest(
     val attestedStopped: Boolean,
 )
 
-/** 잔여 파지 표시 해소 요청(P0-b2). */
-data class ClearRequest(val approverId: String, val reason: String, val requestId: String?)
+/** 잔여 파지 표시 해소 요청(P0-b2). [cited] 는 다시 확인할 때 지목하는 저장된 충돌이다(B2). 없으면 `null` 이다. */
+data class ClearRequest(val approverId: String, val reason: String, val requestId: String?, val cited: CitedConflict? = null)
 
 /** 본문을 못 받는 까닭. [error] 가 응답의 `error` 칸이다. */
 class BadRequest(val error: String, detail: String) : RuntimeException(detail)
@@ -60,6 +61,9 @@ object HostRequests {
 
     const val BAD_REQUEST = "BAD_REQUEST"
     const val UNKNOWN_WORK_MASTER = "UNKNOWN_WORK_MASTER"
+
+    /** 지목의 순번 문자열. 부호 있는 10진 정수다. */
+    private val SEQUENCE = Regex("-?[0-9]{1,19}")
 
     /** `{jobOrder, <listField>}` 를 읽는다. [listField] 는 판정이면 `robotIds`, 제출이면 `candidates` 다. */
     fun read(body: JsonNode?, listField: String): Pair<JobOrder, List<String>> {
@@ -189,10 +193,32 @@ object HostRequests {
         )
     }
 
-    /** 잔여 파지 표시 해소 `{approverId, reason, requestId?}` 를 읽는다(P0-b2). 규칙은 [cancel] 과 같다. */
+    /**
+     * 잔여 파지 표시 해소 `{approverId, reason, requestId?, cited?}` 를 읽는다(P0-b2, B2). 앞 세 칸의 규칙은 [cancel] 과 같다. requestId 는 해소·충돌
+     * 행에 정규형으로 적는다. cited 는 없거나 `null` 이거나 객체다: `conflictRequestId` 는 UUID 문자열, `kind` 는 비어 있지 않은 문자열, `objectRef`·
+     * `session` 은 없거나 `null` 이거나 문자열(빈 문자열은 `null`), `sequence` 는 없거나 `null` 이거나 10진 정수 문자열이다(관측 JSON 이 문자열로 싣는다.
+     * 하위 호환으로 JSON 정수도 받는다).
+     */
     fun clearing(body: JsonNode?): ClearRequest {
         if (body == null || !body.isObject) throw BadRequest(BAD_REQUEST, "본문이 JSON 객체가 아니다")
-        return ClearRequest(text(body, "approverId"), text(body, "reason").trim(), requestId(body))
+        val cited = body.get("cited")?.takeUnless { it.isNull }?.let { node ->
+            if (!node.isObject) throw BadRequest(BAD_REQUEST, "cited 가 객체가 아니다")
+            val conflict = node.get("conflictRequestId")?.takeIf { it.isTextual }?.asText()?.let { runCatching { UUID.fromString(it) }.getOrNull() }
+                ?: throw BadRequest(BAD_REQUEST, "cited.conflictRequestId 가 UUID 문자열이 아니다")
+            fun optionalText(field: String): String? = node.get(field)?.takeUnless { it.isNull }?.let {
+                if (!it.isTextual) throw BadRequest(BAD_REQUEST, "cited.$field 가 문자열이 아니다")
+                it.asText().takeIf { text -> text.isNotEmpty() }
+            }
+            val sequence = node.get("sequence")?.takeUnless { it.isNull }?.let {
+                when {
+                    it.isTextual -> it.asText().takeIf { text -> SEQUENCE.matches(text) }?.toLongOrNull()
+                    it.isIntegralNumber && it.canConvertToLong() -> it.asLong()
+                    else -> null
+                } ?: throw BadRequest(BAD_REQUEST, "cited.sequence 가 정수(10진 문자열이나 JSON 정수)가 아니다")
+            }
+            CitedConflict(conflict, text(node, "kind"), optionalText("objectRef"), optionalText("session"), sequence)
+        }
+        return ClearRequest(text(body, "approverId"), text(body, "reason").trim(), requestId(body)?.let { UUID.fromString(it).toString() }, cited)
     }
 
     private fun requestId(body: JsonNode): String? = body.get("requestId")?.takeUnless { it.isNull }?.let { node ->

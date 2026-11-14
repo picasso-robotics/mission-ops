@@ -978,6 +978,8 @@ export interface HostRejection {
   status: number
   error: string | null
   detail: string | null
+  /** 4xx 본문의 `error`·`detail` 밖의 칸. 그런 칸이 없으면 오지 않는다(빈손 확인의 어긋남이 관측을 싣는다, B2). */
+  fields?: Record<string, unknown>
 }
 
 /**
@@ -1447,7 +1449,10 @@ export interface ResidualHoldsView {
 
 export const fetchResidualHolds = (session: Session) => getHostJson<ResidualHoldsView>('/api/robots/residual-holds', session)
 
-/** 기체 빈손 확인의 200 응답(P0-b2). 실행 호스트가 해소하면 `SUCCEEDED`, 없거나 이미 해소한 표시는 `REJECTED` 와 그 거부다. */
+/**
+ * 기체 빈손 확인의 200 응답(P0-b2, B2). 실행 호스트가 해소하면 `SUCCEEDED`, 없거나 이미 해소한 표시와 발신자가 아직 든 채라고 말하는 어긋남(409
+ * `RESIDUAL_HOLD_OBSERVATION_MISMATCH`, 관측은 `rejection.fields`)과 저장값과 다른 지목(400 `RESIDUAL_HOLD_CITATION_INVALID`)은 `REJECTED` 와 그 거부다.
+ */
 export interface RobotEmptyOutcome {
   requestId: string
   robotId: string
@@ -1458,12 +1463,68 @@ export interface RobotEmptyOutcome {
   rejection: HostRejection | null
 }
 
-/** 승인자는 싣지 않는다(ADR 43). 사유는 앞뒤 공백을 뗀 값이다. */
-export const confirmRobotEmpty = (session: Session, hold: { robotId: string; markerId: number }, reason: string) =>
+/**
+ * 빈손 확인 순간 실행 호스트가 그 기체 스냅숏을 지금 읽은 관측(B2, 호스트 관측 칸 여덟). `snapshotOccurredAt` 은 발신자가 자기 시계로 응답을 찍은
+ * 시각이지 센서가 손을 본 시각이 아니다. `hostRead*` 는 호스트 시계다.
+ */
+export interface HoldObservation {
+  observedKind: string
+  observedObjectRef: string | null
+  observedDetail: string | null
+  snapshotSession: string | null
+  /** 10진 문자열이다. 2^53 을 넘을 수 있어 숫자로 바꾸지 않고 그대로 왕복한다. */
+  snapshotSequence: string | null
+  snapshotOccurredAt: string | null
+  hostReadStartedAt: string | null
+  hostReadReceivedAt: string | null
+}
+
+/** 빈손 확인의 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 가 거부의 `fields` 에 싣는 저장된 충돌. */
+export interface ObservationMismatch {
+  conflictRequestId: string
+  observation: HoldObservation
+}
+
+/** 다시 확인할 때 지목하는 저장된 충돌의 키. 그 어긋남 응답의 값에서만 만든다. */
+export interface CitedConflict {
+  conflictRequestId: string
+  kind: string
+  objectRef: string | null
+  session: string | null
+  /** 관측의 순번 문자열 그대로. */
+  sequence: string | null
+}
+
+export const RESIDUAL_HOLD_OBSERVATION_MISMATCH = 'RESIDUAL_HOLD_OBSERVATION_MISMATCH'
+
+/** 빈손 확인 결과가 어긋남이면 그 저장된 충돌, 아니면(또는 모양이 다르면) null 이다. */
+export function mismatchOf(outcome: RobotEmptyOutcome): ObservationMismatch | null {
+  const rejection = outcome.rejection
+  if (rejection === null || rejection.error !== RESIDUAL_HOLD_OBSERVATION_MISMATCH) return null
+  const fields = rejection.fields
+  const observation = fields?.observation as HoldObservation | undefined
+  if (typeof fields?.conflictRequestId !== 'string' || observation === undefined || observation === null || typeof observation.observedKind !== 'string') return null
+  return { conflictRequestId: fields.conflictRequestId, observation }
+}
+
+/** 어긋남 응답의 관측으로 지목을 만든다. */
+export const citeMismatch = (mismatch: ObservationMismatch): CitedConflict => ({
+  conflictRequestId: mismatch.conflictRequestId,
+  kind: mismatch.observation.observedKind,
+  objectRef: mismatch.observation.observedObjectRef,
+  session: mismatch.observation.snapshotSession,
+  sequence: mismatch.observation.snapshotSequence,
+})
+
+/**
+ * 승인자는 싣지 않는다(ADR 43). 사유는 앞뒤 공백을 뗀 값이다. `cited` 는 어긋남 뒤 다시 확인할 때만 싣는다. 요청 id 는 운영 서비스가 보낼 때마다 새로
+ * 만든다.
+ */
+export const confirmRobotEmpty = (session: Session, hold: { robotId: string; markerId: number }, reason: string, cited?: CitedConflict) =>
   postOps<RobotEmptyOutcome>(
     `/api/robots/${encodeURIComponent(hold.robotId)}/residual-holds/${hold.markerId}/clear`,
     session,
-    { reason },
+    cited === undefined ? { reason } : { reason, cited },
   )
 
 /** 송신 기록 행의 처분(S4b 스펙 T6). 재기동 중복은 송신하지 않은 것이다. */

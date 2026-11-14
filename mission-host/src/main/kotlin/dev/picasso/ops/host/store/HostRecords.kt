@@ -1,5 +1,6 @@
 package dev.picasso.ops.host.store
 
+import com.fasterxml.jackson.annotation.JsonFormat
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.springframework.jdbc.core.simple.JdbcClient
@@ -160,8 +161,54 @@ data class ResidualHoldRow(
     val recordedAt: Instant,
 )
 
-/** 잔여 파지 표시의 해소 한 행(P0-b2, V5). */
-data class ResidualHoldClearingRow(val markerId: Long, val approverId: String, val approverKind: String, val reason: String, val clearedAt: Instant)
+/**
+ * 빈손 확인 때 실행 호스트가 그 기체의 스냅숏을 지금 한 번 읽은 관측(V15 관측 칸 여덟). JSON 키도 이 이름이다.
+ *
+ * @param observedKind `HOLDING`·`EMPTY`·`NOT_OBSERVABLE`·`UNSPECIFIED`(발신자가 말하지 않음)·`UNREADABLE`(스냅숏을 못 읽음)·`NOT_RECORDED`(V15 전 옛 해소 행만)
+ * @param observedObjectRef HOLDING 의 물품 이름. 없으면 `null` 이다(빈 값도 `null`)
+ * @param observedDetail 관측 불가 사유나 읽기 실패 사유. 사람이 읽는다
+ * @param snapshotSession 스냅숏 응답의 세션. 미상이면 `null` 이다
+ * @param snapshotSequence 그 세션 안의 스냅숏 번호. 못 읽었으면 `null` 이다. JSON 에는 10진 문자열로 싣는다(2^53 을 넘으면 화면의 JS 숫자가 정밀도를 잃는다)
+ * @param snapshotOccurredAt 발신자가 자기 시계로 그 응답을 찍은 시각. 센서가 손을 관측한 시각이 아니다
+ * @param hostReadStartedAt·hostReadReceivedAt 실행 호스트가 읽기를 시작한 시각과 답(또는 실패)을 받은 시각(호스트 시계). 옛 해소 행만 `null` 이다
+ */
+data class HoldObservation(
+    val observedKind: String,
+    val observedObjectRef: String?,
+    val observedDetail: String?,
+    val snapshotSession: String?,
+    @get:JsonFormat(shape = JsonFormat.Shape.STRING) val snapshotSequence: Long?,
+    val snapshotOccurredAt: Instant?,
+    val hostReadStartedAt: Instant?,
+    val hostReadReceivedAt: Instant?,
+)
+
+/**
+ * 잔여 파지 표시의 해소 한 행(P0-b2, V5·V15). [requestId] 는 V15 전 옛 행만 `null` 이고 그 행의 관측은 `NOT_RECORDED` 다. [conflictRequestId] 는
+ * 지목한 충돌, [acknowledgedMismatch] 는 발신자가 지금 든 채라고 말하는 것을 알고 해소했는가다(관측이 HOLDING 일 때만 참).
+ */
+data class ResidualHoldClearingRow(
+    val markerId: Long,
+    val approverId: String,
+    val approverKind: String,
+    val reason: String,
+    val clearedAt: Instant,
+    val requestId: UUID?,
+    val observation: HoldObservation,
+    val conflictRequestId: UUID?,
+    val acknowledgedMismatch: Boolean,
+)
+
+/** 해소를 거절한 관측 한 행(V15). 관측은 늘 HOLDING 이다. [refusedAt] 은 적은 DB 시각이다. */
+data class ResidualHoldConflictRow(
+    val requestId: UUID,
+    val markerId: Long,
+    val approverId: String,
+    val approverKind: String,
+    val reason: String,
+    val observation: HoldObservation,
+    val refusedAt: Instant,
+)
 
 /**
  * 운영자 결함 감수 한 행(V11). [faults] 는 감수한 막는 결함 전부의 JSON 배열 글자(호스트 `FaultDetailView` 모양)다. [requestId] 는
@@ -721,20 +768,96 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         return hold to clearing
     }
 
-    fun clearResidualHold(markerId: Long, approverId: String, approverKind: String, reason: String): ResidualHoldClearingRow =
-        jdbc.sql(
-            """
-            INSERT INTO mission.robot_residual_hold_clearing (marker_id, approver_id, approver_kind, reason)
-            VALUES (:markerId, :approverId, :approverKind, :reason)
-            RETURNING $CLEARING_COLUMNS
-            """.trimIndent(),
+    /**
+     * 해소 한 행을 적는다(V15). [conflictRequestId] 는 지목한 같은 표시의 충돌이고 [acknowledged] 는 관측이 HOLDING 일 때만 참이다(DB 제약이 함께 막는다).
+     * 같은 표시나 같은 [requestId] 의 해소가 이미 있으면 `DuplicateKeyException`(쓰기 실패)이다.
+     */
+    fun clearResidualHold(
+        markerId: Long,
+        approverId: String,
+        approverKind: String,
+        reason: String,
+        requestId: UUID,
+        observation: HoldObservation,
+        conflictRequestId: UUID?,
+        acknowledged: Boolean,
+    ): ResidualHoldClearingRow =
+        observed(
+            jdbc.sql(
+                """
+                INSERT INTO mission.robot_residual_hold_clearing (marker_id, approver_id, approver_kind, reason, request_id, $OBSERVATION_COLUMNS,
+                    conflict_request_id, acknowledged_mismatch)
+                VALUES (:markerId, :approverId, :approverKind, :reason, :requestId, $OBSERVATION_PARAMS, :conflictRequestId, :acknowledged)
+                RETURNING $CLEARING_COLUMNS
+                """.trimIndent(),
+            ),
+            observation,
         )
             .param("markerId", markerId)
             .param("approverId", approverId)
             .param("approverKind", approverKind)
             .param("reason", reason)
+            .param("requestId", requestId, Types.OTHER)
+            .param("conflictRequestId", conflictRequestId, Types.OTHER)
+            .param("acknowledged", acknowledged)
             .query { rs, _ -> clearingRow(rs) }
             .single()
+
+    /** 그 요청 id 로 적은 해소 행의 표시 id(V15). 없으면 `null` 이다. */
+    fun residualHoldClearingMarker(requestId: UUID): Long? =
+        jdbc.sql("SELECT marker_id FROM mission.robot_residual_hold_clearing WHERE request_id = :requestId")
+            .param("requestId", requestId, Types.OTHER)
+            .query(Long::class.java)
+            .optional()
+            .orElse(null)
+
+    /** 그 요청 id 의 충돌(V15). 없으면 `null` 이다. */
+    fun residualHoldConflict(requestId: UUID): ResidualHoldConflictRow? =
+        jdbc.sql("SELECT $CONFLICT_COLUMNS FROM mission.robot_residual_hold_conflict WHERE request_id = :requestId")
+            .param("requestId", requestId, Types.OTHER)
+            .query { rs, _ -> conflictRow(rs) }
+            .optional()
+            .orElse(null)
+
+    /** 해소를 거절한 관측을 적는다(V15). 관측은 HOLDING 이어야 한다(DB 제약). 같은 [requestId] 가 이미 있으면 `DuplicateKeyException`(쓰기 실패)이다. */
+    fun recordResidualHoldConflict(
+        requestId: UUID,
+        markerId: Long,
+        approverId: String,
+        approverKind: String,
+        reason: String,
+        observation: HoldObservation,
+    ): ResidualHoldConflictRow =
+        observed(
+            jdbc.sql(
+                """
+                INSERT INTO mission.robot_residual_hold_conflict (request_id, marker_id, approver_id, approver_kind, reason, $OBSERVATION_COLUMNS)
+                VALUES (:requestId, :markerId, :approverId, :approverKind, :reason, $OBSERVATION_PARAMS)
+                RETURNING $CONFLICT_COLUMNS
+                """.trimIndent(),
+            ),
+            observation,
+        )
+            .param("requestId", requestId, Types.OTHER)
+            .param("markerId", markerId)
+            .param("approverId", approverId)
+            .param("approverKind", approverKind)
+            .param("reason", reason)
+            .query { rs, _ -> conflictRow(rs) }
+            .single()
+
+    private fun observed(statement: JdbcClient.StatementSpec, observation: HoldObservation): JdbcClient.StatementSpec {
+        fun at(value: Instant?) = value?.let { OffsetDateTime.ofInstant(it, ZoneOffset.UTC) }
+        return statement
+            .param("observedKind", observation.observedKind)
+            .param("observedObjectRef", observation.observedObjectRef?.takeIf { it.isNotEmpty() }, Types.VARCHAR)
+            .param("observedDetail", observation.observedDetail, Types.VARCHAR)
+            .param("snapshotSession", observation.snapshotSession?.takeIf { it.isNotEmpty() }, Types.VARCHAR)
+            .param("snapshotSequence", observation.snapshotSequence, Types.BIGINT)
+            .param("snapshotOccurredAt", at(observation.snapshotOccurredAt), Types.TIMESTAMP_WITH_TIMEZONE)
+            .param("hostReadStartedAt", at(observation.hostReadStartedAt), Types.TIMESTAMP_WITH_TIMEZONE)
+            .param("hostReadReceivedAt", at(observation.hostReadReceivedAt), Types.TIMESTAMP_WITH_TIMEZONE)
+    }
 
     /**
      * 표시와 회복 실행의 연결 한 행을 적는다(V14). 실행 일지와 같은 [inTransaction] 안에서 부른다. 같은 (표시, 실행)이 이미 있으면
@@ -1066,6 +1189,31 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         approverKind = rs.getString("approver_kind"),
         reason = rs.getString("reason"),
         clearedAt = instant(rs, "cleared_at"),
+        requestId = rs.getObject("request_id", UUID::class.java),
+        observation = observationOf(rs),
+        conflictRequestId = rs.getObject("conflict_request_id", UUID::class.java),
+        acknowledgedMismatch = rs.getBoolean("acknowledged_mismatch"),
+    )
+
+    private fun conflictRow(rs: ResultSet) = ResidualHoldConflictRow(
+        requestId = rs.getObject("request_id", UUID::class.java),
+        markerId = rs.getLong("marker_id"),
+        approverId = rs.getString("approver_id"),
+        approverKind = rs.getString("approver_kind"),
+        reason = rs.getString("reason"),
+        observation = observationOf(rs),
+        refusedAt = instant(rs, "refused_at"),
+    )
+
+    private fun observationOf(rs: ResultSet) = HoldObservation(
+        observedKind = rs.getString("observed_kind"),
+        observedObjectRef = rs.getString("observed_object_ref"),
+        observedDetail = rs.getString("observed_detail"),
+        snapshotSession = rs.getString("snapshot_session"),
+        snapshotSequence = rs.getObject("snapshot_sequence") as Long?,
+        snapshotOccurredAt = rs.getObject("snapshot_occurred_at", OffsetDateTime::class.java)?.toInstant(),
+        hostReadStartedAt = rs.getObject("host_read_started_at", OffsetDateTime::class.java)?.toInstant(),
+        hostReadReceivedAt = rs.getObject("host_read_received_at", OffsetDateTime::class.java)?.toInstant(),
     )
 
     private fun journalRow(rs: ResultSet) = JournalRow(
@@ -1149,7 +1297,13 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         const val RELEASE_COLUMNS =
             "release_id, instance_id, execution_id, job_order_id, faults::text AS faults, approver_id, approver_kind, reason, request_id, recorded_at"
         const val HOLD_COLUMNS = "marker_id, robot_id, job_order_id, execution_id, instance_id, unit_id, object_ref, recorded_at"
-        const val CLEARING_COLUMNS = "marker_id, approver_id, approver_kind, reason, cleared_at"
+        const val OBSERVATION_COLUMNS = "observed_kind, observed_object_ref, observed_detail, snapshot_session, snapshot_sequence, " +
+            "snapshot_occurred_at, host_read_started_at, host_read_received_at"
+        const val OBSERVATION_PARAMS = ":observedKind, :observedObjectRef, :observedDetail, :snapshotSession, :snapshotSequence, " +
+            ":snapshotOccurredAt, :hostReadStartedAt, :hostReadReceivedAt"
+        const val CLEARING_COLUMNS = "marker_id, approver_id, approver_kind, reason, cleared_at, request_id, $OBSERVATION_COLUMNS, " +
+            "conflict_request_id, acknowledged_mismatch"
+        const val CONFLICT_COLUMNS = "request_id, marker_id, approver_id, approver_kind, reason, $OBSERVATION_COLUMNS, refused_at"
         const val RECORD_COLUMNS = "record_id, job_order_id, instance_id, execution_id, wire_version, record, recorded_at"
         const val COPY_SELECT =
             "SELECT c.copy_id, c.instance_id, c.incident_id, c.detail, r.decision, r.decided_at, r.wall_clock_at, r.decided_by_id, r.decided_by_kind " +
