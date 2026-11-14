@@ -343,22 +343,26 @@ function describeRelease(sent: Delivered<ExecutionReleaseOutcome>): string {
 
 interface ReworkProps {
   instanceId: string
-  /** 실행 호스트가 계산한 재작업할 수 있는 건너뛴 대상. 남은 실행이 아니다. 칸이 없던 호스트는 빈 목록이다. */
+  /** 실행 호스트가 싣는 재작업할 수 있는 실패 묶음(picasso 후보). 남은 실행이 아니다. 칸이 없던 호스트는 빈 목록이다. */
   targets: ReworkableTarget[]
   session: Session
   /** 조작이 끝나면 부른다. 실행 목록을 지금 한 번, pump 뒤 한 번 더 읽는다. */
   onReworked: () => void
 }
 
-/** 고르는 대상 하나의 키. 실행 하나에 건너뛴 대상이 여럿일 수 있다. */
+/** 고르는 대상 하나의 키. 실행 하나에 재작업 묶음이 여럿일 수 있다(묶음 하나에 대상 하나). */
 const reworkKey = (target: ReworkableTarget) => `${target.executionId}/${target.unitId}`
 
 /**
- * 운영자 건너뛴 대상 재작업. 운영자 모드에서만 조작하고 승인자는 운영 서비스가 행위자로 정한다(ADR 43). 순회가 종결한 뒤 선행 이동이
- * 실패해 점검을 하지 않은 대상을 실행 호스트 목록에서 하나 골라 `REWORK` 판단으로 보낸다. 인시던트 판단과 같은 호출이고 단위 id 가 건너뛴
- * 점검의 것이다. 확인(`CONFIRM_DONE`)은 보내지 않는다. 사유와 현장 확인이 있어야 보낸다. 인스턴스는 실행 목록의 것이고 호스트가 그 사이
- * 재기동했으면 409 로 막힌다. 목록이 호스트 판정이므로 화면은 남은 실행에서 대상을 추리지 않는다. 호스트가 같은 기체의 다른 활성 실행 등을
- * 거부하면 그 사유를 그대로 보인다.
+ * 운영자 실패 대상 재작업(picasso §15.323). 운영자 모드에서만 조작하고 승인자는 운영 서비스가 행위자로 정한다(ADR 43). 실행이 종결한 뒤 보류가
+ * 아닌 실패 묶음(건너뛴 대상, 시도 뒤 실패한 점검·이동·자재 다루기)을 실행 호스트 목록에서 하나 골라 `REWORK` 판단으로 보낸다. 인시던트 판단과
+ * 같은 호출이고 단위 id 는 후보의 대상이다. 확인(`CONFIRM_DONE`)은 보내지 않는다. 사유와 현장 확인이 있어야 보낸다. 인스턴스는 실행 목록의 것이고
+ * 호스트가 그 사이 재기동했으면 409 로 막힌다. 목록이 호스트(picasso) 판정이므로 화면은 남은 실행에서 대상을 추리지 않는다.
+ *
+ * 고르면 묶음(함께 다시 보낼 단위)과 분류를 보이고, 자재 다루기면 받을 때 손·자리를 본다는 것을, 앞서 받은 재작업이 첫 발행 직전 재검사를 못
+ * 지났으면 그 사실을 함께 적는다. 거부 사유는 실행 호스트의 문장 그대로 보이고 뜯어 범주를 나누지 않는다. 거부면 대상이 목록에 남는다(거부에는
+ * 영구적인 것도 있어 다시 보내면 된다고 말하지 않는다 — 스냅숏을 아직 못 읽었다는 거부는 다음 요청이 통과할 수 있으나 약속하지 않는다). 거부·응답 없음
+ * 뒤에는 고른 대상과 사유를 두고 현장 확인 체크만 끈다.
  */
 export function ReworkSkippedForm({ instanceId, targets, session, onReworked }: ReworkProps) {
   const [chosenKey, setChosenKey] = useState('')
@@ -373,13 +377,21 @@ export function ReworkSkippedForm({ instanceId, targets, session, onReworked }: 
     if (chosen === null || reason.trim() === '' || !confirmed) return
     const what = `${chosen.executionId}(${chosen.jobOrderId}) ${TEXT.reworkHeading}`
     setBusy(true)
+    // 걸렸거나(응답 없음 뒤 다시 읽어 걸림 포함) 더는 대상이 아니면(NotHeld) 폼을 비운다. 거부·응답 없음·그 밖은 고른 대상과 사유를 두고
+    // 현장 확인만 끈다 — 다시 보내려면 현장을 다시 확인해야 한다.
+    let done = false
     resolveHold(session, { instanceId, executionId: chosen.executionId, unitId: chosen.unitId }, 'REWORK', reason.trim())
-      .then((sent) => setLast({ what, sent }))
+      .then((sent) => {
+        setLast({ what, sent })
+        done = sent.kind === 'outcome' && settles(sent.outcome)
+      })
       .finally(() => {
         setBusy(false)
-        setReason('')
         setConfirmed(false)
-        setChosenKey('')
+        if (done) {
+          setReason('')
+          setChosenKey('')
+        }
         onReworked()
       })
   }
@@ -404,12 +416,19 @@ export function ReworkSkippedForm({ instanceId, targets, session, onReworked }: 
               <option value="">{TEXT.reworkChoose}</option>
               {targets.map((target) => (
                 <option key={reworkKey(target)} value={reworkKey(target)}>
-                  {TEXT.reworkOption(target.executionId, target.jobOrderId, target.robotId, target.unitId)}
+                  {TEXT.reworkOption(target.executionId, target.jobOrderId, target.robotId, target.unitId, target.kind)}
                 </option>
               ))}
             </select>
           </label>
-          {chosen !== null && <p>{chosen.retainedUntil === null ? TEXT.reworkNoExpiry : TEXT.reworkExpiry(chosen.retainedUntil)}</p>}{' '}
+          {chosen !== null && (
+            <>
+              {chosen.bundle !== undefined && chosen.bundle.length > 0 && <p>{TEXT.reworkBundle(chosen.bundle)}</p>}
+              {chosen.kind === 'ATTEMPTED_HANDLING' && <p role="note">{TEXT.reworkHandlingNote}</p>}
+              {chosen.recheckFailed === true && <p role="note">{TEXT.reworkRecheckNote}</p>}
+              <p>{chosen.retainedUntil === null ? TEXT.reworkNoExpiry : TEXT.reworkExpiry(chosen.retainedUntil)}</p>
+            </>
+          )}{' '}
           <label>
             {TEXT.reworkReason}
             <input maxLength={1000} value={reason} disabled={busy} onChange={(event) => setReason(event.target.value)} />
@@ -425,6 +444,11 @@ export function ReworkSkippedForm({ instanceId, targets, session, onReworked }: 
       )}
     </form>
   )
+}
+
+/** 이 재작업 결과로 폼을 비우는가 — 걸림(Resolved, 응답 없음 뒤 다시 읽어 걸림)이나 더는 대상이 아님(NotHeld). */
+function settles({ outcome, confirmation }: HoldResolveOutcome): boolean {
+  return outcome === 'Resolved' || outcome === 'NotHeld' || confirmation === 'CONFIRMED_APPLIED'
 }
 
 function describeRework(sent: Delivered<HoldResolveOutcome>): string {

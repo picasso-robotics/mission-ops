@@ -36,23 +36,24 @@ class SkippedTargetReworkHostTest {
     private val settled = setOf("PHYSICALLY_DONE", "FAILED", "UNVERIFIED", "ABORTED", "PARTIAL")
     private val kim = Approver("kim", ApproverKind.PERSON)
 
-    private fun HostBench.runningTask(): String {
-        repeat(20) {
+    private fun HostBench.runningTask(unit: (String) -> Boolean = { true }): String {
+        repeat(40) {
             mimic.server.advance(Duration.ofSeconds(1))
             awaitPump()
-            mimic.server.exclusive { mimic.instance(QUADRUPED)!!.tasks.all.firstOrNull { it.machine.state == TaskState.RUNNING }?.taskId }
-                ?.let { return it }
+            mimic.server.exclusive {
+                mimic.instance(QUADRUPED)!!.tasks.all.firstOrNull { it.machine.state == TaskState.RUNNING && unit(it.taskId) }?.taskId
+            }?.let { return it }
         }
         error("태스크가 RUNNING 이 되지 않았다")
     }
 
     /** 사족 기체로 [targets] 점검을 내고 첫 이동에 로봇 수준 결함을 강제해 결함이 막은 실행(`OPERATOR_HOLD`)의 id 를 돌려준다. */
-    private fun HostBench.blocked(vararg targets: Pair<String, String>): String {
+    private fun HostBench.blocked(vararg targets: Pair<String, String>, unit: (String) -> Boolean = { true }): String {
         awaitPump()
         val submitted = post("/host/job-orders", request(inspect("JO-1", *targets), "candidates", QUADRUPED)).body!!
         assertEquals("ACCEPTED", submitted["result"].asText(), submitted.toString())
         val executionId = submitted["executionId"].asText()
-        val running = runningTask()
+        val running = runningTask(unit)
         val outcome = mimic.server.exclusive { mimic.instance(QUADRUPED)!!.tasks.forceFault("LOCALIZATION_LOST", running) }
         assertTrue(outcome is ForceOutcome.Raised, outcome.toString())
         val held = driveUntil(executionId, settled + "OPERATOR_HOLD", rounds = 4)
@@ -218,7 +219,7 @@ class SkippedTargetReworkHostTest {
 
             val early = bench.rework(executionId).body!!
             assertEquals("Refused", early["result"].asText(), early.toString())
-            assertTrue(early["detail"].asText().startsWith("순회가 종결한 뒤 한 대상씩 재작업한다"), early.toString())
+            assertTrue(early["detail"].asText().startsWith("실행이 종결한 뒤 한 대상씩 재작업한다"), early.toString())
             assertTrue(early["incidentId"].isNull, early.toString())
 
             val done = bench.driveUntil(executionId, settled)
@@ -277,8 +278,15 @@ class SkippedTargetReworkHostTest {
             val targets = bench.reworkable()
             assertEquals(listOf(listOf(held, "JO-1", QUADRUPED, "T1", "PARTIAL")), targets.rows(), targets.toString())
             assertEquals(
-                listOf("executionId", "jobOrderId", "robotId", "unitId", "physicalState", "retainedUntil"),
+                listOf("executionId", "jobOrderId", "robotId", "unitId", "physicalState", "retainedUntil", "attempt", "bundle", "kind", "incidentUnitId", "recheckFailed"),
                 targets.single().fieldNames().asSequence().toList(),
+            )
+            // picasso 후보(§15.323) 그대로다. 건너뛴 쌍은 SKIPPED 이고 묶음은 실패한 이동과 건너뛴 점검, 판단은 이동의 인시던트에 붙는다.
+            val target = targets.single()
+            assertEquals(
+                listOf("0", "[\"T1.travel\",\"T1\"]", "SKIPPED", "T1.travel", "false"),
+                listOf(target["attempt"].asText(), target["bundle"].toString(), target["kind"].asText(), target["incidentUnitId"].asText(), target["recheckFailed"].asText()),
+                target.toString(),
             )
             // PARTIAL 은 기체를 쥔 채 기다리며 보존 기간이 없다.
             assertTrue(targets.single()["retainedUntil"].isNull, targets.toString())
@@ -342,6 +350,87 @@ class SkippedTargetReworkHostTest {
             val resolved = bench.rework(rebuilt).body!!
             assertEquals("Resolved", resolved["result"].asText(), resolved.toString())
             assertEquals("RUNNING", bench.execution(rebuilt)!!["physicalState"].asText())
+        }
+    }
+
+    @Test
+    fun `시도 뒤 실패한 점검은 ATTEMPTED_INSPECTION 후보로 앞 이동과 묶여 서고 재작업하면 묶음의 단위마다 판단이 서며 실행 본문 단위가 시도와 판단을 싣는다`() {
+        HostBench().use { bench ->
+            // 이동이 끝나고 점검 태스크(T1)가 도는 중에 로봇 수준 결함을 강제한다. 점검은 태스크가 나간 채 실패하고(시도된 실패), 결함이 다음 대상의
+            // 이동을 막아 보류에 선다. 수용하면(재작업 발행 관문이 수용한 결함은 막지 않는다) T2 가 이어 돌아 PARTIAL 이다.
+            val executionId = bench.blocked("T1" to "bay-7", "T2" to "dock-3") { it.substringAfter('#').substringBefore('@') == "T1" }
+            bench.accept(executionId)
+            val done = bench.driveUntil(executionId, settled)
+            assertEquals("PARTIAL", done["physicalState"].asText(), done.toString())
+            assertEquals(listOf("DONE", "FAILED", "DONE", "DONE"), done["units"].map { it["state"].asText() }, done.toString())
+
+            val target = bench.reworkable().single()
+            assertEquals(
+                listOf(executionId, "T1", "0", "[\"T1.travel\",\"T1\"]", "ATTEMPTED_INSPECTION", "PARTIAL"),
+                listOf("executionId", "unitId", "attempt").map { target[it].asText() } +
+                    listOf(target["bundle"].toString(), target["kind"].asText(), target["physicalState"].asText()),
+                target.toString(),
+            )
+            assertTrue(target["retainedUntil"].isNull, target.toString())
+
+            // 묶음의 어느 단위로 내도 같은 묶음이다 — 앞 버전에서 NotHeld 였던 DONE 이동 id 요청이 이제 받힌다.
+            val resolved = bench.rework(executionId, unitId = "T1.travel").body!!
+            assertEquals("Resolved", resolved["result"].asText(), resolved.toString())
+            assertTrue(bench.reworkable().isEmpty, bench.reworkable().toString())
+            val units = bench.execution(executionId)!!["units"].associateBy { it["unitId"].asText() }
+            listOf("T1.travel", "T1").forEach { unitId ->
+                val unit = units.getValue(unitId)
+                assertEquals(1, unit["attempt"].asInt(), unit.toString())
+                val decision = unit["decision"]
+                assertEquals(
+                    listOf("REWORK", "kim", "PERSON", "0"),
+                    listOf("decision", "approverId", "approverKind", "attempt").map { decision[it].asText() },
+                    unit.toString(),
+                )
+            }
+            // 판단 기록 버전 6: 뿌리(T1)의 판단에 사건 정체성과 근거 표지가 실린다. DONE 이던 이동에도 REWORK 판단이 선다.
+            val record = bench.latestRecord().units.associateBy { it.unitId }
+            assertEquals(
+                listOf(OperatorDecision.REWORK, OperatorDecision.REWORK),
+                listOf("T1.travel", "T1").map { record.getValue(it).decision!!.decision },
+            )
+            val basis = record.getValue("T1").decision!!.reworkBasis!!
+            assertEquals(QUADRUPED to null, basis.robotId to basis.hold, "점검 대상은 손을 묻지 않은 표지다")
+            assertEquals(JudgmentRecordWire.SCHEMA_VERSION, bench.bean(HostRecords::class.java).judgmentRecords("JO-1").last().wireVersion)
+        }
+    }
+
+    @Test
+    fun `재작업 판단 뒤 판단 기록을 적지 못하면 적을 때까지 pump 와 제출을 막고 적은 뒤에야 새 시도를 낸다`() {
+        HostBench().use { bench ->
+            val executionId = bench.partial()
+            val before = bench.recordCount()
+            PostgresSupport.execute(
+                """
+                CREATE FUNCTION mission.refuse_record() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'record refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            PostgresSupport.execute(
+                "CREATE TRIGGER refuse_record BEFORE INSERT ON mission.execution_judgment_record FOR EACH ROW EXECUTE FUNCTION mission.refuse_record()",
+            )
+            // 판단은 picasso 에 섰다. 기록을 못 적었으므로 그 실행이 일지 막힘에 들고 pump 가 새 시도를 내지 않는다.
+            assertEquals("Resolved", bench.rework(executionId).body!!["result"].asText())
+            assertEquals(before, bench.recordCount())
+            assertEquals(listOf(executionId), bench.get("/host/executions")["journalBlockedExecutionIds"].map { it.asText() })
+            bench.mimic.server.advance(Duration.ofSeconds(5))
+            bench.idlePumps()
+            val units = bench.execution(executionId)!!["units"].associate { it["unitId"].asText() to it["state"].asText() }
+            assertEquals("PENDING", units["T1.travel"], units.toString())
+            val refused = bench.post("/host/job-orders", request(inspect("JO-2", "T9" to "bay-9"), "candidates", QUADRUPED)).body!!
+            assertEquals("REJECTED", refused["result"].asText(), refused.toString())
+
+            PostgresSupport.execute("DROP TRIGGER refuse_record ON mission.execution_judgment_record")
+            bench.eventually("판단 기록") { bench.recordCount() > before }
+            assertTrue(bench.latestRecord().units.single { it.unitId == "T1" }.decision?.decision == OperatorDecision.REWORK)
+            bench.eventually("막힘 풀림") { bench.get("/host/executions")["journalBlockedExecutionIds"].isEmpty }
+            bench.mimic.server.advance(Duration.ofSeconds(1))
+            bench.awaitPump()
+            bench.eventually("새 시도") { bench.execution(executionId)!!["units"].first()["state"].asText() != "PENDING" }
         }
     }
 

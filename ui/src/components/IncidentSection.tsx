@@ -22,6 +22,7 @@ import {
   OPENING_LABEL,
   rejectionText,
   RESOLUTION_LABEL,
+  REWORK_RECHECK_TEXT,
 } from '../labels'
 import type { HostRead } from './ExecutionList'
 import { FaultCard } from './FaultCard'
@@ -40,6 +41,12 @@ interface Props {
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 const DECISIONS: readonly HoldDecision[] = ['CONFIRM_DONE', 'REWORK']
+
+/**
+ * 첫 발행 직전 재검사 실패의 실패 종류(picasso §15.323). 받은 재작업을 내기 직전에 손·자리가 달라 내지 않은 시도다 — 운영자 보류가 아니라 판단 폼이
+ * 서지 않고, 완료 확인을 받지 않는다(실행 구역의 실패 대상 재작업이나 새 작업 지시로 다룬다). 분류 코드이지 사유 문장이 아니다.
+ */
+const REWORK_RECHECK = 'REWORK_RECHECK'
 
 /** 임무 버전 칸. null 은 코드 정의 임무다(S3a JSON 계약 §5). */
 const missionVersion = (version: number | null) => (version === null ? '코드 정의' : `버전 ${version}`)
@@ -349,6 +356,12 @@ function Detail({ detail, related, onSelect, session, decidable, blockedNow, bus
           <dd>{detail.unitState ?? '모름(실행 없음)'}</dd>
           <dt>실패 종류</dt>
           <dd>{detail.failureClass ?? '-'}</dd>
+          {detail.failureClass === REWORK_RECHECK && (
+            <>
+              <dt>재작업 재검사</dt>
+              <dd role="note">{REWORK_RECHECK_TEXT}</dd>
+            </>
+          )}
           <dt>경로</dt>
           <dd>{detail.route}</dd>
           <dt>현장 설정 버전</dt>
@@ -585,7 +598,8 @@ function DecisionForm({ detail, session, busy, onDecide }: DecisionProps) {
         <input value={reason} onChange={(event) => setReason(event.target.value)} />
       </label>{' '}
       <span className="actions">
-        {DECISIONS.map((decision) => (
+        {/* 재검사 실패는 완료 확인을 받지 않는다(보류가 아니라 폼이 서지 않지만 같은 규칙을 화면에도 둔다). */}
+        {DECISIONS.filter((decision) => decision !== 'CONFIRM_DONE' || detail.failureClass !== REWORK_RECHECK).map((decision) => (
           <button key={decision} type="button" disabled={busy} onClick={() => send(decision)}>
             {DECISION_LABEL[decision]}
           </button>

@@ -267,9 +267,13 @@ class IncidentResolveTest {
             assertEquals(listOf("LOCALIZATION_LOST"), detail["blockedBy"].map { it["errorType"].asText() }, detail.toString())
             assertEquals(false, detail["blockedBy"][0]["canAcceptNewTask"].asBoolean())
             assertEquals("KIND_UNTIL_CLEARED", detail["blockedBy"][0]["activeUntilKind"].asText())
-            // 막힘은 실행 수준이라 단위 보류가 아니다. 판단 대상이 아니다.
+            // 막힘은 실행 수준이라 단위 보류가 아니다. 보류 판단 대상이 아니다. 시도 뒤 실패한 단위는 picasso §15.323 부터 재작업 묶음의 뿌리라
+            // NotHeld 가 아니라, 실행이 아직 종결하지 않았다는 Refused 다(아무것도 바뀌지 않는다).
             assertEquals(false, item["held"].asBoolean())
-            assertEquals("NotHeld", bench.resolve(executionId, item["unitId"].asText(), "REWORK", "kim").body!!["result"].asText())
+            val answer = bench.resolve(executionId, item["unitId"].asText(), "REWORK", "kim").body!!
+            assertEquals("Refused", answer["result"].asText(), answer.toString())
+            assertTrue(answer["detail"].asText().startsWith("실행이 종결한 뒤 한 대상씩 재작업한다"), answer.toString())
+            assertEquals("OPERATOR_HOLD", bench.execution(executionId)!!["physicalState"].asText())
         }
     }
 

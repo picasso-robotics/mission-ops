@@ -24,6 +24,12 @@ class IncidentBench {
     var incidents: HostCall<JsonNode> = HostCall.Ok(json.readTree("""{"instanceId":"i-1","total":0,"incidents":[]}"""))
     var incident: HostIncident = HostIncident.Silent("응답 없음: ConnectException")
 
+    /**
+     * 판단 재조회용 실행 본문(`executionUnits`). 부를 때마다 몇 번째 호출인지(0부터)를 받는다 — 보내기 직전 떠 두기가 0, 재조회가 1 이다.
+     * 기본은 읽을 줄 모르는 호스트(모름)다.
+     */
+    var units: (Int) -> HostCall<JsonNode> = { HostCall.Silent("판단 재조회용 실행 조회를 지원하지 않는 호스트 읽기다") }
+
     /** 판단 호출을 받을 때 부른다. 시험이 «호스트가 받았을 때» 의 시각을 정하는 데 쓴다. */
     var onResolve: () -> Unit = {}
 
@@ -69,6 +75,12 @@ class IncidentBench {
             return resolveAnswer
         }
 
+        override fun executionUnits(executionId: String): HostCall<JsonNode> {
+            val index = calls.count { it.op == "executionUnits" }
+            calls += Call("executionUnits", executionId = executionId)
+            return units(index)
+        }
+
         override fun injectFault(body: ObjectNode): HostWrite {
             calls += Call("injectFault", body = body.deepCopy())
             return faultAnswer
@@ -104,6 +116,24 @@ class IncidentBench {
         /** 판단 하나. [wallClockAt] 은 실제 시각, `at` 은 호스트 가상 시각이라 1970 근처다. */
         fun resolution(decision: String, by: String, wallClockAt: Instant): String =
             """{"decision":"$decision","at":"1970-01-01T00:01:05Z","wallClockAt":"$wallClockAt","decidedBy":{"id":"$by","kind":"PERSON"}}"""
+
+        /** 판단 기록의 단위 판단 하나(실행 본문 단위 줄의 `decision`). [at] 은 호스트 시계다. */
+        fun unitDecision(decision: String, by: String, attempt: Int, at: String = "1970-01-01T00:01:05Z"): String =
+            """{"decision":"$decision","approverId":"$by","approverKind":"PERSON","at":"$at","attempt":$attempt}"""
+
+        /** 실행 하나의 `GET /host/executions?executionId=` 본문. 단위 [unitId] 의 시도와 판단만 싣는다. */
+        fun unitBody(
+            attempt: Int,
+            decision: String? = null,
+            instanceId: String = "i-1",
+            executionId: String = "exec-1",
+            unitId: String = "T1",
+        ): HostCall<JsonNode> = HostCall.Ok(
+            jacksonObjectMapper().readTree(
+                """{"instanceId":"$instanceId","executions":[{"executionId":"$executionId","units":[""" +
+                    """{"unitId":"$unitId","skillType":"inspect","state":"FAILED","reached":"E0","attempt":$attempt,"decision":${decision ?: "null"}}]}]}""",
+            ),
+        )
 
         /** 목록 한 줄(S4a JSON 계약 §3, 19칸). */
         fun row(

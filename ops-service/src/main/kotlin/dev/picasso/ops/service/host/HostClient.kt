@@ -316,6 +316,12 @@ interface HostIncidents {
      * 지금 인스턴스가 아니면 호스트가 409 `INSTANCE_MISMATCH` 로 막는다(S4b 계약 H5).
      */
     fun resolve(executionId: String, unitId: String, decision: String, approverId: String, instanceId: String, requestId: UUID): HostWrite
+
+    /**
+     * 판단 재조회가 읽는 그 실행의 본문(`GET /host/executions?executionId=`, HA 설계 기록 §10) 그대로. 단위마다 지금 시도(`attempt`)와 판단 기록의
+     * 판단(`decision`)을 든다(picasso §15.323). 읽을 줄 모르는 구현은 모름이다 — 그러면 판단 재조회는 단위의 인시던트로만 대조한다.
+     */
+    fun executionUnits(executionId: String): HostCall<JsonNode> = HostCall.Silent("판단 재조회용 실행 조회를 지원하지 않는 호스트 읽기다")
 }
 
 /** 작업 응답 송신 기록 읽기(S4b 스펙 T6·T9). 시험이 호스트 없이 대신 끼운다. */
@@ -571,6 +577,8 @@ class HostClient(
             else -> HostIncident.Silent("HTTP ${response.status}")
         }
     }
+
+    override fun executionUnits(executionId: String): HostCall<JsonNode> = executionsOf(executionIds = listOf(executionId))
 
     override fun resolve(
         executionId: String,

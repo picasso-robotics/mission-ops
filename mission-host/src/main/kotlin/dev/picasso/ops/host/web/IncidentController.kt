@@ -55,12 +55,12 @@ class IncidentController(
 
     /**
      * 운영자 판단. 승인자는 늘 `Approver(approverId, PERSON)` 이다(ADR 43 에 따라 기본값이 없고 approverId 는 필수다). 대상 단위는 보류
-     * 단위이거나 선행 이동이 시도 뒤 실패해 내지 않은 점검인 건너뛴 대상이다(picasso ADR 53). 실행이 없거나 그 단위가 둘 다 아니면 NotHeld
-     * 이며 404 를 내지 않는다. 이 인스턴스가 이빅션한 실행이면 NotHeld 의 `detail` 이 [MissionHost.EVICTED] 이다.
+     * 단위이거나 보류가 아닌 재작업 묶음의 단위다(picasso ADR 53·§15.323 — 건너뛴 대상, 시도 뒤 실패한 단위와 그 묶음). 실행이 없거나 그 단위가
+     * 둘 다 아니면 NotHeld 이며 404 를 내지 않는다. 이 인스턴스가 이빅션한 실행이면 NotHeld 의 `detail` 이 [MissionHost.EVICTED] 이다.
      *
-     * 건너뛴 대상은 `REWORK` 만 받고 확인은 Refused 이며, 취소한 실행·종결 전 순회·같은 기체의 다른 활성 실행도 Refused 다. 승인자가 늘
-     * 사람이어도 Refused 가 REST 로 나며 `detail` 은 picasso 사유 문장 그대로다. Resolved 의 `incidentId` 는 판단이 붙은 인시던트이고
-     * 건너뛴 대상이면 요청한 단위가 아니라 선행 이동의 것이다.
+     * 묶음은 `REWORK` 만 받고 확인은 Refused 이며, 취소한 실행·종결 전 실행·같은 기체의 다른 활성 실행·발행 관문·물리 관문·묶음 규칙도 Refused 다.
+     * 승인자가 늘 사람이어도 Refused 가 REST 로 나며 `detail` 은 picasso 사유 문장 그대로다(읽는 쪽은 뜯어 나누지 않는다). Resolved 의
+     * `incidentId` 는 판단이 붙은 인시던트(묶음이면 붙은 것 가운데 마지막)이고 건너뛴 대상이면 요청한 단위가 아니라 선행 이동의 것이다.
      *
      * 본문의 `instanceId` 가 지금 인스턴스가 아니면 409 `INSTANCE_MISMATCH` 이고 판단하지 않는다(S4b 스펙 T8). `exec-N` 은 인스턴스마다
      * 다시 세므로 이전 인스턴스의 실행 id 가 지금 인스턴스의 다른 실행을 가리킬 수 있다.

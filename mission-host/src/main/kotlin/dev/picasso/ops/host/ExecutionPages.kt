@@ -32,8 +32,8 @@ data class SettledExecutionView(
  *
  * 앞 다섯 칸은 [ExecutionsView] 와 같은 이름·같은 뜻이고 [executions] 는 지금 인스턴스의 남은 실행([ExecutionPages.live])만 담는다(생성 순).
  *
- * @param reworkableTargets 지금 재작업을 받을 수 있는 건너뛴 대상([ReworkableTargetView]). 남은 실행뿐 아니라 종결 기록을 적고 아직 picasso
- *   메모리에 있는 `FAILED` 실행의 것도 든다(생성 순, 실행 안에서는 단위 순)
+ * @param reworkableTargets 지금 재작업을 받을 모양인 묶음([ReworkableTargetView], picasso `reworkCandidates` 순서 그대로). 남은 실행뿐 아니라
+ *   종결 기록을 적고 아직 picasso 메모리에 있는 `FAILED` 실행의 것도 든다
  * @param settled 최근 정착 이력(최근부터). 인스턴스를 가리지 않는다
  * @param nextBefore 더 오래된 정착 이력을 읽을 커서. 더 없으면 `null`
  * @param olderTotal [nextBefore] 보다 오래된 정착 이력 수. [nextBefore] 가 `null` 이면 0
@@ -81,14 +81,22 @@ data class UnrestoredRowView(
 )
 
 /**
- * 재작업할 수 있는 건너뛴 대상 하나. 순회가 종결한 뒤 선행 이동이 실패해 점검을 내지 않은 단위다. 운영자가 `REWORK` 로 판단하면
- * picasso 가 그 점검과 선행 이동을 한 쌍으로 새 시도로 되돌린다. 호스트는 picasso 가 공개한 칸만으로 이 모양을 추리므로 목록은 후보다.
- * 선행이 시도된 실패였는지와 같은 기체의 다른 활성 실행은 picasso 가 판단 때 가른다(`NotHeld`·`Refused`).
+ * 재작업할 수 있는 대상 하나(picasso `Middleware.reworkCandidates`, §15.323). 보류가 아닌 단위 가운데 재작업을 받을 모양인 **묶음** 하나에 하나다 —
+ * 건너뛴 대상(선행 이동이 시도 뒤 실패해 점검을 내지 않은 단위, ADR 53), 시도 뒤 실패한 점검·이동, 시도 뒤 실패한 `pick_place` 계열 단위(첫 발행
+ * 직전 재검사를 못 지난 `REWORK_RECHECK` 시도 포함). 묶음 규칙·모양·종결·같은 기체의 다른 활성 실행은 picasso 가 메모리 조건으로 가르고 호스트는
+ * 보존 만료 시각만 덧붙인다 — 술어를 두 벌로 두지 않는다. 발행 관문·물리 관문(손·자리)은 포트를 읽어야 하므로 판단 때에만 답하고, 목록에
+ * 올라도 `Refused` 일 수 있다(그 사유 문장이 답이다).
  *
- * @param unitId 건너뛴 점검의 단위 id. 판단에 싣는 단위 id 다
+ * @param unitId 판단을 낼 대상(picasso 후보의 `unitId`). 판단에 싣는 단위 id 다. 건너뛴 쌍이면 건너뛴 점검이다
  * @param physicalState `PARTIAL` 이나 `FAILED`
  * @param retainedUntil `FAILED` 면 이 시각(호스트 시계) 뒤에 picasso 메모리에서 이빅션되어 재작업할 수 없다. 종결 기록 시각에
  *   [MissionHost.DEFAULT_REVISABLE_RETENTION] 에 해당하는 보존 기간을 더한 값이다. `PARTIAL` 은 기체를 쥔 채 기다리므로 `null` 이다
+ * @param attempt 대상의 지금 시도. 받으면 묶음의 단위마다 하나 오른다
+ * @param bundle 함께 되돌릴 단위 id, 계획 순서
+ * @param kind `SKIPPED`·`ATTEMPTED_INSPECTION`·`ATTEMPTED_HANDLING`(picasso `ReworkKind` 이름 그대로). `ATTEMPTED_HANDLING` 은 받을 때 손·자리를 본다
+ * @param incidentUnitId 판단이 붙을 인시던트의 단위. 붙을 인시던트가 없으면 `null` 이다
+ * @param recheckFailed 묶음에 첫 발행 직전 재검사를 못 지나 태스크 없이 실패로 닫힌 단위(`FAILED` ∧ 실패 분류 [MissionHost.REWORK_RECHECK])가 있다.
+ *   앞서 받은 재작업이 «내기 직전에 손·자리가 달라 내지 않았다» 는 뜻이고 운영자 보류가 아니다. 같은 대상을 다시 재작업할 수 있다
  */
 data class ReworkableTargetView(
     val executionId: String,
@@ -97,6 +105,11 @@ data class ReworkableTargetView(
     val unitId: String,
     val physicalState: String,
     val retainedUntil: Instant?,
+    val attempt: Int,
+    val bundle: List<String>,
+    val kind: String,
+    val incidentUnitId: String?,
+    val recheckFailed: Boolean,
 )
 
 /** `GET /host/executions?before=` 의 본문. 칸 뜻은 [ExecutionPageView] 의 같은 이름 칸과 같다. */

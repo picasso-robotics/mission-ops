@@ -275,7 +275,11 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 - `resolution.decision == 요청한 결정`
 - `resolution.wallClockAt >= sentAt`(`at` 이 아니라 `wallClockAt`. 통합 시험에서는 `at` 이 가상 시각이라 실제 시각과 비교할 수 없다)
 
-어느 것도 없으면 반영 안 됨이다. 같은 사람이 같은 단위를 앞서 판단한 기록은 `wallClockAt` 조건이 거른다. 스펙 §7·§9 의 «가장 최근 인시던트» 와 «그 단위가 더 이상 보류가 아님» 조건은 쓰지 않는다. 재작업 뒤 대기가 기한(20초)을 다시 넘기면 새 인시던트가 가장 최근이 되고 단위가 다시 보류가 되어, 반영된 재작업을 반영 안 됨으로 읽는다.
+같은 사람이 같은 단위를 앞서 판단한 기록은 `wallClockAt` 조건이 거른다. 스펙 §7·§9 의 «가장 최근 인시던트» 와 «그 단위가 더 이상 보류가 아님» 조건은 쓰지 않는다. 재작업 뒤 대기가 기한(20초)을 다시 넘기면 새 인시던트가 가장 최근이 되고 단위가 다시 보류가 되어, 반영된 재작업을 반영 안 됨으로 읽는다.
+
+**판단 기록 대조**(picasso §15.323 반입 때 더함). 보류가 아닌 재작업 묶음의 판단은 요청한 단위의 인시던트에 붙지 않을 수 있다(건너뛴 점검은 인시던트를 열지 않았고, 판단은 묶음 안의 판단을 기다리던 인시던트마다 붙는다). 그래서 보내기 직전에 `GET /host/executions?executionId=` 로 대상 단위의 `attempt` 와 `decision` 을 떠 두고, 인시던트로 반영을 못 찾았으면 다시 읽은 그 단위의 `decision` 이 `approverId == 행위자`·`decision == 요청한 결정`·`attempt == 떠 둔 시도` 이고 떠 둔 판단과 (`approverId`, `decision`, `attempt`, `at`) 이 다르면(떠 둔 판단이 없으면 무엇이든) 반영이다. 시각의 앞뒤는 두 판단의 `attempt` 가 같을 때만 보고 같은 틱(같은 `at`)은 뒤로 친다. 두 `at` 은 다 호스트 시계라 서로만 맞댄다. 지금 인스턴스일 때만 본다.
+
+**같은 실행의 다른 단위 인시던트로 넓히지 않는다**(반입 전의 «그 단위의 인시던트가 없으면 같은 실행의 인시던트로 넓힌다» 분기는 지웠다). 판단 기록을 읽었으면 그것이 맞지 않을 때 반영 안 됨이다. 판단 기록을 못 읽었으면(떠 두기·재조회 실패, 이전 인스턴스) 그 단위에 아직 판단 없는 인시던트가 있을 때만 반영 안 됨이고, 그 밖(인시던트가 없거나 모두 판단이 붙음 — 운영 서비스 시계가 호스트보다 앞서 `wallClockAt` 조건이 거른 것일 수 있다)은 대응하는 판단을 못 찾은 것이라 확인 못 함(null)이다. 재작업 게이트가 반영 안 됨을 «안 걸림» 으로 읽으므로 성공으로도, 반영 안 됨으로도 추정하지 않는다.
 
 ---
 
@@ -487,7 +491,8 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 
 - 요청을 보내기 **직전**의 운영 서비스 실제 시각을 `sentAt` 으로 정해 둔다(요청 id 를 만든 뒤, 호스트를 부르기 바로 앞).
 - `executionId`·`unitId` 가 같은 인시던트 가운데 **하나라도** `resolution != null`, `resolution.decidedBy.id == X-Ops-User`, `resolution.decision == 요청한 decision`, `Instant.parse(resolution.wallClockAt) >= sentAt` 을 모두 만족하면 `CONFIRMED_APPLIED` 다. 관측(`observed`)은 그 인시던트 줄이다.
-- 어느 것도 없으면 `CONFIRMED_NOT_APPLIED` 다. 관측은 그 실행·단위의 가장 최근 인시던트 줄(목록의 첫 것)이고 없으면 null 이다.
+- 인시던트로 못 찾으면 판단 기록으로 대조한다(§5.4 의 판단 기록 대조). 보내기 직전 떠 두기(`GET /host/executions?executionId=`)는 `sentAt` 을 정하기 바로 앞이고, 못 읽어도 요청은 보낸다. 맞으면 `CONFIRMED_APPLIED` 이고 관측은 그 단위 줄(`attempt`·`decision`)이다.
+- 어느 것도 없으면 `CONFIRMED_NOT_APPLIED` 다. 관측은 그 실행·단위의 가장 최근 인시던트 줄(목록의 첫 것)이고, 없으면 판단 기록으로 본 단위 줄이다. 같은 실행의 다른 단위 인시던트로 넓히지 않는다. 판단 기록을 못 읽었으면 그 단위의 판단 없는 인시던트가 있을 때만 `CONFIRMED_NOT_APPLIED`(관측은 그 인시던트 줄)이고 그 밖은 `confirmation` 이 null 이다.
 - 목록을 못 읽으면(호스트 불통, 200 아님, `incidents` 가 배열 아님) 확인 못 함이라 `confirmation` 이 null 이고 확인 행을 붙이지 않는다.
 - «가장 최근 인시던트» 와 «그 단위가 보류가 아님» 조건은 쓰지 않는다(§5.4). 같은 사람이 같은 단위에 앞서 같은 결정을 낸 기록은 `wallClockAt < sentAt` 이라 걸러진다. `wallClockAt` 이 `sentAt` 과 같으면 반영이다.
 - `sentAt` 은 운영 서비스 시계, `wallClockAt` 은 호스트 시계다. 둘이 같은 기계(루프백)에 있다는 전제다.

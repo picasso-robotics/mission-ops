@@ -109,6 +109,12 @@ class SkippedTargetReworkTest {
             "$target",
         )
         assertTrue(target["retainedUntil"].isNull, "$target")
+        // picasso 후보(§15.323) 칸도 그대로 지난다. 건너뛴 쌍은 SKIPPED 이고 묶음은 실패한 이동과 건너뛴 점검이다.
+        assertEquals(
+            listOf("0", "[\"T1.travel\",\"T1\"]", "SKIPPED", "T1.travel", "false"),
+            listOf(target["attempt"].asText(), target["bundle"].toString(), target["kind"].asText(), target["incidentUnitId"].asText(), target["recheckFailed"].asText()),
+            "$target",
+        )
 
         // 운영자 모드로 건너뛴 점검 T1 을 재작업한다. 인스턴스는 목록의 것이다.
         val reason = "경로 막힘이 걷힌 것을 현장에서 확인"

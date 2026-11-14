@@ -332,7 +332,7 @@ describe('운영자 결함 감수', () => {
   })
 })
 
-describe('건너뛴 대상 재작업', () => {
+describe('실패 대상 재작업', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
@@ -340,10 +340,19 @@ describe('건너뛴 대상 재작업', () => {
   const REWORK_PARTIAL = '/api/executions/exec-1/units/T1/resolve'
   const REWORK_FAILED = '/api/executions/exec-2/units/T3/resolve'
 
-  /** 호스트가 싣는 재작업 대상 둘: 기체를 쥔 PARTIAL 의 T1, 보존 기간이 있는 FAILED 의 T3. */
+  /**
+   * 호스트가 싣는 재작업 대상 둘: 기체를 쥔 PARTIAL 의 건너뛴 T1, 보존 기간이 있는 FAILED 의 자재 다루기 T3(앞서 받은 재작업이 재검사를 못 지남).
+   * 셋째는 칸이 생기기 전 호스트의 모양(묶음·분류 없음)이다.
+   */
   const targets = (): ReworkableTarget[] => [
-    { executionId: 'exec-1', jobOrderId: 'JO-1', robotId: 'humanoid-01', unitId: 'T1', physicalState: 'PARTIAL', retainedUntil: null },
-    { executionId: 'exec-2', jobOrderId: 'JO-2', robotId: 'quadruped-01', unitId: 'T3', physicalState: 'FAILED', retainedUntil: '2026-10-19T09:05:00Z' },
+    {
+      executionId: 'exec-1', jobOrderId: 'JO-1', robotId: 'humanoid-01', unitId: 'T1', physicalState: 'PARTIAL', retainedUntil: null,
+      attempt: 0, bundle: ['T1.travel', 'T1'], kind: 'SKIPPED', incidentUnitId: 'T1.travel', recheckFailed: false,
+    },
+    {
+      executionId: 'exec-2', jobOrderId: 'JO-2', robotId: 'quadruped-01', unitId: 'T3', physicalState: 'FAILED', retainedUntil: '2026-10-19T09:05:00Z',
+      attempt: 2, bundle: ['T3'], kind: 'ATTEMPTED_HANDLING', incidentUnitId: 'T3', recheckFailed: true,
+    },
   ]
 
   /** 대상이 있는 호스트. 남은 실행에는 대상이 아닌 도는 실행도 있다. */
@@ -377,9 +386,10 @@ describe('건너뛴 대상 재작업', () => {
     const options = within(within(form).getByLabelText(TEXT.reworkTarget)).getAllByRole('option').map((option) => option.textContent)
     expect(options).toEqual([
       TEXT.reworkChoose,
-      TEXT.reworkOption('exec-1', 'JO-1', 'humanoid-01', 'T1'),
-      TEXT.reworkOption('exec-2', 'JO-2', 'quadruped-01', 'T3'),
+      TEXT.reworkOption('exec-1', 'JO-1', 'humanoid-01', 'T1', 'SKIPPED'),
+      TEXT.reworkOption('exec-2', 'JO-2', 'quadruped-01', 'T3', 'ATTEMPTED_HANDLING'),
     ])
+    expect(options[1]).toBe('exec-1 · JO-1 · humanoid-01 · T1 · 건너뛴 대상')
     const button = within(form).getByRole('button', { name: TEXT.reworkButton })
     expect(button).toBeDisabled()
 
@@ -396,6 +406,76 @@ describe('건너뛴 대상 재작업', () => {
       `exec-1(JO-1) ${TEXT.reworkHeading}: ${TEXT.reworkResolved('incident-1')}`,
     )
     expect(within(form).getByLabelText(TEXT.reworkTarget)).toHaveValue('')
+  })
+
+  it('고르면 묶음을 보이고 자재 다루기는 손·자리를 본다는 것을, 재검사를 못 지난 묶음은 그 사실을 함께 적는다', async () => {
+    withTargets()
+    open()
+    const form = await screen.findByRole('form', { name: TEXT.reworkHeading })
+    await userEvent.selectOptions(within(form).getByLabelText(TEXT.reworkTarget), 'exec-1/T1')
+    expect(form).toHaveTextContent(TEXT.reworkBundle(['T1.travel', 'T1']))
+    expect(form).toHaveTextContent('함께 다시 보낼 단위: T1.travel → T1')
+    expect(form).not.toHaveTextContent(TEXT.reworkHandlingNote)
+    expect(form).not.toHaveTextContent(TEXT.reworkRecheckNote)
+    await userEvent.selectOptions(within(form).getByLabelText(TEXT.reworkTarget), 'exec-2/T3')
+    expect(form).toHaveTextContent(TEXT.reworkBundle(['T3']))
+    expect(form).toHaveTextContent(TEXT.reworkHandlingNote)
+    expect(form).toHaveTextContent(TEXT.reworkRecheckNote)
+  })
+
+  it('칸이 없던 호스트의 대상은 분류 없이 고를 수 있고 묶음 줄이 없다', async () => {
+    const fake = withTargets()
+    fake.recent = {
+      settled: [], nextBefore: null, olderTotal: 0,
+      reworkableTargets: [{ executionId: 'exec-1', jobOrderId: 'JO-1', robotId: 'humanoid-01', unitId: 'T1', physicalState: 'PARTIAL', retainedUntil: null }],
+    }
+    open()
+    const form = await screen.findByRole('form', { name: TEXT.reworkHeading })
+    await userEvent.selectOptions(within(form).getByLabelText(TEXT.reworkTarget), 'exec-1/T1')
+    expect(within(form).getByRole('option', { name: TEXT.reworkOption('exec-1', 'JO-1', 'humanoid-01', 'T1') })).toBeInTheDocument()
+    expect(form).not.toHaveTextContent('함께 다시 보낼 단위')
+  })
+
+  it('거부 사유는 호스트 문장 그대로 보이고 고른 대상과 사유는 남기고 현장 확인만 꺼서 다시 확인해야 보낸다', async () => {
+    const fake = withTargets()
+    const unread = '기체 quadruped-01 의 스냅숏을 아직 못 읽었다 — 다시 낸다'
+    fake.answers.set(REWORK_FAILED, {
+      status: 200,
+      body: resolved({
+        unitId: 'T3', result: 'REJECTED', outcome: 'Refused',
+        answer: { requestId: null, incidentId: null, result: 'Refused', detail: unread },
+      }),
+    })
+    open()
+    const form = await screen.findByRole('form', { name: TEXT.reworkHeading })
+    await rework(form, 'exec-2/T3')
+    const status = await within(form).findByRole('status', { name: `${TEXT.reworkHeading} 결과` })
+    await waitFor(() => expect(status).toHaveTextContent(unread))
+    expect(status).toHaveTextContent(TEXT.reworkRefused(unread))
+    expect(TEXT.reworkRefused(unread)).not.toContain('다시 보낼 수')
+    // 고른 대상과 사유는 남고 현장 확인만 꺼진다. 다시 확인해야 보낸다.
+    await waitFor(() => expect(within(form).getByLabelText(TEXT.reworkConfirm)).not.toBeChecked())
+    expect(within(form).getByLabelText(TEXT.reworkTarget)).toHaveValue('exec-2/T3')
+    expect(within(form).getByLabelText(TEXT.reworkReason)).toHaveValue('확인')
+    const button = within(form).getByRole('button', { name: TEXT.reworkButton })
+    expect(button).toBeDisabled()
+    await userEvent.click(within(form).getByLabelText(TEXT.reworkConfirm))
+    await userEvent.click(button)
+    await waitFor(() => expect(posts(fake, REWORK_FAILED)).toHaveLength(2))
+    expect(posts(fake, REWORK_FAILED)[1].body).toEqual({ decision: 'REWORK', instanceId: 'mw-1', reason: '확인' })
+
+    // 응답 없음(다시 읽지 못함)도 고른 대상과 사유를 남긴다. 다시 읽어 걸렸으면 폼을 비운다.
+    fake.answers.set(REWORK_FAILED, { status: 200, body: resolved({ unitId: 'T3', result: 'NO_RESPONSE', outcome: null, answer: null, confirmation: null }) })
+    await userEvent.click(within(form).getByLabelText(TEXT.reworkConfirm))
+    await userEvent.click(button)
+    await waitFor(() => expect(status).toHaveTextContent(TEXT.reworkUnconfirmed))
+    expect(within(form).getByLabelText(TEXT.reworkTarget)).toHaveValue('exec-2/T3')
+    expect(within(form).getByLabelText(TEXT.reworkConfirm)).not.toBeChecked()
+    fake.answers.set(REWORK_FAILED, { status: 200, body: resolved({ unitId: 'T3', result: 'NO_RESPONSE', outcome: null, answer: null, confirmation: 'CONFIRMED_APPLIED' }) })
+    await userEvent.click(within(form).getByLabelText(TEXT.reworkConfirm))
+    await userEvent.click(button)
+    await waitFor(() => expect(within(form).getByLabelText(TEXT.reworkTarget)).toHaveValue(''))
+    expect(within(form).getByLabelText(TEXT.reworkReason)).toHaveValue('')
   })
 
   it('사유가 비어 있으면 현장 확인을 해도 보내지 않는다', async () => {
