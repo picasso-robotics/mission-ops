@@ -436,7 +436,8 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   await expect(grasp.getByRole('cell').nth(9)).toHaveText('판단 대상 아님')
   await expect(graspRun).toContainText('RACK-204.S01 pick_place: FAILED')
 
-  // 잔여 파지(P0-b2). pick_place 가 든 채로 실패했으므로 실행 호스트가 humanoid-01 에 표시를 세우고 배정에서 뺀다. 운영자가
+  // 잔여 파지(P0-b2). pick_place 가 든 채로 실패했으므로 실행 호스트가 humanoid-01 에 표시를 세우고 일반 배정에서 뺀다(관문 확인용으로만
+  // 후보가 되어 조치 제안을 얻을 뿐 실행은 서지 않는다, picasso §15.317). 운영자가
   // 현장에서 빈손을 확인해 «기체 빈손 확인» 으로 풀어야 다음 작업 지시(운영자 보류)가 humanoid-01 에 배정된다.
   const graspJobOrder = (await graspRun.getByRole('cell').nth(1).textContent())!.trim()
   await page.getByLabel('운영자').check()
@@ -449,7 +450,7 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   await order.getByLabel('RACK-204.S02').check()
   await order.getByLabel('자재').selectOption('ENGINE-COVER-A')
   const humanoidEligibility = eligibility.getByRole('row', { name: /^humanoid-01 / })
-  await expect(humanoidEligibility.getByRole('cell', { name: '불가', exact: true })).toHaveText('불가')
+  await expect(humanoidEligibility.getByRole('cell', { name: '관문 확인용', exact: true })).toHaveText('관문 확인용')
   await expect(humanoidEligibility).toContainText(`잔여 파지 확인 필요: ${graspJobOrder} RACK-204.S01`)
   await residualRow.getByRole('button', { name: '기체 빈손 확인' }).click()
   const emptyForm = residual.getByRole('form', { name: '기체 빈손 확인' })
