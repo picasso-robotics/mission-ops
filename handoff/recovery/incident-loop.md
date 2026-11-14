@@ -16,6 +16,15 @@
 승인이 먼저 실행을 세웠으면 철회는 `EXECUTION_EXISTS` 이고 대체는 409 `ORIGINAL_NOT_REPLACEABLE`, 앞선 작업 요청은 `ACCEPTED` 로 올라간다.
 철회된 작업 지시의 제안은 picasso 의 제안 장부와 내보내기에는 남는다. 승인 에이전트는 `REMEDY_NOT_APPLIED` 를 그 작업 지시의 끝으로 읽는다.
 관문이 통과시킨 표시 기체는 일반 실행을 세우지 않고 `excluded`에 표시 사유로 둔다.
+작업 수락 뒤 기체가 `PRECONDITION_UNMET`(파지 주어)으로 거부해 운영자 보류에 선 실행에는 같은 (기체, 작업 지시)에 회복 제안이 설 수 있다(picasso §15.320).
+그 제안의 값 없는 승인은 호스트 판정보다 앞에서 picasso 에 넘겨 `HUMAN_APPROVAL_REQUIRED`(대상이 낡았으면 `REMEDY_NOT_APPLIED`)로 거부되고 실행도 조치도 서지 않는다. 다시 시도해도 같다.
+이 실행 호스트에는 사람의 회복 입구가 없다. 그 보류는 운영자가 화면에서 판단(재작업·완료 확인)이나 실행 취소로 닫는다.
+운영자 실행 취소는 그 실행의 보류·미확정 단위 인시던트의 판단 칸에 `OPERATOR_CANCEL` 을 승인자와 함께 싣는다. 인시던트 뒤의 탐색 줄 사이에 사람의 걸음이 데이터로 남는다.
+
+## 규약 버전(picasso `fde49d1`)
+승인 호스트(`POST /approvals`) 답의 `schemaVersion` 은 `"5"` 다. `refusal` 에 `HUMAN_APPROVAL_REQUIRED` 가 늘고 거부 답 `consumed` 에 `target` 칸(작업 수락 승인의 소모면 `null`)이 붙었다.
+인시던트 고리 내보내기 `manifest.json` 의 `schemaVersion` 은 `"7"` 이다. 인시던트 줄 `resolution.decision` 에 `OPERATOR_CANCEL`·`REMEDY_APPLIED` 가 늘었고 칸은 그대로다.
+recovery `core` 가 승인 답을 `"4"` 로만, 내보내기를 `"5"`·`"6"` 으로만 읽으면 이 호스트의 답과 번들은 모르는 버전으로 멈춘다.
 
 ## 선언과 승인자 id
 견본 위치는 `mission-host/incident-loop/entitlements.example.json`이다.

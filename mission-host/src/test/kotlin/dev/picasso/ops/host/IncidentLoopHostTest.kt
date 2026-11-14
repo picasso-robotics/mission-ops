@@ -3,6 +3,8 @@ package dev.picasso.ops.host
 import com.fasterxml.jackson.databind.JsonNode
 import dev.picasso.host.FileEntitlements
 import dev.picasso.middleware.ApprovalOutcome
+import dev.picasso.middleware.Approver
+import dev.picasso.middleware.ApproverKind
 import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.EquipmentRequirement
 import dev.picasso.middleware.JobOrder
@@ -145,8 +147,11 @@ class IncidentLoopHostTest {
      */
     private fun misclearedThenPatrol(bench: HostBench): JsonNode = heldThenPatrol(bench, clear = true)
 
-    /** 든 채 실패해 잔여 파지 표시가 선 기체에 순회를 낸다. [clear] 면 그 전에 사람이 어긋남을 지목하고 «빈손 확인» 으로 (잘못) 푼다. */
-    private fun heldThenPatrol(bench: HostBench, clear: Boolean): JsonNode {
+    /**
+     * 든 채 실패해 잔여 파지 표시가 선 기체에 순회를 낸다. [clear] 면 그 전에 사람이 어긋남을 지목하고 «빈손 확인» 으로 (잘못) 푼다. [hideHand] 면
+     * 순회를 내기 전에 발신자가 손을 말하지 않게 한다([HostBench.hiddenHands], 그 세트는 `gated` 여야 한다).
+     */
+    private fun heldThenPatrol(bench: HostBench, clear: Boolean, hideHand: Boolean = false): JsonNode {
         bench.awaitPump()
         val rack = bench.post("/host/job-orders", request(HostBench.rack("JO-R", "RACK-204.S01"), "candidates", HUMANOID)).body!!
         assertEquals("ACCEPTED", rack["result"].asText(), rack.toString())
@@ -168,6 +173,7 @@ class IncidentLoopHostTest {
             assertEquals(200, cleared.status, cleared.body.toString())
             assertEquals(true, cleared.body!!["clearing"]["acknowledgedMismatch"].asBoolean(), cleared.body.toString())
         }
+        if (hideHand) bench.hiddenHands += HUMANOID
         bench.awaitPump()
         return bench.post("/host/job-orders", request(inspect("JO-P", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
     }
@@ -190,6 +196,45 @@ class IncidentLoopHostTest {
                     it.getString(1) to it.getString(2)
                 },
             )
+        }
+    }
+
+    /**
+     * picasso §15.320: 손을 못 본 채 받은 순회가 기체의 파지 거부로 운영자 보류에 서고, 손이 보이자 회복 제안이 선다. 그 제안은 사람만 승인하므로 값
+     * 없는 문은 `HUMAN_APPROVAL_REQUIRED` 를 받고 실행도 조치도 서지 않는다. 사람이 그 실행을 운영자 취소로 닫으면 그 인시던트의 판단 칸에
+     * `OPERATOR_CANCEL` 이 사람과 함께 실린다.
+     */
+    @Test
+    fun `발신자의 파지 거부로 선 보류의 회복 제안은 값 없는 승인에 HUMAN_APPROVAL_REQUIRED 로 답하고 운영자 취소가 그 인시던트를 사람의 걸음으로 닫는다`() {
+        HostBench(gated = true, incidentLoop = loop(putDown)).use { bench ->
+            val patrol = heldThenPatrol(bench, clear = true, hideHand = true)
+            assertEquals("ACCEPTED", patrol["result"].asText(), "손을 못 본 순회가 접수되지 않았다 — 이 장면이 아니다: $patrol")
+            val executionId = patrol["executionId"].asText()
+            assertEquals("OPERATOR_HOLD", bench.driveUntil(executionId, setOf("OPERATOR_HOLD") + settledStates)["physicalState"].asText())
+
+            // 손이 보이면 라운드 끝의 재확인이 회복 제안을 세운다. 값 없는 문은 그 제안을 승인하지 못한다 — 호스트 판정보다 앞에서 그대로 넘긴다.
+            bench.hiddenHands.clear()
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            var refused: JsonNode? = null
+            bench.eventually("회복 제안") {
+                refused = approve(port, AGENT, "JO-P", saw = listOf("pick_place")).second
+                refused!!["refusal"]?.asText() == "HUMAN_APPROVAL_REQUIRED"
+            }
+            assertEquals("REFUSED", refused!!["outcome"].asText(), refused.toString())
+            assertEquals(
+                listOf(executionId),
+                bench.get("/host/executions")["executions"].filter { it["jobOrderId"].asText() == "JO-P" }.map { it["executionId"].asText() },
+                "승인이 새 실행을 세웠다",
+            )
+            assertEquals("OPERATOR_HOLD", bench.execution(executionId)!!["physicalState"].asText())
+
+            val held = bench.get("/host/incidents")["incidents"].single { it["executionId"].asText() == executionId }
+            assertTrue(held["resolution"].isNull, held.toString())
+
+            val canceled = bench.host.cancel(executionId, Approver("kim", ApproverKind.PERSON), "회복 대신 닫는다", null)
+            assertEquals(CancelResult.CANCELED, canceled.result, canceled.toString())
+            val closed = bench.get("/host/incidents/${held["incidentId"].asText()}")["resolution"]
+            assertEquals(listOf("OPERATOR_CANCEL", "kim", "PERSON"), listOf(closed["decision"].asText(), closed["decidedBy"]["id"].asText(), closed["decidedBy"]["kind"].asText()), closed.toString())
         }
     }
 

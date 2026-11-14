@@ -13,7 +13,7 @@ import type {
   IncidentsView,
   Session,
 } from '../api'
-import { DECISION_LABEL, EXECUTION_CONTROL_TEXT, kindLabel, rejectionText } from '../labels'
+import { DECISION_LABEL, EXECUTION_CONTROL_TEXT, kindLabel, rejectionText, RESOLUTION_LABEL } from '../labels'
 import type { HostRead } from './ExecutionList'
 import { FaultCard } from './FaultCard'
 
@@ -414,7 +414,7 @@ function Judgement({ resolution, withoutEvidence }: { resolution: IncidentResolu
         사람이 판단함: {resolution.decidedBy.id}, {resolution.wallClockAt}
       </p>
       <p>
-        결정 {DECISION_LABEL[resolution.decision] ?? resolution.decision}({resolution.decision}), 호스트 시각{' '}
+        결정 {RESOLUTION_LABEL[resolution.decision] ?? resolution.decision}({resolution.decision}), 호스트 시각{' '}
         {resolution.at}
       </p>
       {withoutEvidence && (
