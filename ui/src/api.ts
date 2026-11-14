@@ -1067,11 +1067,27 @@ export interface FaultSummary {
   errorHint: string
 }
 
+/** 인시던트가 이 인스턴스에서 처음 선 것인가(`NEW`), 재기동이 판단 기록의 운영자 보류로 다시 연 것인가(`REOPENED`). picasso §15.322. */
+export type OpeningKind = 'NEW' | 'REOPENED'
+
 /**
- * 인시던트 한 줄(S4a JSON 계약 §3, 19칸). `unresolved` 는 봉인 때 한 번 정해지고 판단 뒤에도 그대로다. «미해결» 은
+ * 재기동을 넘는 인시던트 정체성(picasso §15.322, S4a JSON 계약 §3 의 20~23칸). `incidentKey` 는 **불투명한** 열쇠이고 같으면 같은 사건이다 —
+ * 재기동이 다시 연 보류는 원래 보류의 열쇠를 잇는다. 다시 연 인시던트의 열쇠가 null 이면 옛 판단 기록으로 다시 연 것이라 연결 불명이고
+ * 추측해 잇지 않는다. `attempt` 는 재발 판정의 재료이지 잇는 열쇠가 아니다. 넷 다 null 이거나 칸이 없으면 이 칸이 생기기 전에 적은 사본이거나
+ * 옛 호스트다.
+ */
+export interface IncidentIdentity {
+  incidentKey?: string | null
+  firstOpenedAt?: string | null
+  openingKind?: OpeningKind | null
+  attempt?: number | null
+}
+
+/**
+ * 인시던트 한 줄(S4a JSON 계약 §3, 23칸). `unresolved` 는 봉인 때 한 번 정해지고 판단 뒤에도 그대로다. «미해결» 은
  * `unresolved` 이고 `resolution` 이 없을 때이고, «보류 중» 강조는 `held` 만 본다. `missionVersion` 이 null 이면 코드 정의다.
  */
-export interface IncidentRow {
+export interface IncidentRow extends IncidentIdentity {
   incidentId: string
   executionId: string
   jobOrderId: string
@@ -1093,7 +1109,7 @@ export interface IncidentRow {
   confirmedWithoutEvidence: boolean
 }
 
-/** 이전 인스턴스의 인시던트 사본 한 줄(S4b 계약 H3, 20칸). 그 사본의 `instanceId` 를 앞에 둔다. 늘 보류가 아니다. */
+/** 이전 인스턴스의 인시던트 사본 한 줄(S4b 계약 H3, 24칸). 그 사본의 `instanceId` 를 앞에 둔다. 늘 보류가 아니다. */
 export interface EarlierIncidentRow extends IncidentRow {
   instanceId: string
 }
@@ -1154,10 +1170,10 @@ export interface IncidentIntent {
 }
 
 /**
- * 운영 서비스의 `GET /api/incidents/{incidentId}`(S4a JSON 계약 §4, 29칸). `unitState` 는 그 단위의 지금 상태이고 나머지 근거
+ * 운영 서비스의 `GET /api/incidents/{incidentId}`(S4a JSON 계약 §4, 33칸). `unitState` 는 그 단위의 지금 상태이고 나머지 근거
  * 칸은 봉인 때의 관측이다.
  */
-export interface IncidentDetail {
+export interface IncidentDetail extends IncidentIdentity {
   instanceId: string
   incidentId: string
   executionId: string

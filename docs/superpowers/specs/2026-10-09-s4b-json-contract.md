@@ -158,7 +158,7 @@ picasso 서브모듈 `74e4d3d` 위의 실행 호스트가 실제로 내고 받�
 | 칸 | 형 | 규칙 |
 |---|---|---|
 | `earlierTotal` | 정수 | 지금 인스턴스가 아닌 사본의 수(자르기 전) |
-| `earlier` | 배열 | 지금 인스턴스가 아닌 인스턴스의 인시던트 사본. 적은 순서의 역순(최근 것 먼저), 많아야 `limit` 개. 원소는 20칸: `instanceId`(그 사본의 인스턴스) 다음에 S4a §3 의 19칸 그대로 |
+| `earlier` | 배열 | 지금 인스턴스가 아닌 인스턴스의 인시던트 사본. 적은 순서의 역순(최근 것 먼저), 많아야 `limit` 개. 원소는 24칸: `instanceId`(그 사본의 인스턴스) 다음에 S4a §3 의 23칸 그대로(정체성 네 칸은 사본의 상세 글자에서 읽고, 반입 전 사본이면 넷 다 `null`) |
 
 사본 줄의 값:
 
@@ -311,7 +311,7 @@ HA 단계 0 에서 더해진 V7 `host_instance`(`V7__host_instance_heartbeat.sql
 
 ### O1. `GET /api/incidents`
 
-호스트 `GET /host/incidents`(H3)를 그대로 중계합니다. `limit` 규칙과 400 `INCIDENT_BAD_REQUEST`, 503 `HOST_SILENT` 는 S4a §9.2 그대로입니다. 200 본문은 호스트의 5칸(`instanceId`, `total`, `incidents`, `earlierTotal`, `earlier`)이고 사본 줄은 20칸입니다. `limit` 은 호스트가 `incidents` 와 `earlier` 에 따로 겁니다.
+호스트 `GET /host/incidents`(H3)를 그대로 중계합니다. `limit` 규칙과 400 `INCIDENT_BAD_REQUEST`, 503 `HOST_SILENT` 는 S4a §9.2 그대로입니다. 200 본문은 호스트의 5칸(`instanceId`, `total`, `incidents`, `earlierTotal`, `earlier`)이고 사본 줄은 24칸입니다. `limit` 은 호스트가 `incidents` 와 `earlier` 에 따로 겁니다.
 
 ### O2. `GET /api/incidents/{incidentId}?instanceId=`
 

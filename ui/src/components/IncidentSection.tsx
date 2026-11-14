@@ -7,13 +7,22 @@ import type {
   HoldDecision,
   HoldResolveOutcome,
   IncidentDetail,
+  IncidentIdentity,
   IncidentLookup,
   IncidentResolution,
   IncidentRow,
   IncidentsView,
   Session,
 } from '../api'
-import { DECISION_LABEL, EXECUTION_CONTROL_TEXT, kindLabel, rejectionText, RESOLUTION_LABEL } from '../labels'
+import {
+  DECIDER_KIND_LABEL,
+  DECISION_LABEL,
+  EXECUTION_CONTROL_TEXT,
+  kindLabel,
+  OPENING_LABEL,
+  rejectionText,
+  RESOLUTION_LABEL,
+} from '../labels'
 import type { HostRead } from './ExecutionList'
 import { FaultCard } from './FaultCard'
 
@@ -39,6 +48,16 @@ const settingsVersion = (version: number | null) => (version === null ? '모름'
 const seconds = (value: number | null) => (value === null ? '모름' : `${value}초`)
 
 /**
+ * 열림 칸(picasso §15.322). 칸이 없으면(옛 호스트·이 칸 전에 적은 사본) 모름이다. 다시 연 인시던트에 열쇠가 없으면 옛 판단 기록으로
+ * 다시 연 것이라 연결 불명이다 — 새 사건으로도, 앞 사건과 같은 것으로도 세지 않는다.
+ */
+function opening(row: IncidentIdentity): string {
+  if (row.openingKind == null) return '-'
+  const label = OPENING_LABEL[row.openingKind] ?? row.openingKind
+  return row.openingKind === 'REOPENED' && row.incidentKey == null ? `${label}(연결 불명)` : label
+}
+
+/**
  * 목록의 판단 칸(S4a 스펙 §8.2). «미해결» 은 봉인 때 보류·불확실이었고 판단이 없는 것이다. 단위가 실패로 끝나 사람이 판단할
  * 것이 없는 인시던트는 판단 대상이 아니다.
  */
@@ -58,6 +77,10 @@ function judgement(row: IncidentRow): string {
  * (인스턴스, id)로 고르고 상세도 인스턴스를 실어 읽는다. `incident-N` 은 재기동하면 1부터 다시 세기 때문이다. 이전 인스턴스의
  * 상세에는 판단 폼이 없다. 그 단위는 다시 지은 실행에서 새로 판단해야 한다. 지금 인스턴스의 판단은 상세의 `instanceId` 를
  * 함께 보내고, 그 사이 재기동했으면 실행 호스트가 거부한다.
+ *
+ * 사건 정체성(picasso §15.322): 재기동이 다시 연 보류는 `openingKind` 가 `REOPENED` 이고 원래 보류와 같은 `incidentKey` 를 든다. 상세는
+ * 읽어 온 두 목록(지금 인스턴스와 «이전 인스턴스»)에서 같은 열쇠의 다른 줄을 «같은 사건의 다른 기록» 으로 잇는다. 열쇠가 없으면 잇지
+ * 않는다(연결 불명). 잇는 것은 읽어 온 목록 안에서뿐이다 — `earlier` 는 최근 것부터 잘려 오므로 더 오래된 사본은 보이지 않을 수 있다.
  */
 export function IncidentSection({ read, session, tick, onDecided, executions = null }: Props) {
   const [selected, setSelected] = useState<Selection | null>(null)
@@ -105,6 +128,10 @@ export function IncidentSection({ read, session, tick, onDecided, executions = n
   const shown = detail !== null && detail.key === selectedKey ? detail : null
   // 고른 인시던트가 지금 인스턴스의 것이 아니면(이전 인스턴스 줄을 골랐거나 고른 뒤 재기동) 읽기 전용이다.
   const earlier = selected !== null && (value === null || selected.instanceId !== value.instanceId)
+  const loaded: EarlierIncidentRow[] =
+    value === null
+      ? []
+      : [...value.incidents.map((row) => ({ ...row, instanceId: value.instanceId })), ...(Array.isArray(value.earlier) ? value.earlier : [])]
 
   return (
     <section aria-label="인시던트">
@@ -163,6 +190,8 @@ export function IncidentSection({ read, session, tick, onDecided, executions = n
               {shown.error !== null && <p className="stale">직전 값입니다. 실행 호스트 불통: {shown.error}</p>}
               <Detail
                 detail={shown.lookup.detail}
+                related={sameIncident(loaded, shown.lookup.detail)}
+                onSelect={setSelected}
                 session={session}
                 decidable={!earlier}
                 blockedNow={!earlier && stillBlocked(executions, shown.lookup.detail)}
@@ -186,6 +215,15 @@ export function IncidentSection({ read, session, tick, onDecided, executions = n
 function stillBlocked(page: ExecutionPage | null, detail: IncidentDetail): boolean {
   if (page === null || page.instanceId !== detail.instanceId) return false
   return page.executions.some((execution) => execution.executionId === detail.executionId && faultBlocked(execution))
+}
+
+/** 읽어 온 줄 가운데 [detail] 과 같은 사건 열쇠를 든 다른 줄. 열쇠가 없으면(연결 불명·옛 사본) 아무것도 잇지 않는다. */
+function sameIncident(rows: EarlierIncidentRow[], detail: IncidentDetail): EarlierIncidentRow[] {
+  const key = detail.incidentKey
+  if (key == null) return []
+  return rows.filter(
+    (row) => row.incidentKey === key && !(row.instanceId === detail.instanceId && row.incidentId === detail.incidentId),
+  )
 }
 
 /** 고른 인시던트. 재기동하면 id 를 다시 세므로 인스턴스와 짝을 짓는다. */
@@ -218,6 +256,7 @@ function IncidentTable({
           {earlier && <th>인스턴스</th>}
           <th>인시던트</th>
           <th>발생 시각</th>
+          <th>열림</th>
           <th>기체</th>
           <th>실행 id</th>
           <th>단위</th>
@@ -249,6 +288,7 @@ function IncidentTable({
               </button>
             </td>
             <td>{row.at}</td>
+            <td>{opening(row)}</td>
             <td>{row.robotId}</td>
             <td>{row.executionId}</td>
             <td>{row.unitId}</td>
@@ -267,6 +307,9 @@ function IncidentTable({
 
 interface DetailProps {
   detail: IncidentDetail
+  /** 읽어 온 목록 가운데 같은 사건 열쇠를 든 다른 줄(재기동 앞뒤의 같은 보류). */
+  related: EarlierIncidentRow[]
+  onSelect: (selection: Selection) => void
   session: Session
   /** 지금 인스턴스의 상세일 때만 참이다. 거짓이면 보류여도 판단 폼을 두지 않는다. */
   decidable: boolean
@@ -280,12 +323,13 @@ interface DetailProps {
  * 인시던트 상세(S4a 스펙 §8.2). 판단은 «사람의 판단» 에, 봉인 때의 근거는 «관측» 에 따로 둔다. 확인 결과는 코드 이름 그대로
  * 보인다. `NOT_REQUESTED` 를 «설비 확인 안 함» 으로 풀면, 설비 슬롯을 실제로 읽은 인시던트를 틀리게 읽힌다(S4a JSON 계약 §4).
  */
-function Detail({ detail, session, decidable, blockedNow, busy, onDecide }: DetailProps) {
+function Detail({ detail, related, onSelect, session, decidable, blockedNow, busy, onDecide }: DetailProps) {
   const { intent, step } = detail
   const position = step.at === 0 ? `계획에 없음(계획 ${step.plan.length}개)` : `${step.at}/${step.plan.length}`
   return (
     <>
       <Judgement resolution={detail.resolution} withoutEvidence={detail.confirmedWithoutEvidence} />
+      <Identity detail={detail} related={related} onSelect={onSelect} />
       <section aria-label="관측" className="observed">
         <h4>관측(봉인 때 기록)</h4>
         <dl>
@@ -403,6 +447,85 @@ function Detail({ detail, session, decidable, blockedNow, busy, onDecide }: Deta
 }
 
 /**
+ * 사건 정체성(picasso §15.322). 열림의 종류·열쇠·처음 선 시각·시도를 보이고, 같은 열쇠를 든 다른 줄(재기동 앞뒤의 같은 보류)을 잇는다.
+ * 열쇠는 불투명한 값이라 뜯어 읽지 않고 그대로 보인다. 시도는 재발을 가르는 재료일 뿐 같은 보류를 잇지 않는다.
+ */
+function Identity({
+  detail,
+  related,
+  onSelect,
+}: {
+  detail: IncidentDetail
+  related: EarlierIncidentRow[]
+  onSelect: (selection: Selection) => void
+}) {
+  if (detail.openingKind == null) {
+    return (
+      <section aria-label="사건 정체성">
+        <p>사건 정체성 모름: 정체성 칸이 생기기 전에 적은 기록입니다</p>
+      </section>
+    )
+  }
+  const reopened = detail.openingKind === 'REOPENED'
+  return (
+    <section aria-label="사건 정체성">
+      <h4>사건 정체성</h4>
+      {reopened &&
+        (detail.incidentKey == null ? (
+          <p role="note">
+            재기동이 다시 연 보류입니다. 옛 판단 기록으로 다시 열어 원래 보류와의 연결을 모릅니다(연결 불명). 추측해 잇지 않습니다
+          </p>
+        ) : (
+          <p role="note">재기동이 다시 연 보류입니다. 새 사건이 아니라 {detail.firstOpenedAt}에 처음 선 보류와 같은 사건입니다</p>
+        ))}
+      <dl>
+        <dt>열림</dt>
+        <dd>{opening(detail)}</dd>
+        <dt>사건 열쇠</dt>
+        <dd>{detail.incidentKey ?? '없음(연결 불명)'}</dd>
+        <dt>처음 선 시각</dt>
+        <dd>{detail.firstOpenedAt ?? '모름'}</dd>
+        <dt>시도</dt>
+        <dd>{detail.attempt ?? '모름'}</dd>
+      </dl>
+      {detail.incidentKey != null && (
+        <>
+          <h4>같은 사건의 다른 기록</h4>
+          {related.length === 0 ? (
+            <p>읽어 온 목록에 같은 사건의 다른 기록이 없습니다</p>
+          ) : (
+            <ul aria-label="같은 사건의 다른 기록">
+              {related.map((row) => (
+                <li key={keyOf(row)}>
+                  <button
+                    className="link"
+                    aria-label={`${row.instanceId} ${row.incidentId} 같은 사건 보기`}
+                    onClick={() => onSelect({ instanceId: row.instanceId, incidentId: row.incidentId })}
+                  >
+                    {row.instanceId} {row.incidentId}
+                  </button>{' '}
+                  {opening(row)}, 발생 {row.at}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
+  )
+}
+
+/**
+ * 판단자 문구. 원문 id 는 실행 호스트가 판단자 기록을 이미 두는 자리(판단 칸·사본 판단 행)의 값 그대로 보이고 종류를 함께 보인다.
+ * 설명 문장을 만드는 자리가 아니라 감사 조회 자리다.
+ */
+function decider(by: { id: string; kind: string }): string {
+  const kind = DECIDER_KIND_LABEL[by.kind]
+  if (by.kind === 'PERSON') return `사람이 판단함: ${by.id}`
+  return kind === undefined ? `판단함(${by.kind}): ${by.id}` : `${kind}가 판단함: ${by.id}`
+}
+
+/**
  * 사람의 판단(운영 관리 화면 설계 제안 §9). 관측과 다른 모양으로, 판단자와 판단한 실제 시각을 함께 보인다. 판단이 없으면 이
  * 상세의 값은 모두 관측이다.
  */
@@ -411,7 +534,7 @@ function Judgement({ resolution, withoutEvidence }: { resolution: IncidentResolu
   return (
     <section aria-label="사람의 판단" className="asserted">
       <p>
-        사람이 판단함: {resolution.decidedBy.id}, {resolution.wallClockAt}
+        {decider(resolution.decidedBy)}, {resolution.wallClockAt}
       </p>
       <p>
         결정 {RESOLUTION_LABEL[resolution.decision] ?? resolution.decision}({resolution.decision}), 호스트 시각{' '}

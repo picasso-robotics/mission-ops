@@ -28,7 +28,8 @@ import kotlin.test.assertTrue
  * 실행 호스트가 판단 기록(picasso `JudgmentRecord`)을 영속하고 다시 지을 때 `resume` 에 넘긴다(picasso 한계 §15.221 · 판단 기록 영속).
  * 그래서 앞선 단위의 판정과 근거 등급, 운영자 보류, 설비 대기의 기한 시작이 재기동을 넘어온다. S4b 스펙 T8 의 «새 인스턴스의 값» 은
  * 이 기록이 없을 때의 거동이고, 단계 1·4·5 가 그 차이를 본다. 넘어온 운영자 보류는 새 인스턴스에서 인시던트로 다시 열린다(picasso
- * `resume` 의 8, 근거 윈도우에 `RESUME_HOLD_REOPENED` 줄). 화면과 같이 그 인시던트 상세의 `instanceId` 로 판단해 푼다.
+ * `resume` 의 8). 다시 연 것은 인시던트의 `openingKind`(`REOPENED`)로 읽고, 원래 보류와는 같은 `incidentKey` 로 잇는다(picasso §15.322,
+ * 판단 기록 판 5). 화면과 같이 그 인시던트 상세의 `instanceId` 로 판단해 푼다.
  *
  * 순서가 있고 새 스택에서 돈다. `pick_place` 를 가진 기체가 humanoid-01 하나라 앞 실행이 끝나야 다음 작업 지시가 배정된다. 셀 대역은
  * 슬롯을 비우지 않으므로 작업 지시마다 슬롯을 따로 쓴다(단계 1 이 S01·S02, 단계 3 이 S03, 단계 4 가 S04).
@@ -301,9 +302,10 @@ class RestartRecoveryTest {
         assertEquals(listOf(true, true), listOf(live.single()["unresolved"].asBoolean(), live.single()["held"].asBoolean()), "$list")
         assertTrue(list["incidents"].all { it["resolution"].isNull }, "$list")
         val fresh = stack.get("/api/incidents/${live.single()["incidentId"].asText()}")
-        assertTrue(!reopenedAt(fresh), "새 보류가 다시 연 것으로 보인다: $fresh")
+        assertTrue(!reopened(fresh), "새 보류가 다시 연 것으로 보인다: $fresh")
         // 앞 세 인스턴스의 인시던트 넷이 earlier 에 최근 것부터 있다: 셋째의 재작업 뒤 기한 보류(재작업 판단), 셋째가 다시 연 보류(단계 4 의
-        // 재작업 판단), 둘째가 다시 연 보류(판단 없음), 첫째의 기한 보류(판단 없음). 다시 연 둘은 그 시각의 RESUME_HOLD_REOPENED 줄을 든다.
+        // 재작업 판단), 둘째가 다시 연 보류(판단 없음), 첫째의 기한 보류(판단 없음). 다시 연 둘은 REOPENED 이고 첫째의 기한 보류와 같은
+        // 열쇠·처음 선 시각이다. 셋째의 재작업 뒤 보류와 지금의 새 보류는 각각 새 사건이라 새 열쇠다.
         val (first, second, third) = holdInstances
         val earlier = list["earlier"].filter { it["jobOrderId"].asText() == heldOrder }
         assertEquals(listOf(third, third, second, first), earlier.map { it["instanceId"].asText() }, "$list")
@@ -312,8 +314,13 @@ class RestartRecoveryTest {
         assertEquals(listOf("REWORK", "kim", "PERSON"), listOf(resolution["decision"], resolution["decidedBy"]["id"], resolution["decidedBy"]["kind"]).map { it.asText() }, "$list")
         assertEquals(listOf("REWORK", "REWORK", null, null), earlier.map { it["resolution"].takeIf { r -> !r.isNull }?.get("decision")?.asText() }, "$list")
         assertTrue(earlier.all { !it["held"].asBoolean() && it["failureClass"].asText() == "SIGNAL_DEADLINE" }, "$list")
-        val reopened = earlier.map { row -> reopenedAt(stack.get("/api/incidents/${row["incidentId"].asText()}?instanceId=${row["instanceId"].asText()}")) }
-        assertEquals(listOf(false, true, true, false), reopened, "$list")
+        val details = earlier.map { row -> stack.get("/api/incidents/${row["incidentId"].asText()}?instanceId=${row["instanceId"].asText()}") }
+        assertEquals(listOf(false, true, true, false), details.map(::reopened), "$list")
+        assertEquals(listOf("NEW", "REOPENED", "REOPENED", "NEW"), earlier.map { it["openingKind"].asText() }, "$list")
+        val keys = earlier.map { it["incidentKey"].asText() }
+        assertEquals(List(3) { keys[3] }, keys.drop(1), "$list")
+        assertEquals(List(3) { earlier[3]["firstOpenedAt"].asText() }, earlier.drop(1).map { it["firstOpenedAt"].asText() }, "$list")
+        assertEquals(3, (keys.toSet() + fresh["incidentKey"].asText()).size, "$list $fresh")
         assertTrue(list["earlier"].none { it["instanceId"].asText() == instance }, "$list")
     }
 
@@ -383,7 +390,7 @@ class RestartRecoveryTest {
 
     /**
      * [instance] 가 다시 연 보류 인시던트의 상세. 화면이 읽는 그대로 지금 인스턴스의 목록에서 보류 중인 그 작업 지시의 인시던트를 고르고,
-     * 근거 윈도우에 `RESUME_HOLD_REOPENED` 줄이 있는지(기한이 다시 지나 새로 선 보류가 아님) 본다.
+     * 재기동이 다시 연 것인지(기한이 다시 지나 새로 선 보류가 아님) 본다.
      */
     private fun reopenedHold(instance: String): JsonNode {
         val list = incidents()
@@ -391,18 +398,15 @@ class RestartRecoveryTest {
         val row = list["incidents"].single { it["jobOrderId"].asText() == heldOrder && it["held"].asBoolean() }
         val detail = stack.get("/api/incidents/${row["incidentId"].asText()}")
         assertEquals(instance to WAIT_UNIT, detail["instanceId"].asText() to detail["unitId"].asText(), "$detail")
-        assertTrue(reopenedAt(detail), "다시 연 표시가 없다: $detail")
+        assertTrue(reopened(detail), "다시 연 표시가 없다: $detail")
         return detail
     }
 
     /**
-     * 이 인시던트가 재기동이 다시 연 보류인가. 근거 윈도우의 `RESUME_HOLD_REOPENED` 줄이 인시던트 시각(다시 연 시각)에 있어야 한다.
-     * 줄이 있다는 것만으로는 가르지 못한다 — 다시 연 뒤 근거 윈도우(앞 30초) 안에 기한으로 새로 선 보류의 윈도우에도 그 줄이 실린다.
+     * 이 인시던트가 재기동이 다시 연 보류인가. 재개 경로가 직접 적는 `openingKind` 로 읽는다(picasso §15.322). 근거 윈도우의
+     * `RESUME_HOLD_REOPENED` 줄로는 가르지 못한다 — 다시 연 뒤 근거 윈도우(앞 30초) 안에 기한으로 새로 선 보류의 윈도우에도 그 줄이 실린다.
      */
-    private fun reopenedAt(detail: JsonNode): Boolean {
-        val at = Instant.parse(detail["at"].asText())
-        return detail["evidenceWindow"].any { it["kind"].asText() == "RESUME_HOLD_REOPENED" && Instant.parse(it["occurredAt"].asText()) == at }
-    }
+    private fun reopened(detail: JsonNode): Boolean = detail["openingKind"].asText() == "REOPENED"
 
     /** 시계를 밀지 않고 실제 시간으로 실행의 단위가 [expected] (단위 id, 상태) 가 되기를 기다린다. */
     private fun awaitUnits(executionId: String, expected: List<Pair<String, String>>): JsonNode {

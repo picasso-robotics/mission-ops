@@ -21,10 +21,14 @@
 이 실행 호스트에는 사람의 회복 입구가 없다. 그 보류는 운영자가 화면에서 판단(재작업·완료 확인)이나 실행 취소로 닫는다.
 운영자 실행 취소는 그 실행의 보류·미확정 단위 인시던트의 판단 칸에 `OPERATOR_CANCEL` 을 승인자와 함께 싣는다. 인시던트 뒤의 탐색 줄 사이에 사람의 걸음이 데이터로 남는다.
 
-## 규약 버전(picasso `fde49d1`)
-승인 호스트(`POST /approvals`) 답의 `schemaVersion` 은 `"5"` 다. `refusal` 에 `HUMAN_APPROVAL_REQUIRED` 가 늘고 거부 답 `consumed` 에 `target` 칸(작업 수락 승인의 소모면 `null`)이 붙었다.
-인시던트 고리 내보내기 `manifest.json` 의 `schemaVersion` 은 `"7"` 이다. 인시던트 줄 `resolution.decision` 에 `OPERATOR_CANCEL`·`REMEDY_APPLIED` 가 늘었고 칸은 그대로다.
-recovery `core` 가 승인 답을 `"4"` 로만, 내보내기를 `"5"`·`"6"` 으로만 읽으면 이 호스트의 답과 번들은 모르는 버전으로 멈춘다.
+## 규약 버전(picasso `2711660`)
+승인 호스트(`POST /approvals`) 답의 `schemaVersion` 은 `"5"` 그대로다(`fde49d1` 에서 `refusal` 에 `HUMAN_APPROVAL_REQUIRED` 가 늘고 거부 답 `consumed` 에 `target` 칸이 붙었다).
+인시던트 고리 내보내기 `manifest.json` 의 `schemaVersion` 은 `"8"` 이고 안내에 그 벌을 낸 인스턴스의 `instanceId` 가 붙었다(picasso §15.322). 한 벌은 한 인스턴스의 것이다.
+인시던트 줄에 정체성 넷(`incidentKey`·`firstOpenedAt`·`openingKind`·`attempt`)과 판단자 `resolution.decidedBy`(`{id, kind}`), 임무 버전과 현장 설정 셋(함께 널이거나 함께 있음)이 붙었다. 조치 탐색 줄 `outcome` 에 `SOURCE_UNOBSERVED`·`DESTINATION_OCCUPIED`·`DESTINATION_UNOBSERVED` 가 늘었고 셋 다 `steps` 가 없다(승인 가능한 조치가 아님).
+재기동이 다시 연 보류는 `openingKind` 가 `REOPENED` 이고 앞 인스턴스 벌의 원래 보류와 같은 `incidentKey`·`firstOpenedAt` 을 든다. 인시던트 id 는 재기동마다 `incident-1` 부터 다시 세므로 사건은 (`instanceId`, `incidentId`)가 아니라 `incidentKey` 로 접는다. 열쇠가 널인 `REOPENED` 는 연결 불명이며 새 사건으로도 같은 사건으로도 세지 않는다. `attempt` 는 재발 판정에만 쓴다.
+실행 호스트의 미들웨어 인스턴스 id 는 기동마다 새 값(`mw-<UUID>`)이라 열쇠가 인스턴스를 넘어 겹치지 않는다. 판단 기록 규약은 `"5"` 다(실행 호스트는 글자를 그대로 저장, 구조 변경 없음).
+판단자 원문 id 는 감사 조회·승인자 연결에서만 읽고, 설명 문장을 만드는 자리에는 `kind` 만 넘긴다.
+recovery `core` 가 내보내기를 `"7"` 까지만 읽으면 이 호스트의 번들은 모르는 버전으로 멈춘다.
 
 ## 선언과 승인자 id
 견본 위치는 `mission-host/incident-loop/entitlements.example.json`이다.

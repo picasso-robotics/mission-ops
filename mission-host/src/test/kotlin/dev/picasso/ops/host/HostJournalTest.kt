@@ -313,6 +313,7 @@ class HostJournalTest {
             "incidentId", "executionId", "jobOrderId", "robotId", "unitId", "at", "failureClass", "route", "missionVersion",
             "siteSettingsVersion", "evidenceBeforeSeconds", "evidenceAfterSeconds", "inDoubtGraceSeconds", "stallWindowSeconds",
             "unresolved", "resolution", "fault", "held", "confirmedWithoutEvidence",
+            "incidentKey", "firstOpenedAt", "openingKind", "attempt",
         )
 
         val DETAIL_FIELDS = listOf(
@@ -320,6 +321,7 @@ class HostJournalTest {
             "unresolved", "resolution", "held", "confirmedWithoutEvidence", "unitState", "fault", "blockedBy", "requiredEvidence",
             "reachedEvidence", "verification", "step", "evidenceWindow", "windowTruncated", "preconditionSubjects", "expectedHold",
             "observedHold", "effectMismatch", "linkBroken", "intent",
+            "incidentKey", "firstOpenedAt", "openingKind", "attempt",
         )
 
         fun journal(): List<Map<String, Any?>> = PostgresSupport.queryAll(
