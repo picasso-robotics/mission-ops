@@ -5,6 +5,7 @@ import dev.picasso.ops.host.store.CloseRow
 import dev.picasso.ops.host.store.HoldObservation
 import dev.picasso.ops.host.store.ResidualHoldClearingRow
 import dev.picasso.ops.host.store.ResidualHoldRow
+import dev.picasso.ops.host.store.WithdrawalRow
 import java.time.Instant
 import java.util.UUID
 
@@ -249,3 +250,48 @@ data class CloseRecordView(
         )
     }
 }
+
+/**
+ * 작업 지시 철회의 결과 이름(B3). 둘 다 호스트 잠금 아래에서 판정한 것이다.
+ *
+ * - [WITHDRAWN]: 그 작업 지시의 철회 행이 있다(이번에 적었거나 앞서 적었다). 그 뒤로 그 작업 지시는 값 없는 승인으로도 새 접수로도 실행을 짓지
+ *   않는다. 영구다.
+ * - [EXECUTION_EXISTS]: 그 작업 지시의 실행이 미들웨어에 있거나 실행 일지에 행이 있다. 철회 행을 적지 않았다.
+ *
+ * 실행 일지가 막혀 있으면 어느 쪽도 답하지 않는다(500 `JOURNAL_WRITE_FAILED`, [WithdrawJournalBlocked]) — 일지에 없는 실행이 미들웨어에 있을 수 있다.
+ */
+enum class WithdrawResult { WITHDRAWN, EXECUTION_EXISTS }
+
+/** 철회 한 행(`job_order_withdrawal`, V16). [requestId] 는 처음 철회한 요청의 id 이고 [withdrawnAt] 은 적은 DB 시각이다. */
+data class WithdrawalRecordView(val requestId: String, val requestedBy: String, val reason: String, val withdrawnAt: Instant) {
+    companion object {
+        fun of(row: WithdrawalRow) = WithdrawalRecordView(row.requestId.toString(), row.requestedBy, row.reason, row.withdrawnAt)
+    }
+}
+
+/**
+ * `POST /host/job-orders/{jobOrderId}/withdraw` 의 200 본문(B3).
+ *
+ * @param instanceId·executionId·robotId·physicalState EXECUTION_EXISTS 일 때 그 실행. 미들웨어에 있으면 지금 인스턴스의 실행과 지금 물리 상태이고,
+ *   실행 일지에만 있으면 그 일지의 마지막 실행(받은 행이나 그 뒤 다시 지은·정착한 실행)과 마지막 정착 상태(없으면 `null`)다. WITHDRAWN 이면 모두 `null` 이다
+ * @param withdrawal WITHDRAWN 일 때 그 작업 지시의 철회 행. EXECUTION_EXISTS 면 `null` 이다
+ * @param requestId 요청의 requestId 를 그대로 돌려준다(저장된 행의 요청 id 는 [withdrawal] 에 있다)
+ */
+data class WithdrawView(
+    val result: WithdrawResult,
+    val jobOrderId: String,
+    val instanceId: String?,
+    val executionId: String?,
+    val robotId: String?,
+    val physicalState: String?,
+    val withdrawal: WithdrawalRecordView?,
+    val requestId: String,
+)
+
+/** 철회의 요청 id 를 다른 작업 지시의 철회에 이미 썼다. 아무것도 적지 않았다. REST 는 409 `REQUEST_ID_REUSED` 다. */
+class WithdrawRequestReused(val requestId: String, jobOrderId: String) :
+    RuntimeException("작업 지시 철회의 요청 id 가 다른 작업 지시($jobOrderId)에 이미 쓰였다: $requestId")
+
+/** 실행 일지가 막혀 철회를 판정하지 않았다(일지에 없는 실행이 있을 수 있다). REST 는 500 `JOURNAL_WRITE_FAILED` 다(일지 쓰기 실패와 같은 모양). */
+class WithdrawJournalBlocked(executionIds: List<String>) :
+    RuntimeException("실행 일지 저장 실패: 호스트 복구 전 철회 차단(${executionIds.joinToString(", ")})")

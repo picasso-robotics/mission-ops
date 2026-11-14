@@ -42,6 +42,8 @@ sealed interface StationPermit {
  data class Unreadable(val cause: String) : StationPermit
  data class HostUnreachable(val cause: String) : StationPermit
 }
+/** What a station port proved about a work request closed without executing (B3, [StationPort.proof]). */
+enum class StationProof { NEVER_SENT, EXECUTION_EXISTS, UNPROVEN }
 data class StationReceipt(val id: UUID, val state: String, val safeToRetry: Boolean, val updatedAt: String, val physicalState: String?, val snapshot: JsonNode?, val resultVersion: Int? = null, val detail: String? = null, val sourceUnobserved: Boolean = false, val permitBlock: JsonNode? = null)
 interface StationPort {
  fun validate(payload: JsonNode)
@@ -55,10 +57,20 @@ interface StationPort {
  fun receipt(id: UUID): StationReceipt
  /**
   * True when work request [receipt] closed without executing: a pre-dispatch or host UNASSIGNED, or a REJECTED other than a forgotten job
-  * order, with no execution observed and no stored result. No robot can be running it. Read fresh, so an execution a [receipt] call just
-  * recorded counts. Ports that cannot tell keep false: a run they sent stays one that may have reached a robot.
+  * order, with no execution observed and no stored result, and the execution host confirmed withdrawing its job order (B3). The ops
+  * database alone is no proof: a no-value approval on the host can start the job order without passing through ops. After the withdrawal
+  * no robot can run it. Read fresh, so an execution a [receipt] call just recorded counts. May call the host: never under a station lock.
+  * Ports that cannot tell keep false: a run they sent stays one that may have reached a robot.
   */
  fun unsent(receipt: UUID): Boolean = false
+ /** [unsent] with who asks for the withdrawal and why ([requestedBy], [reason]: a person's site release names that person and their reason). */
+ fun unsent(receipt: UUID, requestedBy: String, reason: String): Boolean = proof(receipt, requestedBy, reason) == StationProof.NEVER_SENT
+ /**
+  * What [unsent] found, kept apart: [StationProof.NEVER_SENT] (the host withdrew the job order), [StationProof.EXECUTION_EXISTS] (the host
+  * reports an execution of it instead; the port moved the receipt to ACCEPTED) or [StationProof.UNPROVEN] (anything else, no answer included).
+  * Ports that cannot tell the host's answer apart derive it from [unsent].
+  */
+ fun proof(receipt: UUID, requestedBy: String, reason: String): StationProof = if (unsent(receipt)) StationProof.NEVER_SENT else StationProof.UNPROVEN
  /**
   * Runs one tick's observations of [receipts]. A port may share host reads covering them across the [receipt] calls inside [block]; a write
   * it sends there is followed by a new read (HA design record §10). Calls outside [block] read the host themselves.
@@ -133,9 +145,16 @@ class OpsStationPort(private val requests: WorkRequests, private val interfaces:
   return sent{requests.receiveInterface(actor,payload["interfaceId"].asText(),payload["interfaceVersion"].asInt(),body,id).receipt.receiptId}
  }
  override fun receipt(id:UUID)=mapped(id)
- override fun unsent(receipt:UUID):Boolean {
+ override fun unsent(receipt:UUID):Boolean = proof(receipt,"system/station",WITHDRAW_REASON)==StationProof.NEVER_SENT
+ override fun proof(receipt:UUID,requestedBy:String,reason:String):StationProof {
   val (row,latest)=requests.stationRead(receipt)
-  return row.state in setOf("UNASSIGNED","REJECTED") && row.lastExecution==null && latest==null && requests.rejection(row)?.forgottenJobOrder!=true
+  if(!(row.state in setOf("UNASSIGNED","REJECTED") && row.lastExecution==null && latest==null && requests.rejection(row)?.forgottenJobOrder!=true))return StationProof.UNPROVEN
+  // The only proof of never sent is the host's withdrawal. An execution it reports instead promotes the receipt (observation); no answer proves nothing.
+  return when(requests.withdrawUnsent(row,reason,requestedBy)) {
+   is dev.picasso.ops.service.requests.Withdrawal.Withdrawn -> StationProof.NEVER_SENT
+   is dev.picasso.ops.service.requests.Withdrawal.Executed -> StationProof.EXECUTION_EXISTS
+   is dev.picasso.ops.service.requests.Withdrawal.Unknown -> StationProof.UNPROVEN
+  }
  }
  private fun mapped(id:UUID):StationReceipt {
   val (receipt,latest)=requests.stationRead(id)
@@ -157,6 +176,8 @@ class OpsStationPort(private val requests: WorkRequests, private val interfaces:
   return sent{requests.recover(receipt.id,actor,body,runId);receipt.id}
  }
 }
+/** Why a station asks the host to withdraw a job order it found closed without executing (B3). */
+const val WITHDRAW_REASON="공유 스테이션 자원 해제: 실행 없이 끝난 작업 요청의 작업 지시 철회"
 /** Job orders per narrowed execution read: 50 `JO-<uuid>` keep the request line near 2.6 KB, under the host's 8 KB header limit. */
 const val READ_CHUNK=50
 /** Reads `GET /host/work-permits`. Anything unreadable is [StationPermit.Unreadable]: a permit not known is not a permit. */

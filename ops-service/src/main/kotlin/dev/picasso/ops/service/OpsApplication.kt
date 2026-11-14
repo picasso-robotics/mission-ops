@@ -117,9 +117,15 @@ open class OpsApplication {
     ): SiteSettingsOperations =
         SiteSettingsOperations(settings, log, TransactionTemplate(DataSourceTransactionManager(dataSource)), clock)
 
-    /** 실행 호스트 클라이언트(S3a 스펙 §8). 주소 형식은 [HostClient.checkBaseUrl] 이 기동에서 본다. */
+    /**
+     * 실행 호스트 클라이언트(S3a 스펙 §8). 주소 형식은 [HostClient.checkBaseUrl] 이 기동에서 본다. 작업 지시 철회만 요청 제한이 따로다
+     * (`ops.host.withdraw-timeout`, 기본 3초, B3).
+     */
     @Bean
-    open fun hostClient(@Value("\${ops.host.url}") url: String): HostClient = HostClient(url)
+    open fun hostClient(
+        @Value("\${ops.host.url}") url: String,
+        @Value("\${ops.host.withdraw-timeout:PT3S}") withdrawTimeout: java.time.Duration,
+    ): HostClient = HostClient(url, withdrawTimeout = withdrawTimeout)
 
     /** 시운전·연결은 기체 목록의 판정을 그대로 쓴다(T3). 기체 목록 빈을 같이 써서 그 직전 값도 같다. */
     @Bean

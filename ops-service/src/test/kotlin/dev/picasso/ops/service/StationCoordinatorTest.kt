@@ -265,6 +265,8 @@ class StationCoordinatorTest {
    val (state,detail)=receipt(run.runId);assertEquals(after,state,before)
    when {
     before==after -> assertEquals("before",detail,before)
+    // 이 포트는 보낸 답(IN_DOUBT)을 기억해 미전송을 증명하지 못한다(B3: 실행 호스트의 철회 확정이 없다). 미배정은 «실행하지 않습니다» 로 닫지 않는다.
+    before=="UNASSIGNED" -> assertEquals("현장 확인으로 자원을 해제했습니다. 실행 호스트가 작업 지시 철회를 확정하지 않아 실행 여부는 실행 관측으로 확인합니다: 현장 상태 확인",detail)
     after=="REJECTED" -> assertEquals("현장 확인으로 자원을 해제했습니다. 이 작업 요청은 실행하지 않습니다: 현장 상태 확인",detail)
     else -> assertEquals("현장 확인으로 자원을 해제했습니다. 제출 결과는 실행 관측으로 확인합니다: 현장 상태 확인",detail)
    }

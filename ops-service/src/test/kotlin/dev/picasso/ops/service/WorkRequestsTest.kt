@@ -1169,6 +1169,102 @@ class WorkRequestsTest {
   val doubt=service.receive("mes",order(8)).receipt;assertEquals("IN_DOUBT",doubt.state)
   val judged=listOf(early,unassigned,rejected,forgotten,accepted,observed,stored,doubt).map{port.unsent(it.receiptId)}
   assertEquals(listOf(true,true,true,false,false,false,false,false),judged)
+  // 운영 DB 조건만으로는 미전송이 아니다(B3). 그 조건을 채운 셋만 실행 호스트에 철회를 물었고 호스트가 확정했다. 다시 물어도 같은 요청 id 다.
+  assertEquals(listOf(early,unassigned,rejected).map{it.jobOrderId},bench.withdrawCalls.map{it.first})
+  assertTrue(port.unsent(early.receiptId));assertEquals(bench.withdrawCalls[0],bench.withdrawCalls.last())
+  // 호스트가 그 작업 지시의 실행을 알리면 미전송이 아니고 작업 요청은 수락이 된다. 답이 없으면 미전송이 아니고 아무것도 바꾸지 않는다.
+  bench.withdraw={job,_->if(job==unassigned.jobOrderId) HostWrite.Answered(200,JobOrderBench.executionExistsBody(job,"exec-5")) else HostWrite.NoResponse("timeout")}
+  assertEquals(listOf(false,false),listOf(unassigned,rejected).map{port.unsent(it.receiptId)})
+  assertEquals("ACCEPTED",service.get(unassigned.receiptId).state);assertEquals("exec-5",service.get(unassigned.receiptId).lastExecution!!["executionId"].asText())
+  assertEquals("REJECTED",service.get(rejected.receiptId).state);assertNull(service.get(rejected.receiptId).lastExecution)
+ }
+ /** B3: 자원 관리 작업의 현장 확인 해제는 실행 호스트의 철회 답 셋을 가른다. 확정만 미전송이고, 실행이 있거나 답이 없으면 격리하며 «실행하지 않습니다» 로 닫지 않는다. */
+ @Test fun `현장 확인 해제는 실행 호스트가 철회를 확정할 때만 미전송으로 닫고 실행이 있거나 답이 없으면 스테이션을 격리한다`() {
+  resource();ready(true);val kim=Actor(Mode.OPERATOR,"kim");val c=coordinator()
+  fun clear(id:UUID)=c.decide(id,kim,json.readTree("""{"expectedRevision":${c.get(id).revision},"decision":"CONFIRM_CLEAR","reason":"현장 확인"}"""))
+  fun held():UUID {
+   jdbc.sql("UPDATE ops.rf_station SET quarantined_by=NULL,quarantined_at=NULL").update()
+   bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01",unobserved())))
+   val id=manual().receipt.receiptId;c.tick()
+   assertEquals(dev.picasso.ops.service.stations.StationCoordinator.SOURCE_UNOBSERVED,c.get(id).reason);assertNotNull(c.get(id).dispatchedAt)
+   return id
+  }
+  // 낡은 판(다른 revision)의 해제는 거절되고 철회를 부르지 않는다 — 그 작업 요청은 아직 다시 제출될 수 있다.
+  val stale=held()
+  assertFailsWith<RequestRejected>{c.decide(stale,kim,json.readTree("""{"expectedRevision":${c.get(stale).revision+1},"decision":"CONFIRM_CLEAR","reason":"현장 확인"}"""))}
+  assertTrue(bench.withdrawCalls.isEmpty(),bench.withdrawCalls.toString())
+  // WITHDRAWN: 미전송 확정 — 격리 없이 풀고 «실행하지 않습니다» 로 닫는다.
+  assertEquals("MANUALLY_CLEARED",clear(stale).state);assertNull(c.stations().single().quarantinedBy);assertNull(c.stations().single().owner)
+  assertEquals("REJECTED",service.get(stale).state);assertTrue("이 작업 요청은 실행하지 않습니다" in service.get(stale).detail!!,service.get(stale).detail)
+  assertEquals(listOf(service.get(stale).jobOrderId),bench.withdrawCalls.map{it.first})
+  // EXECUTION_EXISTS: 값 없는 승인이 실행을 세웠다 — 격리하고 작업 요청은 수락이 된다.
+  bench.withdraw={job,_->HostWrite.Answered(200,JobOrderBench.executionExistsBody(job,"exec-6"))}
+  val ran=held()
+  assertEquals("MANUALLY_CLEARED",clear(ran).state);assertEquals(ran,c.stations().single().quarantinedBy)
+  assertEquals("ACCEPTED",service.get(ran).state);assertEquals("exec-6",service.get(ran).lastExecution!!["executionId"].asText())
+  // 답 없음: 미전송이 아니다 — 격리하고, 거부로 닫되 «실행하지 않습니다» 라고 하지 않는다.
+  bench.withdraw={_,_->HostWrite.NoResponse("timeout")}
+  val silent=held()
+  assertEquals("MANUALLY_CLEARED",clear(silent).state);assertEquals(silent,c.stations().single().quarantinedBy)
+  val closed=service.get(silent)
+  assertEquals("REJECTED",closed.state);assertFalse("이 작업 요청은 실행하지 않습니다" in closed.detail!!,closed.detail);assertTrue("철회를 확정하지 않아" in closed.detail!!,closed.detail)
+ }
+ /**
+  * B3: 현장 확인 해제는 본문을 다 본 뒤에만 그 스테이션 작업을 선점(CLEARING)하고 그 뒤에만 철회를 부른다. 400 으로 거절될 요청은 작업 지시를 철회하지 않는다.
+  * 선점 동안 다른 판단·출발 자리 확인은 409 이고, 선점 뒤 처리가 실패하면 같은 확인 필요로 되돌린다. 철회는 해제한 운영자와 그 사유로 나간다.
+  */
+ @Test fun `현장 확인 해제는 본문 검증과 선점 뒤에만 철회를 부르고 선점 중 다른 판단은 409 이며 실패하면 확인 필요로 되돌린다`() {
+  resource();ready(true);val kim=Actor(Mode.OPERATOR,"kim");val c=coordinator()
+  bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01",unobserved())))
+  val id=manual().receipt.receiptId;c.tick()
+  fun body(extra:String="",reason:String?="\"현장 확인\"")="""{"expectedRevision":${c.get(id).revision},"decision":"CONFIRM_CLEAR"${reason?.let{",\"reason\":$it"} ?: ""}$extra}"""
+  // 사유 없음, 사유 초과, 남는 칸, 모르는 판단: 400 이고 실행 호스트에 철회를 묻지 않는다.
+  listOf(body(reason=null),body(reason="\"${"x".repeat(1001)}\""),body(reason="\"  \""),body(extra=""","more":1""")).forEach{bad->
+   assertEquals(400,assertFailsWith<RequestRejected>(bad){c.decide(id,kim,json.readTree(bad))}.status,bad)
+  }
+  assertTrue(bench.withdrawCalls.isEmpty(),bench.withdrawCalls.toString());assertEquals("REVIEW_REQUIRED",c.get(id).state)
+  // 선점 중: 철회 답을 기다리는 사이 다른 판단과 출발 자리 확인은 409 다(다른 인스턴스도 같은 선점 상태를 본다).
+  val during=mutableListOf<Int>()
+  bench.withdraw={job,request->
+   assertEquals("CLEARING",c.get(id).state)
+   during+=assertFailsWith<RequestRejected>{c.decide(id,kim,json.readTree("""{"expectedRevision":${c.get(id).revision},"decision":"RESUME_OBSERVATION","reason":"r"}"""))}.status
+   during+=assertFailsWith<RequestRejected>{c.confirmSource(id,kim,confirmation(service.get(id)))}.status
+   // 선점 뒤 마무리 쓰기가 실패한다: 해제 상태로 못 가게 막는다.
+   jdbc.sql("ALTER TABLE ops.station_run ADD CONSTRAINT b3_no_clear CHECK (state<>'MANUALLY_CLEARED') NOT VALID").update()
+   HostWrite.Answered(200,JobOrderBench.withdrawnBody(job,request))
+  }
+  assertFails{c.decide(id,kim,json.readTree(body(reason="\"현장에서 기체 정지 확인\"")))}
+  assertEquals(listOf(409,409),during)
+  // 원복: 같은 확인 필요로 돌아가고 점유는 그대로이며 작업 요청은 닫지 않았다.
+  assertEquals("REVIEW_REQUIRED",c.get(id).state);assertEquals(dev.picasso.ops.service.stations.StationCoordinator.CLEAR_FAILED,c.get(id).reason)
+  assertEquals(id,c.stations().single().owner);assertEquals("UNASSIGNED",service.get(id).state)
+  // 철회는 해제한 운영자와 그 사유로 나갔다.
+  assertEquals("operator/kim",bench.withdrawAsked.single().first);assertTrue("현장에서 기체 정지 확인" in bench.withdrawAsked.single().second,bench.withdrawAsked.toString())
+  jdbc.sql("ALTER TABLE ops.station_run DROP CONSTRAINT b3_no_clear").update()
+  // 다시 해제하면 같은 작업 지시의 철회를 다시 묻고(작업 지시 기준 멱등) 해제한다.
+  bench.withdraw=null
+  assertEquals("MANUALLY_CLEARED",c.decide(id,kim,json.readTree(body())).state);assertNull(c.stations().single().quarantinedBy)
+  assertEquals(2,bench.withdrawCalls.size);assertEquals(setOf(service.get(id).jobOrderId),bench.withdrawCalls.map{it.first}.toSet())
+ }
+ /** B3: 호스트 REJECTED 의 자동 해제도 같은 철회가 유일한 미전송 증거다. 확정이 없으면 점유를 유지하고 사람에게 넘긴다. */
+ @Test fun `호스트가 거부한 스테이션 작업은 실행 호스트가 철회를 확정하지 않으면 자원을 풀지 않고 실행이 있으면 작업 요청을 수락으로 올린다`() {
+  resource();ready(true);val c=coordinator()
+  bench.answer=HostWrite.Answered(200,rejectedBy("요구 근거 등급 E2 은 InspectAsset 의 최고 등급 E0 를 넘는다"))
+  fun run(answer:(String)->HostWrite):UUID {
+   jdbc.sql("UPDATE ops.rf_station SET owner=NULL").update()
+   bench.withdraw={job,_->answer(job)}
+   val run=UUID.randomUUID()
+   c.enqueue(Actor(Mode.OPERATOR,"kim"),json.readTree("""{"requestId":"$run","stationId":"inspection-1","interfaceId":"asset-check","interfaceVersion":1,"expectedDeploymentVersion":1,"input":${body["input"]}}"""))
+   c.tick();c.tick()
+   return run
+  }
+  val silent=run{HostWrite.NoResponse("timeout")}
+  assertEquals("REVIEW_REQUIRED",c.get(silent).state);assertEquals(dev.picasso.ops.service.stations.StationCoordinator.REJECTED_UNCONFIRMED,c.get(silent).reason)
+  assertEquals(silent,c.stations().single().owner)
+  val receipt=checkNotNull(c.get(silent).receiptId);assertEquals("REJECTED",service.get(receipt).state)
+  val ran=run{job->HostWrite.Answered(200,JobOrderBench.executionExistsBody(job,"exec-7"))}
+  assertEquals("REVIEW_REQUIRED",c.get(ran).state);assertEquals(ran,c.stations().single().owner)
+  assertEquals("ACCEPTED",service.get(checkNotNull(c.get(ran).receiptId)).state)
  }
  @Test fun `자원 관리 작업은 호스트가 미배정으로 답했으면 현장 확인 해제가 스테이션을 격리하지 않고 제출 결과가 불명이면 격리한다`() {
   resource();ready(true);val kim=Actor(Mode.OPERATOR,"kim");val c=coordinator()
@@ -1600,9 +1696,63 @@ class WorkRequestsTest {
   assertEquals(200,again);assertTrue(replay["duplicate"].asBoolean());assertEquals(b.toString(),replay["receipt"]["receiptId"].asText())
   assertEquals(409 to "ORDER_CONFLICT",refused(order("ORDER-B",location="SEQ-IN-03.BIN-B")))
   assertEquals(2,bench.submitted.size);assertEquals(1L,links())
+  // 접수 전에 실행 호스트가 앞선 작업 지시를 철회했다(B3). 연결은 그 철회 요청 id 를 든다. 재전송은 다시 부르지 않는다.
+  assertEquals(listOf(service.get(a).jobOrderId to b),bench.withdrawCalls.toList())
+  assertEquals(b,jdbc.sql("SELECT withdrawal_request_id FROM ops.work_request_supersession WHERE original_receipt_id=:id").param("id",a).query(UUID::class.java).single())
   // 덧붙이기만 한다.
   assertFails{jdbc.sql("UPDATE ops.work_request_supersession SET original_state='REJECTED'").update()}
   assertFails{jdbc.sql("DELETE FROM ops.work_request_supersession").update()}
+ }
+ @Test fun `실행 호스트가 앞선 작업 지시의 실행을 알리면 대체를 409 로 거절하고 앞선 작업 요청을 수락으로 올려 커밋한다`() {
+  bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01",unobserved())))
+  val a=posted(order("ORDER-A"),"UNASSIGNED");val job=service.get(a).jobOrderId;val submission=service.get(a).submission
+  // 값 없는 승인이 운영 서비스를 거치지 않고 실행을 세웠다 — 첫 작업 응답 전이라 결과 피드도 실행 관측도 아직 없다.
+  bench.withdraw={jobOrderId,_->HostWrite.Answered(200,JobOrderBench.executionExistsBody(jobOrderId,"exec-4"))}
+  val (code,body)=post(order("ORDER-B","ORDER-A"))
+  assertEquals(409 to "ORIGINAL_NOT_REPLACEABLE",code to body["error"].asText(),body.toString())
+  assertTrue("exec-4" in body["detail"].asText() && JobOrderBench.HUMANOID in body["detail"].asText(),body.toString())
+  assertEquals(0L,rows("ORDER-B"));assertEquals(0L,links());assertEquals(1,bench.submitted.size)
+  // 승격은 거절과 별도로 커밋됐다. 제출 기록은 남고 작업 응답·결과 버전은 지어내지 않는다.
+  val original=service.get(a)
+  assertEquals("ACCEPTED",original.state);assertEquals(submission,original.submission)
+  assertEquals(listOf("exec-4",job,"mw-1"),listOf(original.lastExecution!!["executionId"].asText(),original.lastExecution["jobOrderId"].asText(),original.executionInstanceId))
+  assertTrue(original.detail!!.contains("exec-4"),original.detail)
+  assertEquals(0L,resultCount())
+  // 다시 보내도 앞선 작업 요청이 수락이라 같은 거절이고 호스트를 다시 부르지 않는다.
+  val calls=bench.withdrawCalls.size
+  assertEquals(409 to "ORIGINAL_NOT_REPLACEABLE",refused(order("ORDER-B","ORDER-A")));assertEquals(calls,bench.withdrawCalls.size)
+ }
+ @Test fun `철회에 답이 없거나 일지가 막혔으면 대체를 503 으로 접수하지 않고 아무것도 적지 않으며 복구 뒤 같은 요청은 통과한다`() {
+  bench.answer=HostWrite.Answered(200,rejectedShortage("[]"));val a=posted(order("ORDER-A"),"REJECTED")
+  fun stored()=jdbc.sql("SELECT state,detail,submission::text,updated_at::text FROM ops.work_request WHERE receipt_id=:id").param("id",a).query{rs,_->(1..4).map{rs.getString(it)}}.single()
+  val before=stored()
+  bench.answer=HostWrite.Answered(200,JobOrderBench.accepted(JobOrderBench.HUMANOID))
+  listOf(HostWrite.NoResponse("응답 없음: HttpTimeoutException"),HostWrite.Answered(500,"""{"error":"JOURNAL_WRITE_FAILED","detail":"x"}"""),
+   HostWrite.Answered(200,"""{"result":"MAYBE","jobOrderId":"${service.get(a).jobOrderId}"}"""),HostWrite.Answered(200,"""{"result":"WITHDRAWN","jobOrderId":"JO-OTHER","withdrawal":{"requestId":"${UUID.randomUUID()}"}}""")).forEach{answer->
+   bench.withdraw={_,_->answer}
+   assertEquals(503 to "WITHDRAWAL_UNCONFIRMED",refused(order("ORDER-B","ORDER-A")),answer.toString())
+   assertEquals(0L,rows("ORDER-B"));assertEquals(0L,links());assertEquals(before,stored());assertEquals(1,bench.submitted.size)
+  }
+  // 복구: 같은 새 요청을 다시 보내면 호스트가 철회를 확정하고 접수한다.
+  bench.withdraw=null
+  val b=posted(order("ORDER-B","ORDER-A"),"ACCEPTED")
+  assertEquals(b,jdbc.sql("SELECT withdrawal_request_id FROM ops.work_request_supersession WHERE original_receipt_id=:id").param("id",a).query(UUID::class.java).single())
+  assertEquals(before,stored())
+ }
+ @Test fun `제출 기록이 없는 미배정과 출발 자리 확인이 제출 기록을 비운 미배정도 대체 전에 철회를 부르고 운영자 종결로 닫힌 앞선 작업 요청은 부르지 않는다`() {
+  val judge=bench.judge;bench.judge={ids->HostCall.Ok(ids.map{JobOrderBench.missing(it,"inspect")})}
+  val early=posted(order("ORDER-E"),"UNASSIGNED");assertNull(service.get(early).submission)
+  bench.judge=judge
+  // 출발 미관측 → 사람이 확인 → 다시 제출했으나 배정 가능한 기체가 없어 전송 전 미배정: 제출 기록이 비었다(V22). 그 사이 호스트가 답한 적이 있다.
+  bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01",unobserved())))
+  val held=posted(order("ORDER-H"),"UNASSIGNED")
+  bench.judge={ids->HostCall.Ok(ids.map{JobOrderBench.missing(it,"inspect")})}
+  service.confirmSource(held,Actor(Mode.OPERATOR,"kim"),confirmation(service.get(held)))
+  bench.judge=judge
+  assertEquals("UNASSIGNED",service.get(held).state);assertNull(service.get(held).submission)
+  bench.answer=HostWrite.Answered(200,JobOrderBench.accepted(JobOrderBench.HUMANOID))
+  posted(order("ORDER-E2","ORDER-E"),"ACCEPTED");posted(order("ORDER-H2","ORDER-H"),"ACCEPTED")
+  assertEquals(listOf(service.get(early).jobOrderId,service.get(held).jobOrderId),bench.withdrawCalls.map{it.first})
  }
  @Test fun `잘못되거나 없거나 다른 출처이거나 실행 없이 끝나지 않은 앞선 작업 요청을 잇는 새 작업 요청은 접수하지 않고 오류 코드로 거절한다`() {
   val quiet=bench.executions
@@ -1755,6 +1905,9 @@ class WorkRequestsTest {
   val link=jdbc.sql("SELECT original_state,original_result_version FROM ops.work_request_supersession WHERE original_receipt_id=:id").param("id",closed)
    .query{rs,_->rs.getString(1) to rs.getObject(2) as Int?}.single()
   assertEquals("ACCEPTED" to 1,link)
+  // 운영자 종결로 닫힌 앞선 작업 요청은 실행한 뒤 닫힌 것이라 철회를 부르지 않고 연결에 철회 요청 id 가 없다(B3).
+  assertTrue(bench.withdrawCalls.none{it.first==service.get(closed).jobOrderId},bench.withdrawCalls.toString())
+  assertNull(jdbc.sql("SELECT withdrawal_request_id FROM ops.work_request_supersession WHERE original_receipt_id=:id").param("id",closed).query{rs,_->rs.getObject(1,UUID::class.java)}.list().single())
   assertEquals(replacement.toString(),status(closed)["supersededBy"]["receiptId"].asText());assertEquals("ORDER-A",status(replacement)["replaces"]["externalOrderId"].asText())
   // Each side is linked at most once.
   assertEquals(409 to "ORIGINAL_ALREADY_REPLACED",refused(order("ORDER-C","ORDER-A")))

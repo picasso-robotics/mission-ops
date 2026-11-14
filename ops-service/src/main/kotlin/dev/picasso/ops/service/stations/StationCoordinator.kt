@@ -163,18 +163,28 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
   }
  }
  private fun dispatch(run:StationRun) {
-  val receipt=runCatching {port.dispatch(run.runId,run.payload,actor(run))}.getOrNull()
+  val receipt=runCatching {port.dispatch(run.runId,run.payload,actor(run))}.getOrNull();val unsent=unsent(receipt)
   tx.execute {lock(run.stationId);val current=get(run.runId);if(current.state!="DISPATCHING")return@execute
    if(receipt==null) transition(current,"REVIEW_REQUIRED","호출 결과 불명; 새 요청을 보내지 않고 점유 유지")
-   else {jdbc.sql("UPDATE ops.station_run SET receipt_id=:receipt WHERE run_id=:id").param("receipt",receipt.id).param("id",run.runId).update();received(get(run.runId),receipt)}
+   else {jdbc.sql("UPDATE ops.station_run SET receipt_id=:receipt WHERE run_id=:id").param("receipt",receipt.id).param("id",run.runId).update();received(get(run.runId),receipt,unsent)}
   }
  }
- private fun received(run:StationRun,receipt:StationReceipt) {when {
+ /**
+  * True when [receipt] is a REJECTED the port proves never sent ([StationPort.unsent], the host's withdrawal, B3). Asked outside every lock,
+  * before the transaction that judges [receipt] in [received]. Anything else, a failed read included, is no proof.
+  */
+ private fun unsent(receipt:StationReceipt?):StationProof? = if(receipt?.state!="REJECTED") null else
+  runCatching{port.proof(receipt.id,"system/station",WITHDRAW_REASON)}.getOrDefault(StationProof.UNPROVEN)
+ /** Judges [receipt] for [run]. [unsent]: what the port proved about a REJECTED [receipt] ([unsent]); only a proof of never sent releases it on its own. */
+ private fun received(run:StationRun,receipt:StationReceipt,unsent:StationProof?) {when {
   receipt.state=="ACCEPTED" -> transition(run,"RUNNING",RUN_WAITING,context=receipt.snapshot)
   receipt.safeToRetry -> transition(run,"WAITING_ROBOT","전송 전 미배정; 가용 기체를 재평가합니다")
   // Never re-evaluated on a timer: the same cell answers the same way, and a retry loop would hide that a person must confirm the source.
   receipt.sourceUnobserved -> transition(run,"REVIEW_REQUIRED",SOURCE_UNOBSERVED)
-  receipt.state=="REJECTED" -> transition(run,"REJECTED",receipt.detail?.takeIf{it.isNotBlank()}?.let{"계약 제출 거부: $it; 자원 해제"} ?: "계약 제출 거부; 자원 해제",release=true)
+  receipt.state=="REJECTED" && unsent==StationProof.NEVER_SENT -> transition(run,"REJECTED",receipt.detail?.takeIf{it.isNotBlank()}?.let{"계약 제출 거부: $it; 자원 해제"} ?: "계약 제출 거부; 자원 해제",release=true)
+  // A rejection the host did not confirm withdrawing may still run (an approved remedy, B2/B3): keep the station for a person.
+  receipt.state=="REJECTED" && unsent==StationProof.EXECUTION_EXISTS -> transition(run,"REVIEW_REQUIRED",REJECTED_BUT_EXECUTED,context=receipt.snapshot)
+  receipt.state=="REJECTED" -> transition(run,"REVIEW_REQUIRED",REJECTED_UNCONFIRMED,context=receipt.snapshot)
   else -> transition(run,"REVIEW_REQUIRED","작업 요청 ${receipt.state}; 실행 여부 확인 전 점유 유지")
  }}
  private fun observe(run:StationRun,station:RfStation,signals:StationSignals?,readAt:Instant) {
@@ -182,14 +192,14 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
   val receipt=run.receiptId?.let{runCatching{port.receipt(it)}.getOrNull()}
   if(run.state=="WAITING_ROBOT") {
    receipt ?: return
-   if(!receipt.safeToRetry) {tx.execute{lock(run.stationId);if(get(run.runId).state==run.state)received(get(run.runId),receipt)};return}
+   if(!receipt.safeToRetry) {val unsent=unsent(receipt);tx.execute{lock(run.stationId);if(get(run.runId).state==run.state)received(get(run.runId),receipt,unsent)};return}
    if(signals?.flags?.get(station.readySignal)?.value!=true || signals.flags[station.completeSignal]?.value!=false)return
    if(run.attempt>=3 || clock.instant().isBefore(run.phaseAt.plusSeconds(5)))return
    // Claim a retry before calling out. Crashes at this boundary require review, never another retry.
    val claimed=tx.execute{lock(run.stationId);val r=get(run.runId);if(r.state!="WAITING_ROBOT" || r.revision!=run.revision)false else {jdbc.sql("UPDATE ops.station_run SET attempt=attempt+1 WHERE run_id=:id").param("id",r.runId).update();transition(get(r.runId),"RETRYING","호스트 전송 전 미배정의 제한 재평가");true}}!!
    if(claimed) {
-    val next=runCatching{port.retryForRun(receipt,UUID.nameUUIDFromBytes("${run.runId}/${run.attempt+1}".toByteArray()),actor(run),run.runId)}.getOrNull()
-    tx.execute{lock(run.stationId);val r=get(run.runId);if(r.state=="RETRYING")if(next==null)transition(r,"REVIEW_REQUIRED","재평가 결과 불명; 점유 유지") else received(r,next)}
+    val next=runCatching{port.retryForRun(receipt,UUID.nameUUIDFromBytes("${run.runId}/${run.attempt+1}".toByteArray()),actor(run),run.runId)}.getOrNull();val unsent=unsent(next)
+    tx.execute{lock(run.stationId);val r=get(run.runId);if(r.state=="RETRYING")if(next==null)transition(r,"REVIEW_REQUIRED","재평가 결과 불명; 점유 유지") else received(r,next,unsent)}
    }
    return
   }
@@ -245,10 +255,9 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
  fun decide(id:UUID,actor:Actor,p:JsonNode):StationRun {
   // Signals and the released run's stored result are read before the station lock, judged under it.
   val asked=p.path("decision").asText()
+  if(asked=="CONFIRM_CLEAR")return clear(id,actor,p)
   val signals=if(actor.mode==Mode.OPERATOR && asked in SIGNAL_DECISIONS) runCatching{port.read()}.getOrNull() else null
-  val released=if(actor.mode==Mode.OPERATOR && asked in setOf("CONFIRM_CLEAR","CONFIRM_COMPLETION")) runCatching{get(id).receiptId?.let(port::receipt)}.getOrNull() else null
-  // Read after the released read, which may record an execution. A work request closed unsent proves no robot got it; one not read proves nothing.
-  val unsent=actor.mode==Mode.OPERATOR && asked=="CONFIRM_CLEAR" && runCatching{get(id).receiptId?.let(port::unsent)}.getOrNull()==true
+  val released=if(actor.mode==Mode.OPERATOR && asked=="CONFIRM_COMPLETION") runCatching{get(id).receiptId?.let(port::receipt)}.getOrNull() else null
   // Nothing was sent for a source-unobserved run: resuming observation would only wait out the deadline and hide the pending confirmation.
   val unobserved=actor.mode==Mode.OPERATOR && asked=="RESUME_OBSERVATION" && runCatching{get(id).receiptId?.let(port::receipt)?.sourceUnobserved}.getOrNull()==true
   return tx.execute {
@@ -265,14 +274,6 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
     val complete=signals?.flags?.get(station(current.stationId).completeSignal) ?: reject("현장 신호를 확인할 수 없어 관측을 재개하지 않습니다",503)
     if(complete.value)reject("설비 완료 신호가 켜져 있습니다. 신호를 초기화한 뒤 관측을 재개하십시오",409)
     transition(current,"RUNNING",reason,dispatch=true,by=actor.header(),reviewOnly=true)}
-   "CONFIRM_CLEAR" -> {if(current.state!="REVIEW_REQUIRED")reject("확인 필요 작업만 현장 확인 후 해제합니다",409)
-    // Release never stops the execution. Without the job-number pair a late completion cannot be told apart, so a run that may have reached
-    // a robot quarantines the station: dispatched, and its work request not closed unsent (a pre-dispatch or host UNASSIGNED, or a REJECTED).
-    val station=station(current.stationId);val quarantine=current.dispatchedAt!=null && station.jobSignal==null && !unsent
-    val context=json.createObjectNode().apply{set<JsonNode>("signals",snapshot(signals));put("receiptId",current.receiptId?.toString());put("physicalState",released?.physicalState);put("resultVersion",released?.resultVersion);put("quarantined",quarantine)}
-    transition(current,"MANUALLY_CLEARED","현장 확인에 의한 자원 해제: $reason",release=true,by=actor.header(),context=context);cleared(current,reason)
-    if(quarantine) {jdbc.sql("UPDATE ops.rf_station SET quarantined_by=:id,quarantined_at=:at WHERE station_id=:station").param("id",current.runId).param("at",java.sql.Timestamp.from(clock.instant())).param("station",station.stationId).update()
-     event(get(id),QUARANTINE,actor.header(),context.deepCopy().put("stationId",station.stationId))}}
    // A run reviewed on its deadline or on unseen signals whose normal completion is now proven: the robot evidence of a RUNNING completion
    // and the completion signal on, at a station with the job-number pair this run's number echoed. Its completion signal still on is why
    // RESUME_OBSERVATION refuses. A person's decision because a station without the pair cannot tell whose completion the signal is.
@@ -298,6 +299,50 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
    else -> reject("지원하지 않는 판단입니다")
   };get(id)
  }!!
+ }
+ /**
+  * CONFIRM_CLEAR: an operator releases a run in review after checking the site. The body is judged in full before anything else, so a
+  * request refused with 400 never withdraws a job order. The run is then claimed (CLEARING, revision up) in a short station-locked
+  * transaction at the revision the person saw: from then on every other decision, a source confirmation and a rework refuse it with 409,
+  * here and in another instance. Only after the claim does the port ask the host to withdraw the job order (B3, outside every lock, under
+  * this monitor like [rework] and [confirmSource]); the withdrawal is the only proof of never sent. The claim then ends in MANUALLY_CLEARED:
+  * quarantined unless proven unsent, as before. A failure after the claim returns the run to the same review (revision up) and rethrows; a
+  * claim left by a stopped process is a [leftover], reviewed again.
+  */
+ @Synchronized fun clear(id:UUID,actor:Actor,p:JsonNode):StationRun {
+  if(actor.mode!=Mode.OPERATOR)reject("운영자만 확인합니다",403)
+  exact(p,setOf("expectedRevision","decision","reason"))
+  if(text(p,"decision",32)!="CONFIRM_CLEAR")reject("지원하지 않는 판단입니다")
+  val reason=text(p,"reason",1000)
+  if(p["expectedRevision"]?.isIntegralNumber!=true)reject("작업 상태가 바뀌었습니다. 다시 조회하세요",409)
+  // Signals and the released run's stored result are read before the station lock, as for every decision.
+  val signals=runCatching{port.read()}.getOrNull()
+  val released=runCatching{get(id).receiptId?.let(port::receipt)}.getOrNull()
+  val claimed=tx.execute {
+   val run=get(id);lock(run.stationId);val current=get(id)
+   if(p["expectedRevision"].asLong()!=current.revision.toLong())reject("작업 상태가 바뀌었습니다. 다시 조회하세요",409)
+   if(current.state!="REVIEW_REQUIRED")reject("확인 필요 작업만 현장 확인 후 해제합니다",409)
+   transition(current,"CLEARING",CLEARING,by=actor.header(),baseline=false);get(id)
+  }!!
+  try {
+   // A work request closed unsent proves no robot got it; one not proven proves nothing. Read after the released read, which may record an execution.
+   val unsent=claimed.receiptId?.let{receipt->runCatching{port.unsent(receipt,actor.header(),"$CLEAR_WITHDRAW_REASON: $reason")}.getOrDefault(false)} ?: false
+   return tx.execute {
+    lock(claimed.stationId);val current=get(id)
+    if(current.state!="CLEARING" || current.revision!=claimed.revision)reject("작업 상태가 바뀌었습니다. 다시 조회하세요",409)
+    // Release never stops the execution. Without the job-number pair a late completion cannot be told apart, so a run that may have reached
+    // a robot quarantines the station: dispatched, and its work request not proven unsent.
+    val station=station(current.stationId);val quarantine=current.dispatchedAt!=null && station.jobSignal==null && !unsent
+    val context=json.createObjectNode().apply{set<JsonNode>("signals",snapshot(signals));put("receiptId",current.receiptId?.toString());put("physicalState",released?.physicalState);put("resultVersion",released?.resultVersion);put("quarantined",quarantine)}
+    transition(current,"MANUALLY_CLEARED","현장 확인에 의한 자원 해제: $reason",release=true,by=actor.header(),context=context);cleared(current,reason,unsent)
+    if(quarantine) {jdbc.sql("UPDATE ops.rf_station SET quarantined_by=:id,quarantined_at=:at WHERE station_id=:station").param("id",current.runId).param("at",java.sql.Timestamp.from(clock.instant())).param("station",station.stationId).update()
+     event(get(id),QUARANTINE,actor.header(),context.deepCopy().put("stationId",station.stationId))}
+    get(id)
+   }!!
+  } catch(e:Exception) {
+   runCatching{tx.execute{lock(claimed.stationId);val r=get(id);if(r.state=="CLEARING")transition(r,"REVIEW_REQUIRED",CLEAR_FAILED,by=actor.header(),baseline=false)}}.onFailure(e::addSuppressed)
+   throw e
+  }
  }
  /**
   * REWORK re-runs a held unit, so the robot moves again. Only the run still owning its station in review may forward it.
@@ -336,7 +381,8 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
    runCatching{tx.execute{lock(claimed.stationId);val r=get(id);if(r.state=="RETRYING")transition(r,"REVIEW_REQUIRED",if(e is RequestRejected)SOURCE_UNOBSERVED else "출발 자리 확인 뒤 재제출 결과 불명; 점유 유지",by=actor.header())}}.onFailure(e::addSuppressed)
    throw e
   }
-  tx.execute{lock(claimed.stationId);val r=get(id);if(r.state=="RETRYING")received(r,next)}
+  val unsent=unsent(next)
+  tx.execute{lock(claimed.stationId);val r=get(id);if(r.state=="RETRYING")received(r,next,unsent)}
   return next
  }
  private fun reworked(run:StationRun,applied:Boolean?,actor:Actor,context:JsonNode) {
@@ -396,11 +442,15 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
    jdbc.sql("UPDATE ops.work_request SET state='REJECTED',detail=:reason,updated_at=clock_timestamp() WHERE receipt_id=:id AND state='WAITING_RESOURCE'").param("id",run.receiptId).param("reason",reason).update()
   event(get(run.runId),reason,by,context)
  }
- /** WAITING_RESOURCE never reached DISPATCHING and UNASSIGNED failed eligibility before sending; DISPATCHING may have been sent. */
- private fun cleared(run:StationRun,reason:String) {
+ /**
+  * WAITING_RESOURCE never reached DISPATCHING; DISPATCHING may have been sent. An UNASSIGNED is closed as not to run only when [unsent] (the host
+  * withdrew its job order, B3): otherwise an approved remedy may still run it, so it closes without that promise and observation decides.
+  */
+ private fun cleared(run:StationRun,reason:String,unsent:Boolean) {
   val id=run.receiptId ?: return
   fun close(from:String,to:String,detail:String)=jdbc.sql("UPDATE ops.work_request SET state=:to,detail=:detail,updated_at=clock_timestamp() WHERE receipt_id=:id AND state IN (:from)").param("to",to).param("detail",detail.take(2000)).param("id",id).param("from",from.split(',')).update()
-  close("WAITING_RESOURCE,UNASSIGNED","REJECTED","현장 확인으로 자원을 해제했습니다. 이 작업 요청은 실행하지 않습니다: $reason")
+  close(if(unsent)"WAITING_RESOURCE,UNASSIGNED" else "WAITING_RESOURCE","REJECTED","현장 확인으로 자원을 해제했습니다. 이 작업 요청은 실행하지 않습니다: $reason")
+  if(!unsent) close("UNASSIGNED","REJECTED","현장 확인으로 자원을 해제했습니다. 실행 호스트가 작업 지시 철회를 확정하지 않아 실행 여부는 실행 관측으로 확인합니다: $reason")
   close("DISPATCHING","IN_DOUBT","현장 확인으로 자원을 해제했습니다. 제출 결과는 실행 관측으로 확인합니다: $reason")
  }
  private fun event(run:StationRun,reason:String,by:String,context:JsonNode?=null) {jdbc.sql("INSERT INTO ops.station_event(run_id,state,reason,actor,context,recorded_at) VALUES(:id,:state,:reason,:actor,CAST(:context AS JSONB),:at)").param("id",run.runId).param("state",run.state).param("reason",reason).param("actor",by).param("context",(context?:json.nullNode()).toString()).param("at",java.sql.Timestamp.from(clock.instant())).update()}
@@ -433,6 +483,16 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
   const val IDLE_CONFIRMED="현장 확인 후 격리 해제"
   const val SOURCE_UNOBSERVED="출발 미관측; 작업 요청 상세에서 출발 자리 확인을 기록하기 전에는 다시 제출하지 않고 점유를 유지합니다"
   const val SOURCE_CONFIRMED="출발 자리 확인 기록; 같은 작업 요청을 다시 제출합니다"
+  /** A host REJECTED of a station run that the host did not confirm withdrawing (B3): kept for a person, never released on its own. */
+  const val REJECTED_UNCONFIRMED="계약 제출 거부; 실행 호스트가 작업 지시 철회를 확정하지 않아 실행 여부 확인 전 점유 유지"
+  /** A host REJECTED of a station run whose job order the host reports executed instead of withdrawing (an approved remedy, B2/B3). */
+  const val REJECTED_BUT_EXECUTED="계약 제출 거부 뒤 실행 호스트가 그 작업 지시의 실행을 알림; 작업 요청을 수락으로 바꾸고 점유 유지"
+  /** The CONFIRM_CLEAR claim (B3): held while the host is asked to withdraw the job order. Every other decision refuses the run meanwhile. */
+  const val CLEARING="현장 확인 해제 중; 실행 호스트의 작업 지시 철회 답 전 다른 판단을 막습니다"
+  /** A CONFIRM_CLEAR that failed after its claim: back to review, nothing released. */
+  const val CLEAR_FAILED="현장 확인 해제 처리 실패; 점유를 유지하고 다시 판단을 기다립니다"
+  /** Prefix of the withdrawal reason a person's CONFIRM_CLEAR sends to the host; the person's own reason follows. */
+  const val CLEAR_WITHDRAW_REASON="공유 스테이션 현장 확인 해제"
   const val SOURCE_HELD="출발 자리 확인은 출발 미관측으로 점유를 유지한 확인 필요 작업에서만 기록합니다"
   /** Prefix of a WAITING_READY hold on the work permit. Robots, their permit, cause, blocking subject and what lifts it follow. */
   const val PERMIT_HELD="작업 허가 대기; 작업 번호를 쓰지 않고 작업 요청을 내지 않습니다"
@@ -469,8 +529,10 @@ class StationCoordinator(private val jdbc:JdbcClient,private val tx:TransactionT
    */
   val SIGNAL_GRACE:java.time.Duration=java.time.Duration.ofSeconds(15)
   /** Reasons for a claim left by another instance that stopped or whose heartbeat expired. */
-  val LEFTOVER_STOPPED=mapOf("RETRYING" to "재평가 중 프로세스 중단; 실행 관측과 현장 확인 필요","REWORKING" to "재작업 전달 중 프로세스 중단; 반영 여부는 실행 관측과 현장 확인 필요")
+  val LEFTOVER_STOPPED=mapOf("RETRYING" to "재평가 중 프로세스 중단; 실행 관측과 현장 확인 필요","REWORKING" to "재작업 전달 중 프로세스 중단; 반영 여부는 실행 관측과 현장 확인 필요",
+   "CLEARING" to "현장 확인 해제 중 프로세스 중단; 작업 지시 철회 여부는 실행 호스트에서 확인 필요")
   /** Reasons for a claim this instance failed to clear after its host call. */
-  val LEFTOVER_OWN=mapOf("RETRYING" to "재평가 뒤 상태 정리 실패; 실행 관측과 현장 확인 필요","REWORKING" to "재작업 전달 뒤 상태 정리 실패; 반영 여부는 실행 관측과 현장 확인 필요")
+  val LEFTOVER_OWN=mapOf("RETRYING" to "재평가 뒤 상태 정리 실패; 실행 관측과 현장 확인 필요","REWORKING" to "재작업 전달 뒤 상태 정리 실패; 반영 여부는 실행 관측과 현장 확인 필요",
+   "CLEARING" to "현장 확인 해제 뒤 상태 정리 실패; 작업 지시 철회 여부는 실행 호스트에서 확인 필요")
  }
 }

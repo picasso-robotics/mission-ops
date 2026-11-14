@@ -268,10 +268,23 @@ data class CloseRow(
 )
 
 /**
+ * 작업 지시 철회 한 행(V16, B3). 작업 지시마다 하나이고 영구다. [requestId] 는 처음 철회한 요청의 id 다(같은 작업 지시를 다른 요청 id 로 다시
+ * 철회해도 이 행이다). [withdrawnAt] 은 적은 DB 시각이다.
+ */
+data class WithdrawalRow(
+    val jobOrderId: String,
+    val requestId: UUID,
+    val requestedBy: String,
+    val reason: String,
+    val withdrawnAt: Instant,
+)
+
+/**
  * 실행 호스트의 기록(S4b 스펙 §6.1). 실행 일지와 그 이벤트, 송신 기록, 인시던트 사본과 판단의 다섯 표다. 덧붙이기와 읽기만 있다.
  * P0-b2 의 V5 가 운영자 실행 취소, 잔여 파지 표시와 그 해소의 세 표를 더한다. HA 단계 0 의 V6 이 판단 기록(덧붙이기만)을, V7 이
  * 인스턴스 심장박동(인스턴스마다 한 행, 그 인스턴스만 고침)을 더한다. V11 이 운영자 결함 감수(덧붙이기만)를 더한다.
- * V12 는 복원 못 한 실행의 운영자 종결(덧붙이기만)을, V13 은 증언 종결의 스냅숏 확인(덧붙이기만)을 더한다.
+ * V12 는 복원 못 한 실행의 운영자 종결(덧붙이기만)을, V13 은 증언 종결의 스냅숏 확인(덧붙이기만)을 더한다. V16 은 작업 지시 철회(덧붙이기만,
+ * B3)를 더한다.
  *
  * pump 뒤 기록은 [inTransaction] 하나로 묶는다(§6.2). 그 밖의 호출은 문장 하나가 한 트랜잭션이다. 호스트 잠금 아래에서 부를 수
  * 있고, 연결을 쥔 채 호스트 잠금을 기다리는 길은 없다(S3b 와 같은 잠금 순서).
@@ -1008,6 +1021,40 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .optional()
             .orElse(null)
 
+    // ── 작업 지시 철회(V16, B3)
+
+    /** 작업 지시 철회 한 행을 적는다. 같은 작업 지시나 같은 [requestId] 의 행이 이미 있으면 `DuplicateKeyException`(쓰기 실패)이다. */
+    fun withdraw(jobOrderId: String, requestId: UUID, requestedBy: String, reason: String): WithdrawalRow =
+        jdbc.sql(
+            """
+            INSERT INTO mission.job_order_withdrawal (job_order_id, request_id, requested_by, reason)
+            VALUES (:jobOrderId, :requestId, :requestedBy, :reason)
+            RETURNING $WITHDRAWAL_COLUMNS
+            """.trimIndent(),
+        )
+            .param("jobOrderId", jobOrderId)
+            .param("requestId", requestId, Types.OTHER)
+            .param("requestedBy", requestedBy)
+            .param("reason", reason)
+            .query { rs, _ -> withdrawalRow(rs) }
+            .single()
+
+    /** 그 작업 지시의 철회 행. 없으면 `null` 이다. */
+    fun withdrawal(jobOrderId: String): WithdrawalRow? =
+        jdbc.sql("SELECT $WITHDRAWAL_COLUMNS FROM mission.job_order_withdrawal WHERE job_order_id = :jobOrderId")
+            .param("jobOrderId", jobOrderId)
+            .query { rs, _ -> withdrawalRow(rs) }
+            .optional()
+            .orElse(null)
+
+    /** 그 요청 id 의 철회 행. 없으면 `null` 이다. */
+    fun withdrawalByRequest(requestId: UUID): WithdrawalRow? =
+        jdbc.sql("SELECT $WITHDRAWAL_COLUMNS FROM mission.job_order_withdrawal WHERE request_id = :requestId")
+            .param("requestId", requestId)
+            .query { rs, _ -> withdrawalRow(rs) }
+            .optional()
+            .orElse(null)
+
     // ── 판단 기록(V6)
 
     fun judgmentRecord(jobOrderId: String, instanceId: String, executionId: String, wireVersion: String, record: String): JudgmentRecordRow =
@@ -1145,6 +1192,14 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         requestId = rs.getObject("request_id", UUID::class.java),
         responseId = rs.getString("response_id"),
         recordedAt = instant(rs, "recorded_at"),
+    )
+
+    private fun withdrawalRow(rs: ResultSet) = WithdrawalRow(
+        jobOrderId = rs.getString("job_order_id"),
+        requestId = rs.getObject("request_id", UUID::class.java),
+        requestedBy = rs.getString("requested_by"),
+        reason = rs.getString("reason"),
+        withdrawnAt = instant(rs, "withdrawn_at"),
     )
 
     private fun cancelRow(rs: ResultSet) = CancelRow(
@@ -1292,6 +1347,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         const val CLOSE_COLUMNS =
             "close_id, event_id, job_order_id, instance_id, closed_instance_id, closed_execution_id, robot_id, restore_result, restore_reason, " +
                 "basis, approver_id, approver_kind, reason, request_id, response_id, recorded_at"
+        const val WITHDRAWAL_COLUMNS = "job_order_id, request_id, requested_by, reason, withdrawn_at"
         const val CANCEL_COLUMNS =
             "cancel_id, instance_id, execution_id, job_order_id, physical_state, approver_id, approver_kind, reason, recorded_at"
         const val RELEASE_COLUMNS =

@@ -91,6 +91,22 @@ class UpstreamReplacementTest {
         val replacement = status(second["receiptId"].asText())
         assertEquals(listOf("MES-SUPPLY-1", firstId, "UNASSIGNED"), listOf("externalOrderId", "receiptId", "state").map { replacement["replaces"][it].asText() }, "$replacement")
         assertTrue(replacement["supersededBy"].isNull, "$replacement")
+
+        // B3: 대체를 접수하기 전에 운영 서비스가 앞선 작업 지시를 실행 호스트에서 철회했다. 다시 물어도 그 철회(새 작업 요청의 id)이고, 그 작업 지시는
+        // 실행 호스트가 값 없는 승인으로도 새 접수로도 짓지 않는다(실행 호스트 시험 `IncidentLoopHostTest`).
+        val again = host("/host/job-orders/${first["jobOrderId"].asText()}/withdraw", """{"requestId":"${java.util.UUID.randomUUID()}","reason":"e2e 재확인","requestedBy":"e2e"}""")
+        assertEquals(listOf("WITHDRAWN", second["receiptId"].asText()), listOf(again["result"].asText(), again["withdrawal"]["requestId"].asText()), "$again")
+        // 대체한 새 작업 지시는 실행이 섰으므로 철회되지 않는다.
+        val replaced = host("/host/job-orders/${second["jobOrderId"].asText()}/withdraw", """{"requestId":"${java.util.UUID.randomUUID()}","reason":"e2e 재확인","requestedBy":"e2e"}""")
+        assertEquals(listOf("EXECUTION_EXISTS", execution["executionId"].asText()), listOf(replaced["result"].asText(), replaced["executionId"].asText()), "$replaced")
+    }
+
+    private fun host(path: String, body: String): JsonNode {
+        val call = HttpRequest.newBuilder(URI.create("${stack.hostUrl}$path")).header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body)).build()
+        val reply = HttpClient.newHttpClient().send(call, HttpResponse.BodyHandlers.ofString())
+        assertEquals(200, reply.statusCode(), reply.body())
+        return json.readTree(reply.body())
     }
 
     private fun order(body: String): JsonNode {
