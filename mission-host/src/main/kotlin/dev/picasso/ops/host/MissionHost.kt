@@ -274,8 +274,27 @@ data class SourceUnobservedView(val material: String?, val source: String, val o
     }
 }
 
-/** 실행의 단위 하나. [reached] 는 단위가 이른 근거 등급이다. */
-data class UnitView(val unitId: String, val skillType: String, val state: String, val reached: String)
+/**
+ * 실행의 단위 하나. [reached] 는 단위가 이른 근거 등급이다.
+ *
+ * @param attempt 단위의 지금 시도(picasso `ExecutionUnit.attempt`). 이 칸이 생기기 전에 적은 정착 본문은 `null` 이다
+ * @param decision 그 단위의 판단 기록 판단(picasso `JudgmentRecord` 의 단위 `decision`, 가장 최근 하나). 운영 서비스의 판단 재조회가 대상·시도·판단으로
+ *   대조하는 자리다(§15.323). 판단이 없거나 이 칸이 생기기 전의 본문이면 `null` 이다
+ */
+data class UnitView(
+    val unitId: String,
+    val skillType: String,
+    val state: String,
+    val reached: String,
+    val attempt: Int? = null,
+    val decision: UnitDecisionView? = null,
+)
+
+/**
+ * 판단 기록의 단위 판단 하나(picasso `RecordedDecision`). [at] 은 미들웨어 시각(호스트 시계)이고 [attempt] 는 판단이 선 시도다 — 재작업이면 단위의
+ * 시도는 그보다 하나 크다. 재작업 근거(`reworkBasis`)와 사건 정체성(`incident`)은 싣지 않는다(인시던트 판단 칸이 근거를 든다).
+ */
+data class UnitDecisionView(val decision: String, val approverId: String, val approverKind: String, val at: Instant, val attempt: Int)
 
 /** 작업 응답 하나. 미들웨어 `JobResponse` 의 칸을 옮긴다. [residualHold] 는 남은 파지 상태의 종류 이름이다. */
 data class JobResponseView(
@@ -659,6 +678,14 @@ class MissionHost(
      */
     private val recorded = mutableMapOf<String, String>()
 
+    /**
+     * 운영자 판단(`resolve` 의 `Resolved`) 뒤 판단 기록을 아직 적지 못한 실행 id(picasso §15.323 의 판단 사본 저장 틈). 재작업은 picasso `resolve` 안에서
+     * 판단을 적고 시도를 올리므로, 적기 전에 pump 가 새 시도를 내고 죽으면 다시 지은 실행은 재작업을 모른 채 앞 실패로 서고 기체에는 새 시도가 나가
+     * 있다. 그래서 여기 든 실행은 [journalBlocked] 에 들어 pump 와 신규 제출을 막고, 다음 pump 가 먼저 다시 적는다([saveDecisions]). 승인 적용의
+     * 저장 계약(§15.320)을 판단에도 넓힌 것이다. 프로세스 안에만 있다 — 죽으면 그 판단은 넘어오지 않지만 그 사이 pump 도 돌지 않았다.
+     */
+    private val unsavedDecisions = linkedSetOf<String>()
+
     /** 처리 중인 운영자 종결의 요청 id. 프로세스 안에만 있다. [closeUnrestored] 가 잠금을 기다리기 전에 넣고 끝나면 뺀다. */
     private val closing: MutableSet<UUID> = ConcurrentHashMap.newKeySet()
 
@@ -922,6 +949,8 @@ class MissionHost(
                 retryDeferred()
                 // 다시 돈 실행의 기록이 커밋되기 전에는 미들웨어 pump 를 돌리지 않는다(그 실행의 로봇 명령이 pump 에서 나간다).
                 recordReruns()
+                // 판단 뒤 적지 못한 판단 기록도 pump 전에 다시 적는다(재작업의 새 시도가 그 기록보다 먼저 나가지 않게).
+                saveDecisions()
                 if (journalBlocked().isNotEmpty()) return@withLock
                 (robots as? HostRobotPort)?.readNowFor(startingRobots())
                 middleware.pump()
@@ -1400,29 +1429,32 @@ class MissionHost(
     }
 
     /**
-     * 재작업을 받을 수 있는 건너뛴 대상(picasso `Middleware.resolve` 의 건너뛴 대상 경로). 미들웨어 메모리의 실행 가운데 물리 상태가
-     * `PARTIAL`·`FAILED` 이고 열린 단위(낼 것, 도는 것, 미확정, 보류)가 없으며, 단위가 `FAILED` 이고 분류가
-     * [Middleware.PREDECESSOR_NOT_DONE] 이며 태스크를 쓴 적이 없는 것이다. 선행이 시도된 실패인지와 같은 기체의 다른 활성 실행은
-     * 호스트가 못 보거나(`ExecutionUnit.after` 는 picasso 안쪽) picasso 와 규칙이 두 벌이 되므로 picasso 의 `NotHeld`·`Refused` 에 맡긴다.
+     * 재작업을 받을 모양인 묶음(picasso `Middleware.reworkCandidates`, §15.323). 모양·종결·같은 기체의 다른 활성 실행·묶음 규칙은 picasso 의 답
+     * 그대로다 — 건너뛴 단위의 술어(`PREDECESSOR_NOT_DONE` ∧ 태스크 빔)를 호스트가 사본으로 들면 picasso 의 묶음 규칙과 갈린다. 호스트는 보존 만료
+     * 시각만 덧붙인다.
      *
      * `FAILED` 는 지금의 종결 기록을 적은 실행만 싣고([settleRecorded]) 보존 만료 시각을 그 기록 시각에서 정한다. 기록을 적기 전이면
-     * 만료 시각을 모르므로 싣지 않는다. 한 pump 안에 지난다. `PARTIAL` 은 만료가 없다. [latest] 는 [latestResponses] 다. 호스트 잠금
-     * 아래에서 부른다.
+     * 만료 시각을 모르므로 싣지 않는다. 한 pump 안에 지난다. `PARTIAL` 은 만료가 없다. picasso 후보는 이 둘 밖의 상태를 내지 않지만, 내면
+     * 싣지 않는다(만료를 정할 수 없다). [latest] 는 [latestResponses] 다. 호스트 잠금 아래에서 부른다.
      */
-    private fun reworkableTargets(latest: Map<String, JobResponse>): List<ReworkableTargetView> =
-        middleware.executions().flatMap { execution ->
+    private fun reworkableTargets(latest: Map<String, JobResponse>): List<ReworkableTargetView> {
+        val byId = middleware.executions().associateBy { it.executionId }
+        return middleware.reworkCandidates().mapNotNull { candidate ->
+            val execution = byId[candidate.executionId] ?: return@mapNotNull null
             val state = execution.physicalState
-            if (state != PhysicalState.PARTIAL && state != PhysicalState.FAILED) return@flatMap emptyList()
-            if (execution.units.any { it.state in OPEN_UNIT_STATES }) return@flatMap emptyList()
             val retainedUntil = when {
                 state == PhysicalState.PARTIAL -> null
-                settleRecorded(execution, latest) -> settleMarks.getValue(execution.executionId).at.plus(revisableRetention)
-                else -> return@flatMap emptyList()
+                state == PhysicalState.FAILED && settleRecorded(execution, latest) ->
+                    settleMarks.getValue(execution.executionId).at.plus(revisableRetention)
+                else -> return@mapNotNull null
             }
-            execution.units
-                .filter { it.state == UnitState.FAILED && it.failureClass == Middleware.PREDECESSOR_NOT_DONE && it.taskId.isEmpty() }
-                .map { ReworkableTargetView(execution.executionId, execution.order.jobOrderId, execution.robotId, it.unitId, state.name, retainedUntil) }
+            ReworkableTargetView(
+                execution.executionId, execution.order.jobOrderId, execution.robotId, candidate.unitId, state.name, retainedUntil,
+                candidate.attempt, candidate.bundle, candidate.kind.name, candidate.incidentUnitId,
+                execution.units.any { it.unitId in candidate.bundle && it.state == UnitState.FAILED && it.failureClass == REWORK_RECHECK },
+            )
         }
+    }
 
     /** [ExecutionPages.live]. [latest] 는 [latestResponses] 다. 호스트 잠금 아래에서 부른다. */
     private fun live(execution: Middleware.Execution, latest: Map<String, JobResponse>): Boolean =
@@ -1468,6 +1500,7 @@ class MissionHost(
             instanceId = middleware.instanceId,
             pumpedAt = pumpedAt,
             executions = chosen.map { execution ->
+                val decisions = middleware.judgmentRecord(execution.executionId)?.units.orEmpty().associate { it.unitId to it.decision }
                 ExecutionView(
                     executionId = execution.executionId,
                     jobOrderId = execution.order.jobOrderId,
@@ -1475,7 +1508,12 @@ class MissionHost(
                     missionVersion = execution.missionVersion,
                     robotId = execution.robotId,
                     physicalState = execution.physicalState.name,
-                    units = execution.units.map { UnitView(it.unitId, it.skillType, it.state.name, it.reached.name) },
+                    units = execution.units.map { unit ->
+                        val decision = decisions[unit.unitId]?.let {
+                            UnitDecisionView(it.decision.name, it.approver.id, it.approver.kind.name, it.at, it.attempt)
+                        }
+                        UnitView(unit.unitId, unit.skillType, unit.state.name, unit.reached.name, unit.attempt, decision)
+                    },
                     jobResponse = responses[execution.executionId]?.let(::view),
                     restoredFrom = restoredFrom[execution.executionId],
                     cancel = cancels[execution.executionId]?.let(CancelRecordView::of),
@@ -1680,6 +1718,7 @@ class MissionHost(
     private fun dropForgotten(execution: Middleware.Execution) {
         val jobOrderId = execution.order.jobOrderId
         settleMarks.remove(execution.executionId)
+        unsavedDecisions.remove(execution.executionId)
         restoredFrom.remove(execution.executionId)
         cancels.remove(execution.executionId)
         recorded.remove(jobOrderId)
@@ -1704,8 +1743,9 @@ class MissionHost(
     }
 
     /**
-     * 판단 기록 하나를 지금 적는다(수락 직후, 운영자 판단 직후). 못 적으면 경고만 남긴다 — 그 판단은 이미 미들웨어에 섰고, 다음 pump 뒤
-     * 기록이 같은 글자를 다시 적는다(그 pump 가 성공하기 전에 프로세스가 죽으면 그 판단은 넘어오지 않는다).
+     * 판단 기록 하나를 지금 적는다(수락 직후, 결함 수용 직후). 못 적으면 경고만 남긴다 — 그 판정은 이미 미들웨어에 섰고, 다음 pump 뒤
+     * 기록이 같은 글자를 다시 적는다(그 pump 가 성공하기 전에 프로세스가 죽으면 그 판정은 넘어오지 않는다). 운영자 판단은 이것이 아니라
+     * [saveDecisions] 로 적는다 — 못 적으면 pump 를 막는다.
      */
     private fun persistRecord(executionId: String) {
         val changed = changedRecords().firstOrNull { it.first.executionId == executionId } ?: return
@@ -1714,6 +1754,31 @@ class MissionHost(
             recorded[changed.first.order.jobOrderId] = changed.second
         } catch (e: Exception) {
             log.warn("판단 기록을 적지 못했다, 다음 pump 에 다시 한다: {} {}", executionId, e.toString())
+        }
+    }
+
+    /**
+     * [unsavedDecisions] 의 판단 기록을 적는다. 적었거나 더 적을 것이 없으면(같은 글자를 이미 적음, 실행이 메모리에 없음) 뺀다. 실패하면 남겨 pump 를
+     * 막고 다음 pump 가 다시 한다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun saveDecisions() {
+        if (unsavedDecisions.isEmpty()) return
+        val live = middleware.executions().mapTo(HashSet()) { it.executionId }
+        unsavedDecisions.retainAll(live)
+        val pending = changedRecords().filter { it.first.executionId in unsavedDecisions }.associateBy { it.first.executionId }
+        unsavedDecisions.toList().forEach { executionId ->
+            val changed = pending[executionId]
+            if (changed == null) {
+                unsavedDecisions -= executionId
+                return@forEach
+            }
+            try {
+                writeRecord(changed.first, changed.second)
+                recorded[changed.first.order.jobOrderId] = changed.second
+                unsavedDecisions -= executionId
+            } catch (e: Exception) {
+                log.warn("판단 뒤 판단 기록을 적지 못했다, 적을 때까지 pump 를 막는다: {} {}", executionId, e.toString())
+            }
         }
     }
 
@@ -1740,24 +1805,26 @@ class MissionHost(
 
     /**
      * 운영자 판단(S4a 스펙 T4, T6). 호스트 잠금 아래에서 `Middleware.resolve` 를 부르고 결과 이름을 picasso 그대로 돌려준다.
-     * 대상은 보류 단위이거나, 선행 이동이 시도 뒤 실패해 내지 않은 점검인 건너뛴 대상이다(picasso ADR 53). 건너뛴 대상은 `REWORK` 만 받고
-     * 그 점검과 선행 이동을 한 쌍으로 새 시도로 되돌린다.
+     * 대상은 보류 단위이거나, 보류가 아닌 재작업 묶음의 단위다(picasso §15.323 — 건너뛴 대상, 시도 뒤 실패한 점검·이동·`pick_place` 계열, 그것을
+     * 기다려 건너뛴 단위, 그것이 기다린 파지 효과 없는 선행). 묶음은 `REWORK` 만 받고 묶음의 단위를 함께 새 시도로 되돌린다.
      *
      * Resolved 이면 판단이 붙은 인시던트 id 를 같이 낸다. 어느 인시던트에 붙는지는 picasso 가 정한다(`IncidentLog.noteResolution`). 보류
-     * 단위면 그 단위의 판단 없는 가장 최근 인시던트이고, 건너뛴 대상이면 선행 이동의 것이다(건너뛴 점검은 인시던트를 열지 않았다). 그래서
-     * 요청한 단위 id 로 고르지 않고, 부르기 전 그 실행의 판단 없는 인시던트 가운데 부른 뒤 판단이 새로 붙은 것을 고른다. 호스트 잠금 아래라
-     * 그 사이에 다른 판단이 끼지 않는다. 판단이 아무 인시던트에도 안 붙었으면 `null` 이다.
+     * 단위면 그 단위의 판단 없는 가장 최근 인시던트이고, 묶음이면 묶음 안의 판단을 기다리던 인시던트마다 붙는다(건너뛴 쌍이면 선행 이동의 것 —
+     * 건너뛴 점검은 인시던트를 열지 않았다). 그래서 요청한 단위 id 로 고르지 않고, 부르기 전 그 실행의 판단 없는 인시던트 가운데 부른 뒤 판단이
+     * 새로 붙은 것 가운데 마지막을 고른다. 호스트 잠금 아래라 그 사이에 다른 판단이 끼지 않는다. 판단이 아무 인시던트에도 안 붙었으면 `null` 이다.
      *
-     * Refused 는 에이전트 승인자일 때와 건너뛴 대상 재작업을 지금 받지 않을 때 난다. 앞의 것은 REST 가 늘 `PERSON` 승인자를 만들므로 이
-     * 메서드를 직접 부를 때만 난다. 뒤의 것은 확인(`CONFIRM_DONE`) 요청, 취소한 실행, 순회가 아직 종결하지 않은 실행, 같은 기체의 다른 활성
-     * 실행이며 REST 로도 난다. `detail` 은 picasso 사유 문장 그대로이고 호출한 쪽이 이 문장으로 분기해서는 안 된다.
-     * NotHeld 는 실행이 없거나 그 단위가 보류도 건너뛴 점검 모양도 아닐 때 난다. 그 실행이 picasso 메모리에 없고 이 인스턴스의 종결 기록이
+     * Refused 는 에이전트 승인자일 때와 보류가 아닌 재작업을 지금 받지 않을 때 난다. 앞의 것은 REST 가 늘 `PERSON` 승인자를 만들므로 이
+     * 메서드를 직접 부를 때만 난다. 뒤의 것은 확인(`CONFIRM_DONE`) 요청, 취소한 실행, 실행이 아직 종결하지 않음, 같은 기체의 다른 활성 실행,
+     * 발행 관문, 물리 관문(손·목적지·출발·예약·구역, 스냅숏을 아직 못 읽음 포함), 묶음 규칙, `UNVERIFIED`·조치 단위이며 REST 로도 난다. `detail` 은
+     * picasso 사유 문장 그대로이고 호출한 쪽이 이 문장을 뜯어 분기해서는 안 된다.
+     * NotHeld 는 실행이 없거나 그 단위가 보류도 묶음의 모양도 아닐 때 난다. 그 실행이 picasso 메모리에 없고 이 인스턴스의 종결 기록이
      * 있으면, 곧 이 인스턴스가 이빅션한 실행이면 `detail` 에 [EVICTED] 를 싣는다. 그 밖의 NotHeld 의 `detail` 은 `null` 이다.
      *
      * picasso `resolve` 는 판단으로 실행의 보류가 걷히면 그 자리에서 작업 응답 하나(`physicalState` `RUNNING`)를 낸다. 다른 단위가 아직
      * 보류이면 실행은 보류 그대로이고 내지 않는다. 다음 pump 가 그 응답을 송신 기록과 결과 outbox 에 한 번 적는다([release] 와 같다).
-     * 건너뛴 대상 재작업은 종료한 실행(`PARTIAL`·`FAILED`)을 `RUNNING` 으로 되돌리고 작업 응답 하나를 낸다. `FAILED` 는 종결을 적은 실행의
-     * 재실행이라 [recordReruns] 가 재실행 이벤트를 적고, `PARTIAL` 은 종결로 적은 적이 없어 적지 않는다. 어느 쪽이든 판단 기록은 곧바로 적는다.
+     * 묶음 재작업은 종료한 실행(`PARTIAL`·`FAILED`)을 `RUNNING` 으로 되돌리고 작업 응답 하나를 낸다. `FAILED` 는 종결을 적은 실행의
+     * 재실행이라 [recordReruns] 가 재실행 이벤트를 적고, `PARTIAL` 은 종결로 적은 적이 없어 적지 않는다. 어느 쪽이든 판단 기록은 이 호출 안에서
+     * 적고, 못 적으면 적을 때까지 pump 와 신규 제출을 막는다([unsavedDecisions]).
      */
     fun resolve(executionId: String, unitId: String, decision: OperatorDecision, approver: Approver, requestId: String?): ResolveView =
         lock.withLock {
@@ -1767,7 +1834,9 @@ class MissionHost(
                     val target = middleware.incidents().lastOrNull { it.incidentId in open && it.resolution != null }?.incidentId
                     // 종결을 적은 실행이 판단으로 다시 돌면 재실행과 판단 기록을 같이 적는다. 못 적으면 pump 가 다시 적을 때까지 pump 를 막는다.
                     recordReruns()
-                    persistRecord(executionId)
+                    // 판단 기록을 이 호출 안에서(다음 pump 전에) 적는다. 못 적으면 적을 때까지 pump 를 막는다([unsavedDecisions]).
+                    unsavedDecisions += executionId
+                    saveDecisions()
                     ResolveView(RESOLVED, null, target, requestId)
                 }
                 ResolveOutcome.NotHeld -> ResolveView(NOT_HELD, EVICTED.takeIf { evicted(executionId) }, null, requestId)
@@ -2079,7 +2148,7 @@ class MissionHost(
      * 부분 완료 실행은 운영자 취소([cancel])로 닫는다. 같은 작업 지시 id 의 개정판은 그 실행 자신을 빼고 판정한다([submit]).
      */
     private fun journalBlocked(among: List<Middleware.Execution> = middleware.executions()): List<String> =
-        among.filter { it.order.jobOrderId !in journaled || rerunOf(it) != null }.map { it.executionId }
+        among.filter { it.order.jobOrderId !in journaled || rerunOf(it) != null || it.executionId in unsavedDecisions }.map { it.executionId }
 
     /**
      * 다시 돎 하나. [revised] 는 일지에 적은 판보다 높은 판을 받았고, [reopened] 는 이 인스턴스가 정착을 적은 실행이 다시 돌고 그것을 아직
@@ -2531,9 +2600,12 @@ class MissionHost(
          */
         val DEFAULT_REVISABLE_RETENTION: Duration = Duration.ofMinutes(5)
 
-        /** 아직 낼 것이 있거나 도는 중이거나 사람을 기다리는 단위 상태. 하나라도 있으면 순회는 종결한 것이 아니다(picasso 와 같은 집합). */
-        private val OPEN_UNIT_STATES =
-            setOf(UnitState.PENDING, UnitState.RUNNING, UnitState.VERIFYING, UnitState.IN_DOUBT, UnitState.OPERATOR_HOLD)
+        /**
+         * 받은 재작업 시도를 처음 내기 직전에 다시 읽은 손·자리가 물리 관문을 못 지나 태스크 없이 `FAILED` 로 닫힌 시도의 실패 분류(picasso §15.323
+         * `MiddlewareCodes.REWORK_RECHECK`, 라이브러리 안쪽 상수라 글자로 든다). 실패 인시던트를 열고 운영자 보류가 아니다. 완료 확인은 받지 않고
+         * 사람의 새 `REWORK` 만 받는다. 분류 이름(코드 값)이지 사유 문장이 아니다.
+         */
+        const val REWORK_RECHECK = "REWORK_RECHECK"
 
         /** 개정판으로 다시 돌 수 있어 [DEFAULT_REVISABLE_RETENTION] 동안 두는 정착 상태. `PARTIAL` 은 구동이 계속 돌려 놓지 않는다. */
         private val REVISABLE = setOf(PhysicalState.FAILED, PhysicalState.UNVERIFIED)
@@ -2656,7 +2728,7 @@ class MissionHost(
 
         /**
          * 판단 결과 NotHeld 의 `detail` 에 싣는 고정 코드. 그 실행이 picasso 메모리에 없고 이 인스턴스의 종결 기록이 있다, 곧 이 인스턴스가
-         * 종결 뒤 이빅션한 실행이라는 뜻이다. 건너뛴 대상 재작업은 이빅션 뒤에는 받지 않으므로 화면이 «보존 기간이 지났다» 와 «재작업할 수
+         * 종결 뒤 이빅션한 실행이라는 뜻이다. 보류가 아닌 재작업은 이빅션 뒤에는 받지 않으므로 화면이 «보존 기간이 지났다» 와 «재작업할 수
          * 없는 대상» 을 이 코드로 가른다. 화면에 그대로 보이는 문구가 아니라 코드이며, 글자를 바꾸면 그것을 읽는 쪽이 같이 바뀌어야 한다.
          */
         const val EVICTED = "EVICTED"

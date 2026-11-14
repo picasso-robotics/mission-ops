@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from '../App'
 import type { FaultDetail, HoldResolveOutcome, IncidentResolution, Session } from '../api'
 import { EXECUTIONS_RECENT_PATH } from '../api'
-import { EXECUTION_CONTROL_TEXT } from '../labels'
+import { EXECUTION_CONTROL_TEXT, REWORK_RECHECK_TEXT } from '../labels'
 import { POLL_MS, SIGNAL_SETTLE_MS } from '../poll'
 import { earlierRow, executionsView, holdResolved, incidentDetail, incidentRow, incidentsView, installFakeOps } from '../testing/fakeOps'
 import type { FakeOps } from '../testing/fakeOps'
@@ -332,6 +332,18 @@ describe('인시던트', () => {
     await within(detail).findByRole('region', { name: '사람의 판단' })
     expect(within(detail).queryByRole('button', { name: '완료 확인' })).not.toBeInTheDocument()
     expect(within(detail).queryByRole('button', { name: '재작업' })).not.toBeInTheDocument()
+  })
+
+  it('재작업 재검사 실패(REWORK_RECHECK)는 실패 종류 옆에 풀이를 보이고 판단 폼과 완료 확인이 없다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.incidents = threeRows()
+    fake.incidentDetails.set('incident-3', incidentDetail({ incidentId: 'incident-3', held: false, unresolved: false, failureClass: 'REWORK_RECHECK' }))
+    open(operator)
+    const detail = await select('incident-3')
+    await waitFor(() => expect(field(detail, '실패 종류')).toBe('REWORK_RECHECK'))
+    expect(field(detail, '재작업 재검사')).toBe(REWORK_RECHECK_TEXT)
+    expect(within(detail).queryByRole('form', { name: '운영자 판단' })).not.toBeInTheDocument()
+    expect(within(detail).queryByRole('button', { name: '완료 확인' })).not.toBeInTheDocument()
   })
 
   it('다른 보류 인시던트를 고르면 판단 사유 입력이 비어 있다', async () => {

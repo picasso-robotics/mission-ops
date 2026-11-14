@@ -723,9 +723,12 @@ export interface SettledPage {
 }
 
 /**
- * 재작업할 수 있는 건너뛴 대상 하나(실행 호스트가 계산한다). 순회가 종결한 뒤 선행 이동이 실패해 점검을 내지 않은 단위다. `unitId` 가
- * 건너뛴 점검의 단위 id이고 `REWORK` 판단에 그대로 싣는다. `physicalState` 는 `PARTIAL` 이나 `FAILED` 다. `retainedUntil` 은 `FAILED`
- * 일 때만 있고, 이 시각(호스트 시계) 뒤에는 실행 호스트가 그 실행을 이빅션해 재작업할 수 없다. `PARTIAL` 은 null 이다.
+ * 재작업할 수 있는 대상 하나(실행 호스트가 picasso `reworkCandidates` 로 싣는다, §15.323). 실행이 종결한 뒤 보류가 아닌 실패 묶음 하나다 — 이동에
+ * 실패해 건너뛴 대상, 시도 뒤 실패한 점검·이동, 시도 뒤 실패한 자재 다루기(`pick_place` 계열). `unitId` 가 판단을 낼 대상이고 `REWORK` 판단에 그대로
+ * 싣는다. `physicalState` 는 `PARTIAL` 이나 `FAILED` 다. `retainedUntil` 은 `FAILED` 일 때만 있고, 이 시각(호스트 시계) 뒤에는 실행 호스트가 그 실행을
+ * 이빅션해 재작업할 수 없다. `PARTIAL` 은 null 이다. 목록에 올라도 받을 때 거부될 수 있다(발행 관문·손과 자리) — 그 사유 문장은 그대로 보인다.
+ *
+ * 뒤 다섯 칸은 picasso `4d8b364` 반입 때 붙었다. 칸이 없던 호스트 본문은 undefined 다.
  */
 export interface ReworkableTarget {
   executionId: string
@@ -734,11 +737,21 @@ export interface ReworkableTarget {
   unitId: string
   physicalState: string
   retainedUntil: string | null
+  /** 대상의 지금 시도. */
+  attempt?: number
+  /** 함께 다시 보낼 단위 id, 계획 순서. */
+  bundle?: string[]
+  /** `SKIPPED`·`ATTEMPTED_INSPECTION`·`ATTEMPTED_HANDLING`. `ATTEMPTED_HANDLING` 은 받을 때 손·자리를 본다. */
+  kind?: string
+  /** 판단이 붙을 인시던트의 단위. 붙을 인시던트가 없으면 null. */
+  incidentUnitId?: string | null
+  /** 묶음에 첫 발행 직전 재검사를 못 지나 태스크 없이 실패로 닫힌 단위(`REWORK_RECHECK`)가 있다. */
+  recheckFailed?: boolean
 }
 
 /**
  * 화면의 실행 목록(`GET /api/executions?recent=`, HA 설계 기록 §10). `executions` 는 지금 인스턴스의 남은 실행(활성이거나 정착 기록 전)이고,
- * `settled` 는 최근 종결 이력이다(최근부터). `reworkableTargets` 는 재작업할 수 있는 건너뛴 대상이고 종결 기록을 적고 아직 호스트 메모리에
+ * `settled` 는 최근 종결 이력이다(최근부터). `reworkableTargets` 는 재작업할 수 있는 실패 묶음이고 종결 기록을 적고 아직 호스트 메모리에
  * 있는 `FAILED` 실행의 것도 든다(칸이 없던 호스트 본문은 undefined 다).
  */
 export interface ExecutionPage extends ExecutionsView, SettledPage {

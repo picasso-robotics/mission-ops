@@ -302,6 +302,17 @@ export const EXECUTION_LIST_TEXT = {
 export const FORGOTTEN_JOB_ORDER_TEXT = '이미 끝나 이빅션한 작업 지시입니다. 같은 작업 지시는 다시 받지 않으므로 다시 할 일은 새 작업 지시로 냅니다.'
 
 /** 운영자 실행 취소와 잔여 파지 확인 문구(P0-b2). */
+/** 재작업 후보의 분류(picasso `ReworkKind`, §15.323). 모르는 값은 코드 그대로. */
+export const REWORK_KIND_LABEL: Record<string, string> = {
+  SKIPPED: '건너뛴 대상',
+  ATTEMPTED_INSPECTION: '시도 뒤 실패(점검·이동)',
+  ATTEMPTED_HANDLING: '시도 뒤 실패(자재 다루기)',
+}
+
+/** 실패 종류가 첫 발행 직전 재검사 실패(`REWORK_RECHECK`, picasso §15.323)인 인시던트의 풀이. 완료 확인을 받지 않는다. */
+export const REWORK_RECHECK_TEXT =
+  '받은 재작업을 내기 직전에 손·자리가 달라 내지 않았습니다. 운영자 보류가 아니어서 완료 확인은 받지 않습니다. 실행 구역의 실패 대상 재작업으로 다시 보내거나, 다시 보내지 않으려면 새 작업 지시로 냅니다(부분 완료로 기체를 쥔 실행은 실행 취소로 닫습니다)'
+
 export const EXECUTION_CONTROL_TEXT = {
   cancelHeading: '실행 취소',
   cancelTarget: '취소할 실행',
@@ -353,30 +364,37 @@ export const EXECUTION_CONTROL_TEXT = {
   releaseApplied: '응답은 없었으나 다시 읽어 보니 수용이 걸림',
   releaseNotApplied: '응답 없음. 다시 읽어 보니 수용이 걸리지 않음. 실행 목록에서 확인하십시오',
   releaseUnconfirmed: '응답 없음. 수용이 걸렸을 수 있음. 다시 읽지도 못해 확인하지 못했습니다. 실행 목록에서 확인하십시오',
-  // 건너뛴 대상 재작업. 순회가 종결한 뒤 이동에 실패해 점검을 하지 않은 대상을 한 번에 하나씩 새 시도로 다시 보낸다.
-  reworkHeading: '건너뛴 대상 재작업',
-  reworkIntro: '순회가 종결된 뒤 이동에 실패해 건너뛴 대상을 한 번에 하나씩 재작업할 수 있습니다. 같은 실행과 작업 지시에서 해당 대상의 이동과 점검을 다시 보냅니다.',
-  reworkSiteNote: '경로 차단 등 이동 실패 원인이 사라졌는지 현장에서 먼저 확인한 뒤 재작업하세요.',
-  reworkTarget: '재작업할 건너뛴 대상',
-  reworkChoose: '건너뛴 대상 선택',
-  reworkOption: (executionId: string, jobOrderId: string, robotId: string, unitId: string) =>
-    `${executionId} · ${jobOrderId} · ${robotId} · ${unitId}`,
+  // 실패 대상 재작업(picasso §15.323). 실행이 종결한 뒤 보류가 아닌 실패 묶음을 한 번에 하나씩 새 시도로 다시 보낸다.
+  reworkHeading: '실패 대상 재작업',
+  reworkIntro:
+    '실행이 종결된 뒤 실패한 대상(이동에 실패해 건너뛴 대상, 시도 뒤 실패한 점검·이동·자재 다루기)을 한 번에 한 묶음씩 재작업할 수 있습니다. 같은 실행과 작업 지시에서 묶음의 단위를 함께 다시 보냅니다.',
+  reworkSiteNote: '경로 차단, 설비 상태, 기체의 손과 자리 등 실패 원인이 사라졌는지 현장에서 먼저 확인한 뒤 재작업하세요.',
+  reworkTarget: '재작업할 대상',
+  reworkChoose: '대상 선택',
+  reworkOption: (executionId: string, jobOrderId: string, robotId: string, unitId: string, kind?: string) =>
+    `${executionId} · ${jobOrderId} · ${robotId} · ${unitId}` + (kind ? ` · ${REWORK_KIND_LABEL[kind] ?? kind}` : ''),
+  reworkBundle: (units: string[]) => `함께 다시 보낼 단위: ${units.join(' → ')}`,
+  reworkHandlingNote:
+    '받을 때 실행 호스트가 기체의 손과 출발·목적지 자리를 읽어 봅니다. 맞지 않거나 아직 못 읽었으면 그 사유로 거부하고, 대상은 목록에 남습니다.',
+  reworkRecheckNote: '앞서 받은 재작업을 내기 직전에 손·자리가 달라 내지 않았습니다(REWORK_RECHECK). 같은 대상을 다시 재작업할 수 있습니다.',
   reworkExpiry: (time: string) => `보존 기간 만료: ${time}`,
   reworkNoExpiry: '보존 만료 없음',
-  reworkEmpty: '재작업할 건너뛴 대상이 없습니다',
+  reworkEmpty: '재작업할 대상이 없습니다',
   reworkReason: '재작업 사유',
-  reworkConfirm: '기체 상태를 현장에서 확인했고 이동 실패 원인이 해소되어 재작업을 진행합니다',
+  reworkConfirm: '기체 상태를 현장에서 확인했고 실패 원인이 해소되어 재작업을 진행합니다',
   reworkButton: '현장 확인 후 재작업',
   reworkOperatorOnly: '재작업은 운영자 모드에서 합니다',
-  // 판단이 붙은 인시던트 id 를 모르면(이동 인시던트가 없는 실행) 괄호를 뺀다.
+  // 판단이 붙은 인시던트 id 를 모르면(붙을 인시던트가 없는 묶음) 괄호를 뺀다.
   reworkResolved: (incidentId: string | null) =>
-    incidentId ? `선행 이동 인시던트에 판단이 섰습니다(${incidentId})` : '선행 이동 인시던트에 판단이 섰습니다',
-  reworkRefused: (detail: string | null) => (detail ? `실행 호스트가 재작업을 거부했습니다. ${detail}` : '실행 호스트가 재작업을 거부했습니다.'),
+    incidentId ? `실패 인시던트에 판단이 섰습니다(${incidentId})` : '판단이 섰습니다(붙을 인시던트 없음)',
+  // 거부 사유는 실행 호스트(picasso)의 문장 그대로다. 뜯어 범주를 나누지 않는다.
+  reworkRefused: (detail: string | null) =>
+    (detail ? `실행 호스트가 재작업을 거부했습니다. ${detail}` : '실행 호스트가 재작업을 거부했습니다.') + ' 대상은 목록에 남습니다',
   reworkEvicted: '보존 기간이 지나 이빅션되었습니다. 새 작업 지시를 내리십시오',
-  reworkNotSkipped: '이미 재작업되었거나 더는 건너뛴 대상이 아닙니다. 실행 목록에서 다시 확인하십시오',
+  reworkNotSkipped: '이미 재작업되었거나 더는 재작업할 대상이 아닙니다. 실행 목록에서 다시 확인하십시오',
   reworkApplied: '응답은 없었으나 다시 읽어 보니 재작업이 걸림',
   reworkNotApplied: '응답 없음. 다시 읽어 보니 재작업이 걸리지 않음. 실행 목록에서 확인하십시오',
-  reworkUnconfirmed: '응답 없음. 재작업이 걸렸을 수 있음. 다시 읽지도 못해 확인하지 못했습니다. 실행 목록에서 확인하십시오',
+  reworkUnconfirmed: '응답 없음. 재작업이 걸렸을 수 있음. 대응하는 판단을 찾지 못해 확인하지 못했습니다. 실행 목록에서 확인하십시오',
   // 복원 못 한 실행의 운영자 종결(결함 14).
   closeHeading: '복원 못 한 실행 운영자 종결',
   closeWarning:
