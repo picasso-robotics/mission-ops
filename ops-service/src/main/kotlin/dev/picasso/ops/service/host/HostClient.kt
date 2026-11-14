@@ -202,6 +202,15 @@ interface HostReads {
      * 구현은 모름이고, 모름을 받은 스테이션 조정은 닫힌 쪽(보류)으로 읽는다.
      */
     fun workPermits(): HostCall<JsonNode> = HostCall.Silent("작업 허가 조회를 지원하지 않는 호스트 읽기다")
+
+    /**
+     * `POST /host/job-orders/{jobOrderId}/withdraw`(B3). 그 작업 지시를 영구히 철회한다 — 그 뒤로 실행 호스트는 그 작업 지시를 값 없는 승인으로도
+     * 새 접수로도 실행하지 않는다. 결과(WITHDRAWN·EXECUTION_EXISTS)는 200 본문의 `result` 에 있고, 실행 일지가 막혀 있으면 500 `JOURNAL_WRITE_FAILED`
+     * 다. 응답은 코드와 본문 그대로이고 분류는 부르는 쪽이 한다. 대체 접수가 원 요청 행 잠금을 쥔 채 부르므로 요청 제한은 이 호출 전용의 짧은 값이다
+     * ([HostClient.WITHDRAW_TIMEOUT]). 철회할 줄 모르는 구현은 응답 없음이다 — 응답 없음은 미전송의 증거가 아니다.
+     */
+    fun withdrawJobOrder(jobOrderId: String, requestId: UUID, reason: String, requestedBy: String): HostWrite =
+        HostWrite.NoResponse("작업 지시 철회를 지원하지 않는 호스트다")
 }
 
 /** 호스트 제출. 시험이 호스트 없이 대신 끼운다. */
@@ -400,6 +409,9 @@ fun interface HostFaults {
  * gRPC 를 부르고, mimic 은 엔진 잠금 아래에서 registry 로 태스크 관측을 동기 HTTP 로 적재한다(요청 제한 3초, 스펙 §5.3).
  * 호스트가 registry 장애 한 번을 기다리는 동안 운영 서비스가 먼저 끊으면, 받은 제출을 응답 없음으로 남기게 된다.
  *
+ * 작업 지시 철회만 요청 제한이 [withdrawTimeout](기본 3초, `ops.host.withdraw-timeout`)이다(B3). 대체 접수가 원 요청 행 잠금을 쥔 채 부르므로 그 행을
+ * 기다리는 결과 수집이 이만큼(호스트가 연결을 받지 않으면 따로 세는 연결 제한 2초를 더해) 멈춘다. 철회는 호스트 잠금 아래 DB 한두 문장이라 짧게 끝난다.
+ *
  * 모의 실행만 요청 제한이 [mockRunTimeout](60초)이다(S3b 스펙 T10). 호스트가 요청 안에서 동기로 돌리고 실제 시간 상한이
  * 30초라, 5초에서 끊으면 돌고 있는 모의 실행을 응답 없음으로 남기게 된다. 60초를 기다리면 호스트는 이미 끝냈으므로 그래도
  * 응답이 없을 때 재조회가 그 결과를 본다.
@@ -410,6 +422,7 @@ class HostClient(
     private val json: ObjectMapper = jacksonObjectMapper(),
     private val requestTimeout: Duration = REQUEST_TIMEOUT,
     private val mockRunTimeout: Duration = MOCK_RUN_TIMEOUT,
+    private val withdrawTimeout: Duration = WITHDRAW_TIMEOUT,
 ) : HostReads, HostWrites, HostMissions, HostSignals, HostSiteTimings, HostIncidents, HostFaults, HostJobResponses,
     HostExecutionControls, AutoCloseable {
 
@@ -465,6 +478,14 @@ class HostClient(
         body.putArray("candidates").apply { candidates.forEach(::add) }
         if (sourceConfirmations.isNotEmpty()) body.set<JsonNode>("sourceConfirmations", json.valueToTree(sourceConfirmations))
         return post("/host/job-orders", body)
+    }
+
+    override fun withdrawJobOrder(jobOrderId: String, requestId: UUID, reason: String, requestedBy: String): HostWrite {
+        val body = json.createObjectNode()
+            .put("requestId", requestId.toString())
+            .put("reason", reason)
+            .put("requestedBy", requestedBy)
+        return post("/host/job-orders/${segment(jobOrderId)}/withdraw", body, withdrawTimeout)
     }
 
     override fun draft(draftId: Long): HostCall<JsonNode> = get("/host/missions/drafts/$draftId")
@@ -707,6 +728,12 @@ class HostClient(
     companion object {
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(2)
         val REQUEST_TIMEOUT: Duration = Duration.ofSeconds(5)
+
+        /**
+         * 작업 지시 철회 요청 제한(B3). 대체 접수가 원 요청 행 잠금을 쥔 채 기다리는 한도라 일반 요청 제한([REQUEST_TIMEOUT])보다 짧다. 넘으면 대체를
+         * 접수하지 않고 503 이다(철회는 반영됐을 수 있다 — 상위 시스템의 재전송이 멱등 호출로 이어 간다).
+         */
+        val WITHDRAW_TIMEOUT: Duration = Duration.ofSeconds(3)
 
         /** 모의 실행 요청 제한(T10). 호스트의 실제 시간 상한 30초보다 길어야 한다. */
         val MOCK_RUN_TIMEOUT: Duration = Duration.ofSeconds(60)

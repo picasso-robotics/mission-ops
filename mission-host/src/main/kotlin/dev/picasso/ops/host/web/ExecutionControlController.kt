@@ -9,6 +9,8 @@ import dev.picasso.ops.host.CloseRequestReused
 import dev.picasso.ops.host.MissionHost
 import dev.picasso.ops.host.ReleaseRequestReused
 import dev.picasso.ops.host.ResidualHoldsView
+import dev.picasso.ops.host.WithdrawJournalBlocked
+import dev.picasso.ops.host.WithdrawRequestReused
 import dev.picasso.ops.host.store.HoldObservation
 import org.springframework.dao.DataAccessException
 import org.springframework.http.HttpStatus
@@ -42,6 +44,9 @@ import java.util.UUID
  * 복원 못 한 실행의 운영자 종결(결함 14)은 작업 지시 id 로 한다(메모리에 실행이 없다). 결과(CLOSED·ALREADY_CLOSED·NOT_CLOSABLE·TASK_LIVE·
  * STOP_UNCONFIRMED·TARGET_CHANGED·NOT_FOUND·REFUSED)는 늘 200 의 본문에 있고, 같은 requestId 의 종결 행이 이미 있으면 409 `REQUEST_ID_REUSED`,
  * 종결 행을 못 적으면 500 `RECORD_WRITE_FAILED` 이고 아무것도 적지 않는다. 종결 조회는 종결 행이 있으면 200, 없으면 404 `NOT_CLOSED`, 조회가 준 요청 id 의 종결을 처리 중이면 409 `REQUEST_IN_PROGRESS` 다.
+ *
+ * 작업 지시 철회(B3)의 결과(WITHDRAWN·EXECUTION_EXISTS)는 늘 200 의 본문에 있다. 실행 일지가 막혀 있으면 500 `JOURNAL_WRITE_FAILED` 이고(일지 쓰기 실패와 같은
+ * 모양) 어느 답도 주지 않는다. 그 요청 id 를 다른 작업 지시의 철회에 썼으면 409 `REQUEST_ID_REUSED`, 철회 행을 못 적으면 500 `RECORD_WRITE_FAILED` 다.
  */
 /**
  * 빈손 확인의 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 본문(B2). [observation] 은 저장한 충돌의 관측 칸 여덟이다. 다시 확인하려면 [conflictRequestId] 와
@@ -149,6 +154,26 @@ class ExecutionControlController(private val host: MissionHost, private val json
     }
 
     /**
+     * 작업 지시 철회(B3). 본문 `{requestId, reason, requestedBy}` 는 [HostRequests.withdraw] 가 읽는다. 대상이 작업 지시 id 라 `instanceId` 막이는 없다 —
+     * 판정은 지금 미들웨어와 실행 일지를 본다. 판정 순서와 결과는 [MissionHost.withdraw] 다.
+     */
+    @PostMapping("/host/job-orders/{jobOrderId}/withdraw", consumes = [MediaType.APPLICATION_JSON_VALUE])
+    fun withdraw(@PathVariable jobOrderId: String, @RequestBody(required = false) body: ByteArray?): ResponseEntity<Any> {
+        val request = try {
+            HostRequests.withdraw(body?.let { runCatching { json.readTree(it) }.getOrNull() })
+        } catch (e: BadRequest) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(HostRejection(e.error, e.message ?: ""))
+        }
+        return try {
+            ResponseEntity.ok(host.withdraw(jobOrderId, UUID.fromString(request.requestId), request.reason, request.requestedBy))
+        } catch (e: WithdrawJournalBlocked) {
+            ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(HostRejection(HostController.JOURNAL_WRITE_FAILED, e.message ?: ""))
+        } catch (e: WithdrawRequestReused) {
+            ResponseEntity.status(HttpStatus.CONFLICT).body(HostRejection(MissionController.REQUEST_ID_REUSED, e.message ?: ""))
+        }
+    }
+
+    /**
      * 그 작업 지시의 운영자 종결. DB 만 읽고 호스트 잠금을 잡지 않는다. 종결하지 않았으면 404 `NOT_CLOSED` 다. `requestId` 를 주면 그 요청 id 의 종결을
      * 아직 처리 중일 때 409 `REQUEST_IN_PROGRESS` 다(운영 서비스의 응답 없음 뒤 재조회가 «반영 안 됨» 으로 읽지 않도록). UUID 가 아니면 400 이다.
      */
@@ -207,7 +232,7 @@ class ExecutionControlController(private val host: MissionHost, private val json
             ?: ResponseEntity.status(HttpStatus.NOT_FOUND).body(HostRejection(RESIDUAL_HOLD_NOT_FOUND, "기체 $robotId 에 잔여 파지 표시 $id 가 없다"))
     }
 
-    /** 취소·해소·결함 수용·종결 기록을 못 적었다. 아무것도 바꾸지 않았다(취소와 수용은 기록을 먼저 적고 미들웨어를 부른다). */
+    /** 취소·해소·결함 수용·종결·철회 기록을 못 적었다. 아무것도 바꾸지 않았다(취소와 수용은 기록을 먼저 적고 미들웨어를 부른다). */
     @ExceptionHandler(DataAccessException::class)
     fun recordFailed(e: DataAccessException): ResponseEntity<Any> =
         ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(HostRejection(RECORD_WRITE_FAILED, e.mostSpecificCause.message ?: e.toString()))

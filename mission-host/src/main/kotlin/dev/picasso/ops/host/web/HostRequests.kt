@@ -45,6 +45,9 @@ data class CloseRequest(
     val attestedStopped: Boolean,
 )
 
+/** 작업 지시 철회 요청(B3). [requestId] 는 정규형 UUID 문자열이다. */
+data class WithdrawRequest(val requestId: String, val reason: String, val requestedBy: String)
+
 /** 잔여 파지 표시 해소 요청(P0-b2). [cited] 는 다시 확인할 때 지목하는 저장된 충돌이다(B2). 없으면 `null` 이다. */
 data class ClearRequest(val approverId: String, val reason: String, val requestId: String?, val cited: CitedConflict? = null)
 
@@ -191,6 +194,16 @@ object HostRequests {
         return CloseRequest(
             text(body, "approverId"), text(body, "reason").trim(), requestId, text(body, "executionInstanceId"), text(body, "executionId"), attested,
         )
+    }
+
+    /**
+     * 작업 지시 철회 `{requestId, reason, requestedBy}` 를 읽는다(B3). requestId 는 필수이고 UUID 문자열이다(정규형으로 바꿔 적는다). reason 과
+     * requestedBy 는 비어 있지 않은 문자열이고 reason 은 앞뒤 공백을 뗀다.
+     */
+    fun withdraw(body: JsonNode?): WithdrawRequest {
+        if (body == null || !body.isObject) throw BadRequest(BAD_REQUEST, "본문이 JSON 객체가 아니다")
+        val requestId = requestId(body)?.let { UUID.fromString(it).toString() } ?: throw BadRequest(BAD_REQUEST, "requestId 는 필수이고 UUID 문자열이다")
+        return WithdrawRequest(requestId, text(body, "reason").trim(), text(body, "requestedBy"))
     }
 
     /**

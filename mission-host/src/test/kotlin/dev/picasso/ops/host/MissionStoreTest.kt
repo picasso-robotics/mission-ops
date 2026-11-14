@@ -23,7 +23,7 @@ class MissionStoreTest {
     @BeforeTest
     fun freshSchema() {
         PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        assertEquals(15, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+        assertEquals(16, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
     }
 
     private fun draft(workMaster: String = PSR) = store.saveDraft(workMaster, "{}", "lee", UUID.randomUUID())
@@ -39,7 +39,7 @@ class MissionStoreTest {
             listOf(
                 "draft", "execution_cancel", "execution_close", "execution_close_confirmed", "execution_fault_release", "execution_journal", "execution_journal_event", "execution_journal_revision", "execution_judgment_record",
                 "flyway_schema_history",
-                "host_instance", "incident_copy", "incident_copy_resolution", "job_response_log", "mission_version", "mock_run", "result_outbox",
+                "host_instance", "incident_copy", "incident_copy_resolution", "job_order_withdrawal", "job_response_log", "mission_version", "mock_run", "result_outbox",
                 "result_producer", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
             ),
             placed,
@@ -228,6 +228,26 @@ class MissionStoreTest {
         // 지목한 충돌로 어긋남을 알고 해소하는 행과, 지목 뒤 손이 비어 인지 없이 해소하는 행은 받는다.
         PostgresSupport.execute(clearing(first, "22222222-2222-2222-2222-222222222222", "HOLDING", true, conflict))
         PostgresSupport.execute(clearing(second, "33333333-3333-3333-3333-333333333333", "EMPTY", false, null))
+    }
+
+    /** V16(B3): 철회는 작업 지시마다 하나, 요청 id 는 한 번, 철회한 쪽과 까닭은 비지 않고 덧붙이기만 한다(풀어 주는 길이 없다). */
+    @Test
+    fun `V16 철회표는 작업 지시와 요청 id 마다 하나이고 덧붙이기만 한다`() {
+        fun withdraw(job: String, request: String, by: String = "ops/supersede", reason: String = "대체 접수") =
+            "INSERT INTO mission.job_order_withdrawal (job_order_id, request_id, requested_by, reason) VALUES ('$job', '$request', '$by', '$reason')"
+        PostgresSupport.execute(withdraw("JO-1", "11111111-1111-1111-1111-111111111111"))
+        listOf(
+            withdraw("JO-1", "22222222-2222-2222-2222-222222222222"),
+            withdraw("JO-2", "11111111-1111-1111-1111-111111111111"),
+            withdraw("JO-2", "33333333-3333-3333-3333-333333333333", by = ""),
+            withdraw("JO-2", "33333333-3333-3333-3333-333333333333", reason = "  "),
+        ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+        listOf("UPDATE mission.job_order_withdrawal SET reason = 'x'", "DELETE FROM mission.job_order_withdrawal", "TRUNCATE mission.job_order_withdrawal")
+            .forEach { sql ->
+                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                assertTrue("덧붙이기만 한다" in e.message!!, "$sql: ${e.message}")
+            }
+        assertEquals(1, PostgresSupport.queryOne("SELECT count(*) FROM mission.job_order_withdrawal") { it.getInt(1) })
     }
 
     @Test

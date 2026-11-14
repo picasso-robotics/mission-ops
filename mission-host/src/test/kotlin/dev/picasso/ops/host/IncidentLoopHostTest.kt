@@ -301,6 +301,121 @@ class IncidentLoopHostTest {
         }
     }
 
+    /**
+     * B3: 관문 확인으로 조치 제안이 선 작업 지시(B1 표시 기체)를 철회하면, 그 제안의 값 없는 승인은 잔여 파지 표시 예외보다 앞에서 `REMEDY_NOT_APPLIED`
+     * 로 거부된다(미들웨어에 넘기지 않아 제안을 소모하지 않는다). 같은 작업 지시의 재제출은 재기동 뒤에도 REJECTED 이고, 다른 요청 id 의 다시 철회는 같은
+     * 행을 돌려준다.
+     */
+    @Test
+    fun `관문 확인으로 제안이 선 작업 지시를 철회하면 값 없는 승인과 재제출을 재기동 뒤에도 거부하고 철회는 작업 지시마다 한 행이다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            val patrol = heldThenPatrol(bench, clear = false)
+            assertEquals("FOUND", patrol["refusals"].single()["remedy"]["kind"].asText(), patrol.toString())
+            val request = java.util.UUID.randomUUID().toString()
+            val first = withdraw(bench, "JO-P", request)
+            assertEquals(200, first.status, first.body.toString())
+            assertEquals(listOf("WITHDRAWN", request, "ops/supersede"), listOf(first.body!!["result"], first.body["withdrawal"]["requestId"], first.body["withdrawal"]["requestedBy"]).map { it.asText() })
+            assertTrue(first.body["executionId"].isNull, first.body.toString())
+            val again = withdraw(bench, "JO-P").body!!
+            assertEquals(listOf("WITHDRAWN", request), listOf(again["result"], again["withdrawal"]["requestId"]).map { it.asText() }, again.toString())
+            assertEquals(1, withdrawals("JO-P"))
+
+            bench.host.approve = { _, attempt -> fail("철회된 작업 지시의 승인을 미들웨어에 넘겼다(제안을 소모한다): $attempt") }
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, refused) = approve(port, AGENT, "JO-P", saw = listOf("pick_place"))
+            assertEquals(listOf("REFUSED", "REMEDY_NOT_APPLIED"), listOf(refused["outcome"].asText(), refused["refusal"].asText()), refused.toString())
+            assertTrue(refused["reason"].asText().startsWith(MissionHost.WITHDRAWN_JOB_ORDER), refused.toString())
+            assertEquals(0, journaled("JO-P"), "철회된 작업 지시에 실행이 섰다")
+            assertEquals(0, PostgresSupport.queryAll("SELECT count(*) FROM mission.robot_residual_hold_recovery") { it.getInt(1) }.single())
+            assertTrue(bench.get("/host/executions")["executions"].none { it["jobOrderId"].asText() == "JO-P" })
+
+            fun resubmit() = bench.post("/host/job-orders", request(inspect("JO-P", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
+            val resubmitted = resubmit()
+            assertEquals("REJECTED", resubmitted["result"].asText(), resubmitted.toString())
+            assertTrue(resubmitted["rejectionReason"].asText().startsWith(MissionHost.WITHDRAWN_JOB_ORDER), resubmitted.toString())
+            assertEquals(0, resubmitted["refusals"].size(), resubmitted.toString())
+
+            bench.restartHost()
+            bench.awaitPump()
+            val restarted = resubmit()
+            assertEquals("REJECTED", restarted["result"].asText(), restarted.toString())
+            assertTrue(restarted["rejectionReason"].asText().startsWith(MissionHost.WITHDRAWN_JOB_ORDER), restarted.toString())
+            assertEquals("WITHDRAWN", withdraw(bench, "JO-P").body!!["result"].asText())
+            assertEquals(0, journaled("JO-P"))
+            assertEquals(1, withdrawals("JO-P"))
+        }
+    }
+
+    /** B3 반대 순서: 승인이 먼저 실행을 세웠으면 철회는 EXECUTION_EXISTS 와 그 실행이고 철회 행을 적지 않는다. 정착해 놓은 뒤에는 일지가 답한다. */
+    @Test
+    fun `승인이 먼저 실행을 세운 작업 지시의 철회는 EXECUTION_EXISTS 이고 적지 않으며 정착해 놓은 뒤에는 실행 일지로 답한다`() {
+        HostBench(incidentLoop = loop()).use { bench ->
+            bench.awaitPump()
+            bench.host.approve = { middleware, attempt ->
+                val accepted = middleware.submit(patrol(attempt.jobOrderId), attempt.robotId) as Middleware.Submission.Accepted
+                ApprovalOutcome.Approved(accepted.execution.executionId, emptyList())
+            }
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, approved) = approve(port, AGENT, "JO-A")
+            assertEquals("APPROVED", approved["outcome"].asText(), approved.toString())
+            val executionId = approved["executionId"].asText()
+
+            val live = withdraw(bench, "JO-A")
+            assertEquals(200, live.status, live.body.toString())
+            assertEquals(
+                listOf("EXECUTION_EXISTS", bench.host.instanceId, executionId, HUMANOID),
+                listOf(live.body!!["result"], live.body["instanceId"], live.body["executionId"], live.body["robotId"]).map { it.asText() },
+                live.body.toString(),
+            )
+            assertTrue(live.body["withdrawal"].isNull && live.body["physicalState"].isTextual, live.body.toString())
+            assertEquals(0, withdrawals("JO-A"))
+
+            assertEquals("PHYSICALLY_DONE", bench.driveUntil(executionId, settledStates)["physicalState"].asText())
+            bench.eventually("놓기") { bench.host.footprint() == empty }
+            val journaledOnly = withdraw(bench, "JO-A").body!!
+            assertEquals(
+                listOf("EXECUTION_EXISTS", executionId, HUMANOID, "PHYSICALLY_DONE"),
+                listOf(journaledOnly["result"], journaledOnly["executionId"], journaledOnly["robotId"], journaledOnly["physicalState"]).map { it.asText() },
+                journaledOnly.toString(),
+            )
+            assertEquals(0, withdrawals("JO-A"))
+        }
+    }
+
+    /** B3: 실행 일지가 막혀 있으면 철회는 어느 답도 주지 않고(500 `JOURNAL_WRITE_FAILED`) 적지 않는다. 다른 작업 지시에 쓴 요청 id 는 409 다. */
+    @Test
+    fun `실행 일지가 막혀 있으면 철회는 성공을 주지 않고 다른 작업 지시에 쓴 요청 id 는 409 다`() {
+        HostBench().use { bench ->
+            val request = java.util.UUID.randomUUID().toString()
+            assertEquals("WITHDRAWN", withdraw(bench, "JO-W", request).body!!["result"].asText())
+            val reused = withdraw(bench, "JO-V", request)
+            assertEquals(listOf(409, "REQUEST_ID_REUSED"), listOf(reused.status, reused.body!!["error"].asText()), reused.body.toString())
+            assertEquals(0, withdrawals("JO-V"))
+
+            PostgresSupport.execute(
+                """
+                CREATE FUNCTION mission.refuse_journal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'journal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
+                """.trimIndent(),
+            )
+            PostgresSupport.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
+            assertEquals(500, bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID)).status)
+            listOf("JO-1", "JO-9").forEach { job ->
+                val blocked = withdraw(bench, job)
+                assertEquals(listOf(500, "JOURNAL_WRITE_FAILED"), listOf(blocked.status, blocked.body!!["error"].asText()), blocked.body.toString())
+                assertEquals(0, withdrawals(job))
+            }
+        }
+    }
+
+    private fun withdraw(bench: HostBench, jobOrderId: String, requestId: String = java.util.UUID.randomUUID().toString()): HostBench.Reply =
+        bench.post(
+            "/host/job-orders/$jobOrderId/withdraw",
+            JSON.writeValueAsString(linkedMapOf("requestId" to requestId, "reason" to "상위 시스템 대체 접수", "requestedBy" to "ops/supersede")),
+        )
+
+    private fun withdrawals(jobOrderId: String): Int =
+        PostgresSupport.queryAll("SELECT count(*) FROM mission.job_order_withdrawal WHERE job_order_id = '$jobOrderId'") { it.getInt(1) }.single()
+
     private fun journaled(jobOrderId: String): Int =
         PostgresSupport.queryAll("SELECT count(*) FROM mission.execution_journal WHERE job_order_id = '$jobOrderId'") { it.getInt(1) }.single()
 

@@ -5,7 +5,7 @@ import { STATION_TEXT } from '../labels'
 import { POLL_MS } from '../poll'
 import { MissionResourceSettings } from './MissionResourceSettings'
 
-const labels:Record<string,string>={QUEUED:'자원 대기',WAITING_READY:'설비 준비 대기',DISPATCHING:'제출 중',RUNNING:'실행·설비 완료 대기',WAITING_ROBOT:'가용 기체 대기',RETRYING:'미배정 재평가 중',REWORKING:'재작업 전달 중',REVIEW_REQUIRED:'현장 확인 필요',COMPLETED:'완료',TIMED_OUT:'준비 시간 초과',REJECTED:'제출 거부',MANUALLY_CLEARED:'현장 확인 후 해제',CANCELLED:'대기 취소'}
+const labels:Record<string,string>={QUEUED:'자원 대기',WAITING_READY:'설비 준비 대기',DISPATCHING:'제출 중',RUNNING:'실행·설비 완료 대기',WAITING_ROBOT:'가용 기체 대기',RETRYING:'미배정 재평가 중',REWORKING:'재작업 전달 중',CLEARING:'현장 확인 해제 중',REVIEW_REQUIRED:'현장 확인 필요',COMPLETED:'완료',TIMED_OUT:'준비 시간 초과',REJECTED:'제출 거부',MANUALLY_CLEARED:'현장 확인 후 해제',CANCELLED:'대기 취소'}
 const message=(e:unknown)=>e instanceof Error?e.message:String(e)
 interface Pending { requestId:string;stationId:string;interfaceId:string;interfaceVersion:number;expectedDeploymentVersion:number;input:unknown }
 export function StationWorkspace({session}:{session:Session}) {

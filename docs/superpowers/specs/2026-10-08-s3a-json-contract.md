@@ -490,6 +490,32 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 
 (예의 id 값은 보기다. 근거 시험: `FaultReleaseHostTest` 의 첫째~여덟째 시험, `본 결함대로 감수하면 감수 행과 판단 기록을 곧바로 적고 막힘이 걷힌 작업 응답 하나를 곧바로 내며 이동이 실패한 대상의 점검은 거르고 다음 대상의 단위를 낸다`, `본 결함과 지금 막는 결함이 다르면 BLOCK_CHANGED 이고 감수 행 없이 막힌 그대로다`.)
 
+### 5.11 `POST /host/job-orders/{jobOrderId}/withdraw`(B3)
+
+실행이 없는 작업 지시를 영구히 철회한다. 그 뒤로 실행 호스트는 그 작업 지시를 값 없는 승인(`REMEDY_NOT_APPLIED`)으로도 새 접수(`POST /host/job-orders` 의 `REJECTED`, `rejectionReason` 앞머리 `철회된 작업 지시다. 실행을 짓지 않는다`)로도 실행하지 않는다. 풀어 주는 호출은 없다. 대상이 작업 지시 id 라 `instanceId` 막이는 없다.
+
+본문 `{requestId, reason, requestedBy}`: `requestId` 는 필수 UUID 문자열(정규형으로 적음), `reason`·`requestedBy` 는 비어 있지 않은 문자열(`reason` 은 앞뒤 공백을 뗌). 판정은 호스트 잠금 아래이고 순서는 다음과 같다.
+
+1. 실행 일지가 막혀 있으면(`journalBlockedExecutionIds` 가 비지 않음) 500 `JOURNAL_WRITE_FAILED`, 적지 않음. 일지에 없는 실행이 미들웨어에 있을 수 있어 어느 결과도 주지 않는다.
+2. 그 작업 지시의 실행이 미들웨어에 있으면 `EXECUTION_EXISTS`(지금 인스턴스, 실행 id, 기체, 지금 물리 상태), 적지 않음.
+3. 실행 일지에 그 작업 지시의 행이 있으면 `EXECUTION_EXISTS`(일지의 마지막 실행 — 받은 행이나 그 뒤 다시 지은·정착한 실행 —, 기체, 마지막 차례가 정착·다시 돎이면 그 물리 상태, 운영자 종결이면 `UNVERIFIED`, 그 밖에는 null), 적지 않음.
+4. 철회 행이 이미 있으면 `WITHDRAWN` 과 그 행(요청 id 가 달라도 같다, 작업 지시 기준 멱등).
+5. 그 요청 id 를 다른 작업 지시의 철회에 썼으면 409 `REQUEST_ID_REUSED`, 적지 않음.
+6. 철회 행을 적고 `WITHDRAWN`. 그 작업 지시의 관문 확인 제안 표시를 지운다(picasso 의 제안 장부는 지우지 않음). 행을 못 적으면 500 `RECORD_WRITE_FAILED`.
+
+```json
+{"requestId": "6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a", "reason": "상위 시스템 대체 접수: MES-SUPPLY-2", "requestedBy": "operator/mock-mes"}
+```
+
+```json
+{"result": "WITHDRAWN", "jobOrderId": "JO-1", "instanceId": null, "executionId": null, "robotId": null, "physicalState": null,
+ "withdrawal": {"requestId": "6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a", "requestedBy": "operator/mock-mes", "reason": "상위 시스템 대체 접수: MES-SUPPLY-2", "withdrawnAt": "2026-11-14T01:02:03.456Z"},
+ "requestId": "6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a"}
+{"result": "EXECUTION_EXISTS", "jobOrderId": "JO-1", "instanceId": "mw-3f0c...", "executionId": "exec-1", "robotId": "humanoid-01", "physicalState": "RUNNING", "withdrawal": null, "requestId": "6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a"}
+```
+
+`withdrawal.requestId` 는 처음 철회한 요청의 id 다(다시 철회한 요청의 id 는 맨 끝 `requestId`). 실행 취소(5.2)의 `NOT_FOUND` 는 미실행 증거가 아니다 — 미실행 작업 지시를 폐기하는 취소를 만들면 이 철회를 거친다. 근거 시험: `IncidentLoopHostTest` 의 `관문 확인으로 제안이 선 작업 지시를 철회하면 값 없는 승인과 재제출을 재기동 뒤에도 거부하고 철회는 작업 지시마다 한 행이다`, `승인이 먼저 실행을 세운 작업 지시의 철회는 EXECUTION_EXISTS 이고 적지 않으며 정착해 놓은 뒤에는 실행 일지로 답한다`, `실행 일지가 막혀 있으면 철회는 성공을 주지 않고 다른 작업 지시에 쓴 요청 id 는 409 다`.
+
 ## 6. `GET /host/cell`
 
 응답 200 늘:
@@ -522,9 +548,10 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 | `GET /host/robots/residual-holds` | 늘 | 없음 | 없음 |
 | `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` | 해소함 | `BAD_REQUEST`(그 밖 400 `RESIDUAL_HOLD_CITATION_INVALID`, 404 `RESIDUAL_HOLD_NOT_FOUND`, 409 `RESIDUAL_HOLD_ALREADY_CLEARED`, 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`, 409 `REQUEST_ID_REUSED`, 403 `APPROVER_REFUSED`(REST 로는 안 남), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `GET /host/robots/{robotId}/residual-holds/{markerId}` | 늘 | `BAD_REQUEST`(그 밖 404 `RESIDUAL_HOLD_NOT_FOUND`) | 없음 |
+| `POST /host/job-orders/{jobOrderId}/withdraw` | 결과 둘 전부(5.11) | `BAD_REQUEST`(그 밖 409 `REQUEST_ID_REUSED`, 500 `JOURNAL_WRITE_FAILED`(일지 막힘), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | 현장 `GET /cell` | 늘 | 없음(405·404 는 위 1절) | 없음 |
 
-호스트가 안 닿으면(연결 실패) 운영 서비스가 503·NO_RESPONSE 로 다룬다(스펙 §8). 취소·해소(P0-b2)·결함 수용(5.10) 기록 실패는 500 `RECORD_WRITE_FAILED`, 실행 일지 쓰기 실패는 500 `JOURNAL_WRITE_FAILED`(S4b H6, 이 PR 전부터)다. 운영 서비스는 호스트 5xx 를 응답 없음으로 다루고 재조회한다.
+호스트가 안 닿으면(연결 실패) 운영 서비스가 503·NO_RESPONSE 로 다룬다(스펙 §8). 작업 지시 철회(5.11)만 운영 서비스의 요청 제한이 따로다(`ops.host.withdraw-timeout`, 기본 3초) — 상위 시스템 대체가 앞선 작업 요청 행 잠금을 쥔 채 부른다. 운영 서비스는 철회의 응답 없음·5xx·잘못된 본문을 미전송 증거로 쓰지 않는다(대체 503 `WITHDRAWAL_UNCONFIRMED`, 9.9). 취소·해소(P0-b2)·결함 수용(5.10) 기록 실패는 500 `RECORD_WRITE_FAILED`, 실행 일지 쓰기 실패는 500 `JOURNAL_WRITE_FAILED`(S4b H6, 이 PR 전부터)다. 운영 서비스는 호스트 5xx 를 응답 없음으로 다루고 재조회한다.
 
 ---
 
@@ -786,3 +813,20 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 ```
 
 (근거 시험: `ExecutionControlsTest` 의 `결함 감수는 운영자 모드만 하고 본문이 틀리면 사유보다 먼저 400 RELEASE_BAD_REQUEST 이며 사유가 없으면 400 REASON_REQUIRED 다`·`결함 감수는 승인자가 행위자이고 본 결함의 종류와 참조만 옮겨 보내며 RELEASED 는 성공 그 밖의 결과와 호스트 4xx 는 거부로 남는다`·`결함 감수 응답이 없으면 그 실행의 releases 에 이 요청 id 가 있는지로 대조하고 인스턴스가 바뀌었거나 못 읽으면 확인하지 못한다`, `HostClientTest` 의 `결함 감수는 승인자와 사유와 인스턴스와 본 결함과 요청 id 를 실어 보내고 상태 코드와 본문을 그대로 돌려준다`.)
+
+### 9.9 상위 시스템 대체 접수와 작업 지시 철회(B3)
+
+외부 주문 `POST /integration/v1/job-orders` 의 `replacesExternalOrderId` 로 실행 없이 끝난 앞선 작업 요청(`REJECTED`·`UNASSIGNED`)을 대체할 때 운영 서비스는 앞선 작업 요청 행 잠금을 쥔 채, 기존 조건과 대체 연결 검사 뒤에 실행 호스트의 작업 지시 철회(5.11)를 부른다. 같은 새 주문의 재전송과 운영자 종결로 닫힌 앞선 작업 요청은 부르지 않는다. 출발 자리 확인이 `submission` 을 비우므로 제출 기록 유무와 무관하게 늘 부른다.
+
+| 실행 호스트 답 | 운영 서비스 답 | 적는 것 |
+|---|---|---|
+| `WITHDRAWN` | 202(새 작업 요청) | 새 작업 요청과 연결(`withdrawal_request_id` = 철회 행의 요청 id) |
+| `EXECUTION_EXISTS` | 409 `ORIGINAL_NOT_REPLACEABLE`(`detail` 에 실행 id·기체) | 앞선 작업 요청을 `ACCEPTED` 로 올림(`last_execution` 에 그 실행, 작업 응답·결과 버전 없음). 커밋한 뒤 409 |
+| 응답 없음·5xx·잘못된 본문 | 503 `WITHDRAWAL_UNCONFIRMED` | 없음(철회는 반영됐을 수 있다. 같은 요청 id 의 재전송이 멱등 호출로 이어 감) |
+
+```json
+{"error": "ORIGINAL_NOT_REPLACEABLE", "detail": "실행 호스트가 앞선 작업 요청의 작업 지시를 이미 실행했습니다(실행 exec-1, 기체 humanoid-01). 대체하지 않고 앞선 작업 요청을 수락으로 바꿨습니다"}
+{"error": "WITHDRAWAL_UNCONFIRMED", "detail": "실행 호스트가 앞선 작업 요청의 작업 지시 철회를 확정하지 않아 대체를 접수하지 않았습니다(응답 없음: HttpTimeoutException). 같은 요청을 다시 보내십시오"}
+```
+
+스테이션의 현장 확인 해제(`CONFIRM_CLEAR`)와 제출 거부 자동 해제도 같은 철회를 스테이션 잠금 밖에서 부르고 `WITHDRAWN` 만 미전송으로 본다(요청 id 는 작업 요청에서 지은 고정값). 현장 확인 해제는 본문 검증과 선점(`CLEARING`) 뒤에만 부르고 `requestedBy` 는 해제한 운영자, `reason` 은 «공유 스테이션 현장 확인 해제: <그 사람의 사유>» 다. 자동 해제의 `requestedBy` 는 `system/station` 이다. (근거 시험: `WorkRequestsTest` 의 `실행 호스트가 앞선 작업 지시의 실행을 알리면 대체를 409 로 거절하고 앞선 작업 요청을 수락으로 올려 커밋한다`, `철회에 답이 없거나 일지가 막혔으면 대체를 503 으로 접수하지 않고 아무것도 적지 않으며 복구 뒤 같은 요청은 통과한다`, `현장 확인 해제는 실행 호스트가 철회를 확정할 때만 미전송으로 닫고 실행이 있거나 답이 없으면 스테이션을 격리한다`, `HostClientTest` 의 `작업 지시 철회는 본문을 실어 보내고 이 호출 전용의 짧은 요청 제한으로 끊는다`.)

@@ -241,6 +241,45 @@ class HostClientTest {
         )
     }
 
+    /**
+     * B3: 철회는 요청 id·까닭·부른 쪽을 실어 보내고 코드와 본문을 그대로 돌려준다. 요청 제한은 이 호출 전용의 짧은 값이다 — 대체 접수가 원 요청 행 잠금을
+     * 쥔 채 기다린다. 그 제한을 넘긴 답은 응답 없음이고 같은 호스트의 다른 요청은 일반 제한으로 기다린다.
+     */
+    @Test
+    fun `작업 지시 철회는 본문을 실어 보내고 이 호출 전용의 짧은 요청 제한으로 끊는다`() {
+        assertTrue(HostClient.WITHDRAW_TIMEOUT < HostClient.REQUEST_TIMEOUT, "철회 요청 제한이 일반 요청 제한보다 짧지 않다")
+        assertTrue(HostClient.WITHDRAW_TIMEOUT in java.time.Duration.ofSeconds(2)..java.time.Duration.ofSeconds(3), HostClient.WITHDRAW_TIMEOUT.toString())
+        val requestId = UUID.fromString("6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a")
+        val answer = """{"result":"WITHDRAWN","jobOrderId":"JO-1"}"""
+        val s = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        s.createContext("/host/job-orders/JO-1/withdraw") { exchange ->
+            seen["withdraw"] = Triple(exchange.requestMethod, exchange.requestHeaders.getFirst("Content-Type"), exchange.requestBody.readAllBytes().decodeToString())
+            val bytes = answer.toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        // 일반 제한 안, 철회 제한 밖에 답한다.
+        val slow = { exchange: com.sun.net.httpserver.HttpExchange ->
+            exchange.requestBody.readAllBytes()
+            Thread.sleep(1500)
+            val bytes = answer.toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        s.createContext("/host/job-orders/JO-SLOW/withdraw", slow)
+        s.createContext("/host/cell", slow)
+        s.executor = java.util.concurrent.Executors.newCachedThreadPool()
+        s.start()
+        server = s
+        val client = HostClient("http://127.0.0.1:${s.address.port}", withdrawTimeout = java.time.Duration.ofMillis(500))
+        assertEquals(HostWrite.Answered(200, answer), client.withdrawJobOrder("JO-1", requestId, "상위 시스템 대체 접수: ORDER-B", "operator/mes"))
+        val (method, contentType, body) = seen.getValue("withdraw")
+        assertEquals(listOf("POST", "application/json"), listOf(method, contentType))
+        assertEquals(json.readTree("""{"requestId":"$requestId","reason":"상위 시스템 대체 접수: ORDER-B","requestedBy":"operator/mes"}"""), json.readTree(body))
+        assertIs<HostWrite.NoResponse>(client.withdrawJobOrder("JO-SLOW", requestId, "r", "operator/mes"))
+        assertIs<HostCall.Ok<*>>(client.cell())
+    }
+
     @Test
     fun `종결은 승인자와 사유와 본 실행과 증언과 요청 id 를 실어 보내고 종결 조회는 404 NOT_CLOSED 만 없음으로 읽는다`() {
         val requestId = UUID.fromString("6f1c2a9e-0b7d-4c55-9a51-2f3e4d5c6b7a")

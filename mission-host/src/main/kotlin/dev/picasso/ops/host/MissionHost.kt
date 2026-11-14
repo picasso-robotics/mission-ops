@@ -527,6 +527,14 @@ data class HostFootprint(
  * `NOT_DECLARED` 로 거부된다. [export] 를 주면 pump 마다 잠금 아래에서 인시던트 대장·조치 탐색 대장·안내·작업 응답을 그 디렉터리에
  * 쓴다([IncidentExport]). 둘 다 기본값이면 오늘의 동작 그대로다. 승인 호스트(`POST /approvals`)는 이 클래스 밖에서 열고
  * [attemptApproval] 을 부른다.
+ *
+ * ## 작업 지시 철회(B3)
+ *
+ * [withdraw] 는 실행이 없는 작업 지시를 영구히 막는다(`job_order_withdrawal`, V16). 운영 서비스의 대체 접수와 스테이션 현장 해제가 «그 작업 지시는
+ * 보내지 않았다» 를 증명하는 유일한 길이다 — 값 없는 승인은 운영 서비스를 거치지 않고 실행을 세우므로 운영 DB 만으로는 증명이 안 된다. 판정과 기록이
+ * 호스트 잠금 하나 아래라 승인과 철회 가운데 먼저 잠금을 잡은 쪽이 이긴다. 철회된 작업 지시는 값 없는 승인([attemptApproval])이 `REMEDY_NOT_APPLIED`
+ * 로, 새 접수([submit])가 [WITHDRAWN_JOB_ORDER] 로 거부한다. 사람이 값을 넣는 조치 승인(`approveRemedy`) 경로를 이 호스트에 열면 그 경로도 같은
+ * 검사를 지나야 한다. 실행 취소([cancel])의 `NOT_FOUND` 는 미실행 증거로 쓰지 않는다 — 미실행 작업 지시를 폐기하는 취소를 만들면 같은 철회를 거친다.
  */
 class MissionHost(
     private val robots: RobotPort,
@@ -936,7 +944,9 @@ class MissionHost(
      * 실패하면 [JournalWriteFailed] 가 나가고 제출과 같이 호스트 복구 전까지 막힌다.
      *
      * 실행이 없는 작업 지시가 실행 일지에 이미 있으면(정착했거나 포기한 작업 지시) 미들웨어에 넘기지 않고 `REMEDY_NOT_APPLIED` 로 거부한다.
-     * 제출의 [journalRefusal] 과 같은 확인이고, 제안을 소모하지 않는다.
+     * 제출의 [journalRefusal] 과 같은 확인이고, 제안을 소모하지 않는다. 철회된 작업 지시([withdraw])도 같은 자리에서 `REMEDY_NOT_APPLIED` 로
+     * 거부한다 — 잔여 파지 표시 예외보다 앞이라 관문 확인으로 선 제안도 받지 않는다. 사람이 값을 넣는 조치 승인 경로를 이 호스트에 열면 그 경로도
+     * 이 검사를 지나야 한다.
      *
      * **판정이 막은 기체에는 승인으로도 실행을 세우지 않는다.** picasso 0.11.0 부터 도는 단위 없는 기체에도 제안이 서므로(§15.316) 이 경로가 실제로
      * 닿는다. 승인 접수는 미들웨어 관문을 다시 지나지만 관문은 이 호스트의 제한(진행 중인 실행, 복원 못 한 행, 증언 종결 확인 전, 잔여 파지 표시,
@@ -949,6 +959,8 @@ class MissionHost(
         val existing = middleware.executions().firstOrNull { it.order.jobOrderId == attempt.jobOrderId }
         val existed = existing != null
         if (!existed) {
+            // 철회는 잔여 파지 표시 예외보다 앞이다 — 대체 접수가 이긴 작업 지시의 낡은 제안은 관문 확인으로 섰어도 실행을 세우지 않는다.
+            withdrawalRefusal(attempt.jobOrderId)?.let { return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REMEDY_NOT_APPLIED, it) }
             journalRefusal(attempt.jobOrderId)?.let { return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REMEDY_NOT_APPLIED, it) }
         }
         // **승인도 판정이 막은 기체에는 실행을 세우지 않는다.** 미들웨어 관문은 이 호스트의 제한을 모른다. 제안은 지우지 않는다(관문 거절과 같다).
@@ -1029,6 +1041,9 @@ class MissionHost(
      * 미들웨어에 그 작업 지시의 실행이 없는데 실행 일지에 그 작업 지시가 있으면 `assign` 을 부르지 않고 REJECTED 다([journalRefusal]).
      * 일지의 키가 작업 지시 id 라 새 실행을 받으면 일지 쓰기가 실패해 호스트 전체가 막히고, 정착한 작업 지시면 이미 끝난 일이 또 돈다.
      * picasso 의 놓은 작업 지시 표시는 메모리라 재기동 뒤에는 없으므로 이 확인이 재기동 전후를 같게 한다.
+     *
+     * 철회된 작업 지시([withdraw])도 `assign` 을 부르지 않고 REJECTED 다(사유가 [WITHDRAWN_JOB_ORDER] 로 시작한다). 운영 서비스의 재제출(미배정 재평가,
+     * 출발 자리 확인)이 관문 확인으로 제안을 다시 세우지 않게 한다. 철회 행은 DB 에 있어 재기동 뒤에도 같다.
      */
     fun submit(order:JobOrder,candidates:List<String>,missionVersion:String?=null,confirmations:List<SourceConfirmation> = emptyList()):SubmitOutcome = lock.withLock {
         catalog.withMission(order.workMasterId,selectedMission(order.workMasterId,missionVersion)) { submitCurrent(order,candidates,confirmations) }
@@ -1052,6 +1067,9 @@ class MissionHost(
         }
         val excluded = judged.filter { !it.passed }
         if (!existed) {
+            withdrawalRefusal(order.jobOrderId)?.let { reason ->
+                return@withLock SubmitOutcome(SubmitResult.REJECTED, null, null, reason, emptyList(), excluded)
+            }
             journalRefusal(order.jobOrderId)?.let { reason ->
                 return@withLock SubmitOutcome(
                     SubmitResult.REJECTED, null, null, reason, emptyList(), excluded,
@@ -1182,6 +1200,51 @@ class MissionHost(
             ?: return "$JOURNALED_JOB_ORDER: $jobOrderId · ${row.instanceId} ${row.executionId}"
         return "${Middleware.FORGOTTEN_JOB_ORDER}: $jobOrderId · ${settled.instanceId} ${settled.executionId} · ${settled.detail} " +
             "(실행 일지). 다시 할 일은 새 작업 지시 ID로 낸다"
+    }
+
+    /** 철회된 작업 지시면 거부 사유([WITHDRAWN_JOB_ORDER] 로 시작), 아니면 `null`. 호스트 잠금 아래에서 부른다. */
+    private fun withdrawalRefusal(jobOrderId: String): String? = records.withdrawal(jobOrderId)?.let {
+        "$WITHDRAWN_JOB_ORDER: $jobOrderId · ${it.requestedBy} ${it.withdrawnAt} (${it.reason})"
+    }
+
+    /**
+     * 작업 지시 철회(B3). 호스트 잠금 아래에서 판정한다 — 값 없는 승인([attemptApproval])과 새 접수([submit])도 같은 잠금이라 둘 가운데 먼저 잡은 쪽이
+     * 이긴다. 순서:
+     * 1. 실행 일지가 막혀 있으면([journalBlocked]) [WithdrawJournalBlocked] — 일지에 없는 실행이 미들웨어에 있을 수 있어 어느 답도 주지 않는다.
+     * 2. 그 작업 지시의 실행이 미들웨어에 있으면 [WithdrawResult.EXECUTION_EXISTS](지금 인스턴스의 실행과 물리 상태). 적지 않는다.
+     * 3. 실행 일지에 그 작업 지시의 행이 있으면 [WithdrawResult.EXECUTION_EXISTS](일지의 마지막 실행과 마지막 정착 상태). 적지 않는다.
+     * 4. 철회 행이 이미 있으면 [WithdrawResult.WITHDRAWN] 과 그 행. 요청 id 가 달라도 같다(작업 지시 기준 멱등).
+     * 5. 그 요청 id 를 다른 작업 지시의 철회에 썼으면 [WithdrawRequestReused].
+     * 6. 철회 행을 적고 [WithdrawResult.WITHDRAWN]. 적지 못하면 `DataAccessException` 이고 아무것도 바뀌지 않는다.
+     *
+     * WITHDRAWN 이면 그 작업 지시의 관문 확인 제안([trialProposals])을 지운다. picasso 의 제안 장부는 지우지 않는다 — 승인과 접수를 이 호스트가 막으므로
+     * 그 제안으로는 실행이 서지 않는다. 풀어 주는 호출은 없다(영구).
+     */
+    fun withdraw(jobOrderId: String, requestId: UUID, reason: String, requestedBy: String): WithdrawView = lock.withLock {
+        fun executed(instance: String, executionId: String, robotId: String, state: String?) =
+            WithdrawView(WithdrawResult.EXECUTION_EXISTS, jobOrderId, instance, executionId, robotId, state, null, requestId.toString())
+        journalBlocked().takeIf { it.isNotEmpty() }?.let { throw WithdrawJournalBlocked(it) }
+        middleware.executions().firstOrNull { it.order.jobOrderId == jobOrderId }?.let {
+            return@withLock executed(instanceId, it.executionId, it.robotId, it.physicalState.name)
+        }
+        records.journalRow(jobOrderId)?.let { row ->
+            val events = records.events(jobOrderId)
+            // 받은 행 뒤에 다시 짓거나 정착한 실행이 있으면 그 실행이 마지막이다. 물리 상태는 마지막 차례가 정착(또는 다시 돎)일 때의 것이다.
+            val ran = events.lastOrNull { it.executionId != null }
+            val last = events.lastOrNull { it.kind in TURNS }
+            val state = when (last?.kind) {
+                JournalEventKind.SETTLED, JournalEventKind.REOPENED -> last.detail
+                JournalEventKind.CLOSED -> PhysicalState.UNVERIFIED.name
+                else -> null
+            }
+            return@withLock executed(ran?.instanceId ?: row.instanceId, ran?.executionId ?: row.executionId, row.robotId, state)
+        }
+        val row = records.withdrawal(jobOrderId) ?: run {
+            records.withdrawalByRequest(requestId)?.let { throw WithdrawRequestReused(requestId.toString(), it.jobOrderId) }
+            records.withdraw(jobOrderId, requestId, requestedBy, reason)
+        }
+        trialProposals.keys.removeIf { it.second == jobOrderId }
+        WithdrawView(WithdrawResult.WITHDRAWN, jobOrderId, null, null, null, null, WithdrawalRecordView.of(row), requestId.toString())
     }
 
     /** 새 실행의 일지 행을 적는다. 작업 지시는 picasso `JobOrder` 의 칸 그대로의 JSON 이다. */
@@ -1706,6 +1769,9 @@ class MissionHost(
      * 인스턴스의 취소 행이 있음)과 실행 일지에 없는 실행은 NOT_CANCELABLE 이다. 이 인스턴스가 정착을 적고 놓은 실행도 정착한 실행이라
      * NOT_CANCELABLE 이다(상태는 마지막 정착 이벤트의 것). 승인자는 사람이어야 한다(ADR 47 과 같은 규칙).
      * picasso 의 `cancel` 은 승인자를 받지 않으므로 이 판정은 호스트가 한다.
+     *
+     * `NOT_FOUND` 는 «그 실행이 지금 인스턴스에 없다» 일 뿐 그 작업 지시를 보내지 않았다는 증거가 아니다(값 없는 승인이 뒤에 실행을 세울 수 있다).
+     * 미실행 작업 지시를 폐기하는 취소를 만들면 같은 철회([withdraw])를 거친다.
      */
     fun cancel(executionId: String, approver: Approver, reason: String, requestId: String?): CancelView = lock.withLock {
         if (approver.kind != ApproverKind.PERSON) {
@@ -2454,6 +2520,9 @@ class MissionHost(
          * 뒤에 `: 작업 지시 id · 받은 인스턴스 실행 id` 가 붙는다.
          */
         const val JOURNALED_JOB_ORDER = "실행 일지에 이미 있는 작업 지시라 새 실행을 짓지 않는다"
+
+        /** 철회된 작업 지시([withdraw], B3)의 제출·값 없는 승인 거부 사유의 앞부분. 작업 지시 id, 철회한 쪽과 시각, 까닭이 뒤따른다. 다시 할 일은 새 작업 지시 id 로 낸다. */
+        const val WITHDRAWN_JOB_ORDER = "철회된 작업 지시다. 실행을 짓지 않는다"
 
         /**
          * 정착을 [recordedAt] 에 적은 [state] 의 실행을 [now] 에 놓을 때가 되었는가. `PHYSICALLY_DONE`·`ABORTED` 는 곧이고, `FAILED`·`UNVERIFIED` 는

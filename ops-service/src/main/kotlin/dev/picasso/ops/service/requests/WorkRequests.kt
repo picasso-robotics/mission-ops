@@ -49,6 +49,18 @@ data class WorkRequestUnassignment(val refusals:List<dev.picasso.ops.service.hos
  * that ended without executing. [externalOrderId] is the upstream's own identifier; [state] is that work request's current state.
  */
 data class WorkRequestLink(val receiptId:UUID, val externalOrderId:String, val state:String, val linkedAt:String)
+/**
+ * The execution host's answer to a job order withdrawal (B3, `POST /host/job-orders/{jobOrderId}/withdraw`). Only [Withdrawn] proves the job
+ * order was never sent and never will be: the host recorded the withdrawal under its own lock, and from then on refuses both a no-value
+ * approval and a new submission of it. [Executed]: the host has an execution of it in memory or in its journal (an approval may have run it
+ * without passing through ops); [execution] is the host's answer as stored on the work request. [Unknown]: no answer, an error status (the
+ * host answers 500 while its journal is blocked) or an unreadable body; the withdrawal may still have been recorded, so it proves nothing.
+ */
+sealed interface Withdrawal {
+ data class Withdrawn(val requestId:UUID):Withdrawal
+ data class Executed(val instanceId:String,val executionId:String,val robotId:String,val physicalState:String?,val execution:JsonNode):Withdrawal
+ data class Unknown(val cause:String):Withdrawal
+}
 /** Detail text for a host rejection: the host's own reason, so the stale pre-dispatch line never stands in for it. */
 fun rejectedDetail(outcome:dev.picasso.ops.service.host.HostSubmitOutcome?):String =
  "호스트 제출 거부: ${outcome?.rejectionReason?.takeIf{it.isNotBlank()} ?: "사유 없음"}".take(2000)
@@ -133,7 +145,7 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
   val insert = { jdbc.sql("""INSERT INTO ops.work_request(receipt_id,source_system_id,external_order_id,payload_hash,payload,job_order_id,state)
    VALUES(:id,:source,:external,:hash,CAST(:payload AS JSONB),:job,'RECEIVED') ON CONFLICT(source_system_id,external_order_id) DO NOTHING""")
    .param("id",id).param("source",source).param("external",external).param("hash",hash).param("payload",payload.toString()).param("job",jobId).update() }
-  val inserted = if(replaces==null) insert() else supersede(source,external,replaces,id,insert)
+  val inserted = if(replaces==null) insert() else supersede(source,external,replaces,id,actor.header(),insert)
   if (inserted == 0) {
    val old = jdbc.sql("SELECT receipt_id,payload_hash FROM ops.work_request WHERE source_system_id=:source AND external_order_id=:external")
     .param("source",source).param("external",external).query { rs, _ -> rs.getObject(1,UUID::class.java) to rs.getString(2) }.single()
@@ -168,31 +180,114 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
   * no result version) or closed by an operator (ACCEPTED, latest result version carries a closure of [CLOSED_KINDS]; the link then
   * records that version). In both cases no station run may still be open. Each side is linked at most once. A replay of the same new order returns 0 and is answered
   * by the caller's duplicate check, never judged again. A refusal records nothing, so the upstream can resend with the same id.
-  * The earlier order's state, detail and submission are never written here.
+  * The earlier order's state, detail and submission are never written here, except when the host shows it ran (below).
+  *
+  * An original closed without executing is proven unsent only by the execution host (B3): a no-value approval on the host can start it
+  * without passing through ops, and the result feed only speaks once a job response exists. So, still holding the original's row lock and
+  * after every check above, the host is asked to withdraw its job order, with a short time-out of its own ([HostReads.withdrawJobOrder]).
+  * Holding the lock costs a result collection waiting on that row the call's time: the request time-out plus, when the host does not
+  * accept the connection, the connect time-out counted apart (about 5 s by default). A withdrawal outside the lock could end with the
+  * original withdrawn and the replacement refused by a check that changed in between, an order nobody runs.
+  * - [Withdrawal.Withdrawn]: the new receipt and the link (with the host's withdrawal request id) commit together.
+  * - [Withdrawal.Executed]: the original is promoted to ACCEPTED with the host's execution, on the same basis as an observed execution (B2),
+  *   without inventing a job response or a result version. That promotion commits, then 409 `ORIGINAL_NOT_REPLACEABLE` names the execution
+  *   and robot. Thrown inside the transaction, the refusal would roll the promotion back.
+  * - [Withdrawal.Unknown]: 503 `WITHDRAWAL_UNCONFIRMED`, nothing written. The withdrawal may have been recorded; the upstream's resend
+  *   with the same id asks again and the host answers it idempotently. A database failure after a withdrawal never releases it.
+  * An operator-closed original ran and was closed; it calls nothing. A replay of the same new order calls nothing either.
   */
- private fun supersede(source:String,external:String,replaces:String,id:UUID,insert:()->Int):Int = transactions.execute {
-  val original=jdbc.sql("SELECT receipt_id FROM ops.work_request WHERE source_system_id=:source AND external_order_id=:replaces FOR UPDATE")
-   .param("source",source).param("replaces",replaces).query(UUID::class.java).optional().orElse(null)
-  if(jdbc.sql("SELECT count(*) FROM ops.work_request WHERE source_system_id=:source AND external_order_id=:external")
-   .param("source",source).param("external",external).query(Long::class.java).single()>0) return@execute 0
-  original ?: throw RequestRejected("ORIGINAL_NOT_FOUND","대체할 앞선 작업 요청을 이 출처에서 찾을 수 없습니다",409)
-  val receipt=get(original)
-  val ran=receipt.lastExecution!=null || jdbc.sql("SELECT count(*) FROM ops.work_result WHERE receipt_id=:id").param("id",original).query(Long::class.java).single()>0
-  val station=jdbc.sql("SELECT count(*) FROM ops.station_run WHERE receipt_id=:id AND state NOT IN ('COMPLETED','TIMED_OUT','REJECTED','MANUALLY_CLEARED','CANCELLED')")
-   .param("id",original).query(Long::class.java).single()>0
-  // An operator close of an execution the host could not restore ends in an UNVERIFIED result marked with a closure (defect 14).
-  val latest=storedResult(original,null)
-  val closed=receipt.state=="ACCEPTED" && ((latest?.get("snapshot") as? JsonNode)?.path("closure")?.path("kind")?.asText() in CLOSED_KINDS)
-  if(!((receipt.state in setOf("REJECTED","UNASSIGNED") && !ran) || closed) || station)
-   throw RequestRejected("ORIGINAL_NOT_REPLACEABLE","실행 없이 끝났거나 운영자가 종결한 앞선 작업 요청만 대체할 수 있습니다",409)
-  if(link(original,"original_receipt_id","replacement_receipt_id")!=null)
-   throw RequestRejected("ORIGINAL_ALREADY_REPLACED","앞선 작업 요청은 이미 다른 작업 요청으로 대체되었습니다",409)
-  val inserted=insert()
-  if(inserted==1) jdbc.sql("""INSERT INTO ops.work_request_supersession(original_receipt_id,replacement_receipt_id,source_system_id,original_state,original_result_version)
-   VALUES(:original,:id,:source,:state,:version)""").param("original",original).param("id",id).param("source",source).param("state",receipt.state)
-   .param("version",if(closed) latest!!["version"] as Int else null,java.sql.Types.INTEGER).update()
-  inserted
- }!!
+ private fun supersede(source:String,external:String,replaces:String,id:UUID,requestedBy:String,insert:()->Int):Int {
+  val (inserted,refusal)=transactions.execute<Pair<Int,RequestRejected?>> {
+   val original=jdbc.sql("SELECT receipt_id FROM ops.work_request WHERE source_system_id=:source AND external_order_id=:replaces FOR UPDATE")
+    .param("source",source).param("replaces",replaces).query(UUID::class.java).optional().orElse(null)
+   if(jdbc.sql("SELECT count(*) FROM ops.work_request WHERE source_system_id=:source AND external_order_id=:external")
+    .param("source",source).param("external",external).query(Long::class.java).single()>0) return@execute 0 to null
+   original ?: throw RequestRejected("ORIGINAL_NOT_FOUND","대체할 앞선 작업 요청을 이 출처에서 찾을 수 없습니다",409)
+   val receipt=get(original)
+   val ran=receipt.lastExecution!=null || jdbc.sql("SELECT count(*) FROM ops.work_result WHERE receipt_id=:id").param("id",original).query(Long::class.java).single()>0
+   val station=jdbc.sql("SELECT count(*) FROM ops.station_run WHERE receipt_id=:id AND state NOT IN ('COMPLETED','TIMED_OUT','REJECTED','MANUALLY_CLEARED','CANCELLED')")
+    .param("id",original).query(Long::class.java).single()>0
+   // An operator close of an execution the host could not restore ends in an UNVERIFIED result marked with a closure (defect 14).
+   val latest=storedResult(original,null)
+   val closed=receipt.state=="ACCEPTED" && ((latest?.get("snapshot") as? JsonNode)?.path("closure")?.path("kind")?.asText() in CLOSED_KINDS)
+   if(!((receipt.state in setOf("REJECTED","UNASSIGNED") && !ran) || closed) || station)
+    throw RequestRejected("ORIGINAL_NOT_REPLACEABLE","실행 없이 끝났거나 운영자가 종결한 앞선 작업 요청만 대체할 수 있습니다",409)
+   if(link(original,"original_receipt_id","replacement_receipt_id")!=null)
+    throw RequestRejected("ORIGINAL_ALREADY_REPLACED","앞선 작업 요청은 이미 다른 작업 요청으로 대체되었습니다",409)
+   // Always asked, submission or not: a source confirmation clears the submission of an original the host answered (V22).
+   val withdrawn=if(closed) null else when(val answer=withdraw(receipt.jobOrderId,id,"상위 시스템 대체 접수: $external",requestedBy)) {
+    is Withdrawal.Withdrawn -> answer.requestId
+    is Withdrawal.Executed -> {
+     promote(original,answer)
+     return@execute 0 to RequestRejected("ORIGINAL_NOT_REPLACEABLE",
+      "실행 호스트가 앞선 작업 요청의 작업 지시를 이미 실행했습니다(실행 ${answer.executionId}, 기체 ${answer.robotId}). 대체하지 않고 앞선 작업 요청을 수락으로 바꿨습니다",409)
+    }
+    is Withdrawal.Unknown -> throw RequestRejected("WITHDRAWAL_UNCONFIRMED",
+     "실행 호스트가 앞선 작업 요청의 작업 지시 철회를 확정하지 않아 대체를 접수하지 않았습니다(${answer.cause}). 같은 요청을 다시 보내십시오",503)
+   }
+   val inserted=insert()
+   if(inserted==1) jdbc.sql("""INSERT INTO ops.work_request_supersession(original_receipt_id,replacement_receipt_id,source_system_id,original_state,original_result_version,withdrawal_request_id)
+    VALUES(:original,:id,:source,:state,:version,:withdrawal)""").param("original",original).param("id",id).param("source",source).param("state",receipt.state)
+    .param("version",if(closed) latest!!["version"] as Int else null,java.sql.Types.INTEGER).param("withdrawal",withdrawn,java.sql.Types.OTHER).update()
+   inserted to null
+  }!!
+  refusal?.let{throw it}
+  return inserted
+ }
+ /**
+  * Asks the execution host to withdraw [jobOrderId] for good (B3) and reads its answer. Never inside a station lock; [supersede] calls it under
+  * the original's row lock, with the dedicated short time-out of [HostReads.withdrawJobOrder]. Only a 200 whose body names this job order and
+  * a known result counts; anything else is [Withdrawal.Unknown].
+  */
+ fun withdraw(jobOrderId:String,requestId:UUID,reason:String,requestedBy:String):Withdrawal {
+  val answered=when(val write=host.withdrawJobOrder(jobOrderId,requestId,reason,requestedBy)) {
+   is dev.picasso.ops.service.host.HostWrite.NoResponse -> return Withdrawal.Unknown(write.cause)
+   is dev.picasso.ops.service.host.HostWrite.Answered -> write
+  }
+  if(answered.status!=200) return Withdrawal.Unknown("HTTP ${answered.status}")
+  val body=runCatching{json.readTree(answered.body)}.getOrNull()?.takeIf{it.isObject && it.path("jobOrderId").asText()==jobOrderId}
+   ?: return Withdrawal.Unknown("본문 모양이 다르다")
+  fun text(key:String)=body.path(key).takeIf{it.isTextual && it.asText().isNotBlank()}?.asText()
+  return when(body.path("result").asText()) {
+   "WITHDRAWN" -> body.path("withdrawal").path("requestId").takeIf{it.isTextual}?.asText()?.let{runCatching{UUID.fromString(it)}.getOrNull()}
+    ?.let{Withdrawal.Withdrawn(it)} ?: Withdrawal.Unknown("철회 행이 없다")
+   "EXECUTION_EXISTS" -> {
+    val instance=text("instanceId");val execution=text("executionId");val robot=text("robotId")
+    if(instance==null || execution==null || robot==null) return Withdrawal.Unknown("실행 칸이 없다")
+    val seen=json.createObjectNode().put("executionId",execution).put("jobOrderId",jobOrderId).put("robotId",robot).put("physicalState",text("physicalState"))
+     .put("instanceId",instance).put("observedBy","WITHDRAWAL")
+    Withdrawal.Executed(instance,execution,robot,text("physicalState"),seen)
+   }
+   else -> Withdrawal.Unknown("모르는 결과다")
+  }
+ }
+ /**
+  * Station proof that work request [receipt] was never sent (B3): withdraws its job order on the host outside any lock. An execution the host
+  * reports instead promotes the receipt to ACCEPTED under its row lock, as [supersede] does. The request id is derived from the receipt, so a
+  * repeat asks the same withdrawal again; the host answers per job order either way.
+  */
+ fun withdrawUnsent(receipt:Receipt,reason:String,requestedBy:String):Withdrawal {
+  val answer=withdraw(receipt.jobOrderId,UUID.nameUUIDFromBytes("withdraw/${receipt.receiptId}".toByteArray()),reason,requestedBy)
+  if(answer is Withdrawal.Executed) transactions.executeWithoutResult {
+   jdbc.sql("SELECT receipt_id FROM ops.work_request WHERE receipt_id=:id FOR UPDATE").param("id",receipt.receiptId).query(UUID::class.java).single()
+   promote(receipt.receiptId,answer)
+  }
+  return answer
+ }
+ /**
+  * Records the host's [executed] answer on the locked receipt [id]: an UNASSIGNED or REJECTED (or uncertain) answer whose job order the host ran
+  * moves to ACCEPTED, the same basis and detail as an observed execution (B2). The execution is stored only when none was observed yet; no job
+  * response and no result version are written. Caller holds the row lock.
+  */
+ private fun promote(id:UUID,executed:Withdrawal.Executed) {
+  jdbc.sql("""UPDATE ops.work_request SET last_execution=COALESCE(last_execution,CAST(:execution AS JSONB)),
+    execution_observed_at=CASE WHEN last_execution IS NULL THEN clock_timestamp() ELSE execution_observed_at END,
+    execution_instance_id=CASE WHEN last_execution IS NULL THEN :instance ELSE execution_instance_id END,
+    $OBSERVED_DETAIL,
+    state=CASE WHEN state IN $PROMOTED THEN 'ACCEPTED' ELSE state END,updated_at=clock_timestamp() WHERE receipt_id=:id""")
+   .param("execution",executed.execution.toString()).param("instance",executed.instanceId)
+   .param("observedExecution",executed.executionId).param("observedRobot",executed.robotId).param("id",id).update()
+ }
  /** The other side of this receipt's supersession: [self] names this receipt's column, [other] the column read back. */
  private fun link(id:UUID,self:String,other:String):WorkRequestLink? =
   jdbc.sql("""SELECT r.receipt_id,r.external_order_id,r.state,s.created_at FROM ops.work_request_supersession s

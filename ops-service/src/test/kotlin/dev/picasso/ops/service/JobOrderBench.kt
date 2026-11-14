@@ -22,6 +22,7 @@ import java.time.Clock
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneOffset
+import java.util.UUID
 
 /**
  * 배정 가능·제출 시험의 대역 세트. registry 읽기와 실행 호스트를 기존 시험처럼 인터페이스 대역으로 끼운다.
@@ -65,6 +66,17 @@ class JobOrderBench {
     /** 제출마다 실린 출발 자리 확인. [submitted] 와 같은 순서다. */
     val confirmed = mutableListOf<List<HostSourceConfirmation>>()
 
+    /**
+     * 작업 지시 철회(B3)의 호스트 답. `null` 이면 실행 호스트처럼 작업 지시마다 처음 요청 id 의 WITHDRAWN 이다. 받은 (작업 지시, 요청 id)는
+     * [withdrawCalls] 에 남는다.
+     */
+    var withdraw: ((String, UUID) -> HostWrite)? = null
+    val withdrawCalls: MutableList<Pair<String, UUID>> = java.util.Collections.synchronizedList(mutableListOf())
+
+    /** 철회마다 실린 (부른 쪽, 까닭). [withdrawCalls] 와 같은 순서다. */
+    val withdrawAsked: MutableList<Pair<String, String>> = java.util.Collections.synchronizedList(mutableListOf())
+    private val withdrawn = java.util.concurrent.ConcurrentHashMap<String, UUID>()
+
     /** 호스트 대역. 읽기와 제출이 이 벤치의 칸을 쓴다. */
     inner class FakeHost : HostReads, HostWrites {
         override fun eligibility(jobOrder: ObjectNode, robotIds: List<String>): HostCall<List<HostEligibility>> {
@@ -87,6 +99,13 @@ class JobOrderBench {
         override fun executionSummary(): HostCall<JsonNode> = summary.also { pageCalls += "summary" }
 
         override fun cell(): HostCall<JsonNode> = this@JobOrderBench.cell
+
+        override fun withdrawJobOrder(jobOrderId: String, requestId: UUID, reason: String, requestedBy: String): HostWrite {
+            withdrawCalls += jobOrderId to requestId
+            withdrawAsked += requestedBy to reason
+            withdraw?.let { return it(jobOrderId, requestId) }
+            return HostWrite.Answered(200, withdrawnBody(jobOrderId, withdrawn.getOrPut(jobOrderId) { requestId }, requestId))
+        }
 
         override fun workPermits(): HostCall<JsonNode> = this@JobOrderBench.workPermits
 
@@ -149,6 +168,16 @@ class JobOrderBench {
 
         fun running(id: String, executionId: String) =
             HostEligibility(id, HostSkillFit.FIT, emptyList(), executionId, false, listOf("진행 중인 실행이 있다: $executionId"))
+
+        /** 실행 호스트의 철회 WITHDRAWN 본문. [stored] 는 저장된 행의 요청 id, [requestId] 는 이번 요청의 것이다. */
+        fun withdrawnBody(jobOrderId: String, stored: UUID, requestId: UUID = stored) =
+            """{"result":"WITHDRAWN","jobOrderId":"$jobOrderId","instanceId":null,"executionId":null,"robotId":null,"physicalState":null,""" +
+                """"withdrawal":{"requestId":"$stored","requestedBy":"ops","reason":"r","withdrawnAt":"2026-10-08T00:00:00Z"},"requestId":"$requestId"}"""
+
+        /** 실행 호스트의 철회 EXECUTION_EXISTS 본문. */
+        fun executionExistsBody(jobOrderId: String, executionId: String = "exec-9", robotId: String = HUMANOID) =
+            """{"result":"EXECUTION_EXISTS","jobOrderId":"$jobOrderId","instanceId":"mw-1","executionId":"$executionId","robotId":"$robotId",""" +
+                """"physicalState":"RUNNING","withdrawal":null,"requestId":"${UUID.randomUUID()}"}"""
 
         fun accepted(robotId: String) =
             """{"result":"ACCEPTED","executionId":"exec-1","robotId":"$robotId","rejectionReason":null,"refusals":[],"excluded":[]}"""
