@@ -1,5 +1,6 @@
 package dev.picasso.ops.service.operations
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.core.JacksonException
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -14,9 +15,17 @@ import java.util.UUID
 /**
  * 호스트가 4xx 로 막은 조작의 응답. 본문 `{error, detail}` 을 옮긴다. 본문을 못 읽으면 두 칸이 널이다.
  *
+ * [fields] 는 4xx 본문 객체의 `error`·`detail` 밖의 칸이다. 그런 칸이 없으면 널이고 응답 JSON 에 싣지 않는다. 빈손 확인의 409
+ * `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 는 여기에 `robotId`·`markerId`·`conflictRequestId`·`observation` 을 실어 화면이 다시 확인할 지목을 만든다(B2).
+ *
  * 신호 조작에서는 현장 셀 대역의 거부(안전 신호 쓰기 등)가 호스트를 거쳐 그대로 여기에 온다(ADR 32).
  */
-data class HostRejection(val status: Int, val error: String?, val detail: String?)
+data class HostRejection(
+    val status: Int,
+    val error: String?,
+    val detail: String?,
+    @get:JsonInclude(JsonInclude.Include.NON_NULL) val fields: JsonNode? = null,
+)
 
 /**
  * 응답 없음 뒤 재조회의 판정.
@@ -111,10 +120,12 @@ class HostOperationRunner(
             }
             in 400..499 -> {
                 record(OperationResult.REJECTED, responseJson)
+                val rest = (body?.deepCopy<JsonNode>() as? ObjectNode)?.apply { remove(listOf("error", "detail")) }?.takeIf { !it.isEmpty }
                 val rejection = HostRejection(
                     write.status,
                     body?.get("error")?.takeIf { it.isTextual }?.asText(),
                     body?.get("detail")?.takeIf { it.isTextual }?.asText(),
+                    rest,
                 )
                 HostOperationResult(requestId, OperationResult.REJECTED, null, null, rejection)
             }

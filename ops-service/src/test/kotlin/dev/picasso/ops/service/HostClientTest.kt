@@ -278,6 +278,34 @@ class HostClientTest {
     }
 
     @Test
+    fun `빈손 확인은 지목이 있을 때만 본문에 싣고 표시 조회는 404 RESIDUAL_HOLD_NOT_FOUND 만 없음으로 읽는다`() {
+        val requestId = UUID.randomUUID()
+        val record = """{"hold":{"markerId":7},"clearing":null}"""
+        val client = serve(
+            "/host/robots/humanoid-01/residual-holds/7/clear" to (200 to """{"hold":{},"clearing":{},"requestId":"$requestId"}"""),
+            "/host/robots/humanoid-01/residual-holds/8/clear" to (409 to """{"error":"RESIDUAL_HOLD_OBSERVATION_MISMATCH","detail":"x"}"""),
+            "/host/robots/humanoid-01/residual-holds/7" to (200 to record),
+            "/host/robots/humanoid-01/residual-holds/9" to (404 to """{"error":"RESIDUAL_HOLD_NOT_FOUND","detail":"x"}"""),
+            "/host/robots/humanoid-01/residual-holds/10" to (404 to """{"error":"OTHER","detail":"x"}"""),
+            "/host/robots/humanoid-01/residual-holds/11" to (500 to ""),
+        )
+        assertEquals(200, assertIs<HostWrite.Answered>(client.clearResidualHold("humanoid-01", 7, "kim", "r", requestId)).status)
+        assertEquals(
+            json.readTree("""{"approverId":"kim","reason":"r","requestId":"$requestId"}"""),
+            json.readTree(seen.getValue("/host/robots/humanoid-01/residual-holds/7/clear").third),
+        )
+        val cited = json.readTree("""{"conflictRequestId":"$requestId","kind":"HOLDING","objectRef":null,"session":"s","sequence":3}""")
+        assertEquals(409, assertIs<HostWrite.Answered>(client.clearResidualHold("humanoid-01", 8, "kim", "r", requestId, cited)).status)
+        assertEquals(cited, json.readTree(seen.getValue("/host/robots/humanoid-01/residual-holds/8/clear").third)["cited"])
+
+        assertEquals(json.readTree(record), assertIs<HostCall.Ok<*>>(client.residualHold("humanoid-01", 7)).value)
+        assertEquals("GET", seen.getValue("/host/robots/humanoid-01/residual-holds/7").first)
+        assertEquals(HostCall.Ok(null), client.residualHold("humanoid-01", 9))
+        assertIs<HostCall.Silent>(client.residualHold("humanoid-01", 10))
+        assertIs<HostCall.Silent>(client.residualHold("humanoid-01", 11))
+    }
+
+    @Test
     fun `작업 허가는 GET host work-permits 본문 그대로이고 200 아님은 모름이다`() {
         val body = """{"declared":true,"robots":[{"robotId":"r1","permit":"INHIBITED","reasons":[]}]}"""
         val client = serve("/host/work-permits" to (200 to body))

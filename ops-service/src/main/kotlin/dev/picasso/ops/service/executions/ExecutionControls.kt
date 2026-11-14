@@ -3,6 +3,7 @@ package dev.picasso.ops.service.executions
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import dev.picasso.ops.service.actor.Actor
 import dev.picasso.ops.service.host.HostCall
@@ -71,10 +72,12 @@ data class ExecutionCloseOutcome(
 )
 
 /**
- * 잔여 파지 표시 해소(기체 빈손 확인)의 200 응답(P0-b2).
+ * 잔여 파지 표시 해소(기체 빈손 확인)의 200 응답(P0-b2, B2).
  *
- * @param result 호스트가 해소하면 성공, 404 `RESIDUAL_HOLD_NOT_FOUND`·409 `RESIDUAL_HOLD_ALREADY_CLEARED` 는 거부다
+ * @param result 호스트가 해소하면 성공, 404 `RESIDUAL_HOLD_NOT_FOUND`·409 `RESIDUAL_HOLD_ALREADY_CLEARED`·409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`·
+ *   400 `RESIDUAL_HOLD_CITATION_INVALID` 는 거부다
  * @param answer 호스트의 200 본문(해소한 표시와 해소 행) 그대로
+ * @param rejection 호스트 4xx. 어긋남(409)이면 [HostRejection.fields] 에 `conflictRequestId`·`observation` 이 있어 화면이 다시 확인할 지목을 만든다
  */
 data class RobotEmptyOutcome(
     val requestId: UUID,
@@ -97,8 +100,10 @@ data class RobotEmptyOutcome(
  * 다르면 호스트가 그 사이 재기동한 것이라 확인하지 못한다(널).
  *
  * 빈손 확인: 정착할 때 로봇 단위의 마지막 파지 관측이 HOLDING 이던 기체에 호스트가 표시를 세우고, 표시가 있는 동안 그 기체를
- * 배정에서 뺀다. 사람이 현장에서 빈손을 확인해야 푼다. 응답 없음 뒤 재조회는 미해소 표시 목록으로 한다. 그 표시가 목록에 없으면
- * 반영됨이다(누가 풀었는지는 호스트의 해소 행이 말한다).
+ * 배정에서 뺀다. 사람이 현장에서 빈손을 확인해야 푼다. 호스트는 확인할 때 기체 스냅숏을 지금 읽고, 발신자가 지금 든 채라고 말하면 해소하지 않고
+ * 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 로 그 관측(충돌)을 돌려준다(B2). 다시 확인하려면 운영자가 그 충돌을 요청 본문의 `cited` 로 지목한다 —
+ * `cited` 는 요청 본문에서만 오고 운영 서비스가 호스트 응답이나 목록으로 채우지 않는다. 응답 없음 뒤 재조회는 그 표시 하나의 조회(표시와 해소 행)로
+ * 하고 다시 보내지 않는다. 해소 행의 요청 id 가 이 요청의 것일 때만 반영됨이고, 해소 행이 없거나 다른 요청의 해소면 반영 안 됨이다.
  *
  * 복원 못 한 실행의 종결(결함 14): 기동 복원이 GAVE_UP 이나 DEFERRED 로 남긴 일지 행을 운영자가 끝낸다. 호스트가 일지 이벤트와 UNVERIFIED 종결 응답을 한
  * 트랜잭션으로 적고 운영 서비스는 그것을 보통의 결과 수집으로 모은다. 작업 요청 상태 집합은 그대로이고 종결 응답의 `closure` 표시가 결과 버전에 실린다
@@ -193,18 +198,21 @@ class ExecutionControls(
         return ExecutionCloseOutcome(ran.requestId, jobOrderId, ran.result, ran.confirmation, outcome, ran.body, ran.rejection)
     }
 
-    /** [reason] 은 컨트롤러가 비어 있지 않음을 본 값이다. */
-    fun confirmEmpty(actor: Actor, robotId: String, markerId: Long, reason: String): RobotEmptyOutcome {
+    /**
+     * [reason] 은 컨트롤러가 비어 있지 않음을, [cited] 는 모양을 본 값이다. [cited] 는 운영자 요청 본문의 지목 그대로이고 조작 기록의 요청 칸에도 남는다.
+     */
+    fun confirmEmpty(actor: Actor, robotId: String, markerId: Long, reason: String, cited: ObjectNode? = null): RobotEmptyOutcome {
         val request = json.createObjectNode()
             .put("op", CONFIRM_EMPTY_OP)
             .put("robotId", robotId)
             .put("markerId", markerId)
             .put("approverId", actor.user)
+        if (cited != null) request.set<JsonNode>("cited", cited)
         val ran = runner.run(
             actor, "$robotId/$markerId", request, reason,
             accepted = { body -> if (body.path("clearing").isObject) OperationResult.SUCCEEDED else null },
-            recheck = { recheckClear(markerId) },
-        ) { requestId -> host.clearResidualHold(robotId, markerId, actor.user, reason, requestId) }
+            recheck = { requestId -> recheckClear(robotId, markerId, requestId) },
+        ) { requestId -> host.clearResidualHold(robotId, markerId, actor.user, reason, requestId, cited) }
         return RobotEmptyOutcome(ran.requestId, robotId, markerId, ran.result, ran.confirmation, ran.body, ran.rejection)
     }
 
@@ -236,10 +244,14 @@ class ExecutionControls(
         }
     }
 
-    private fun recheckClear(markerId: Long): HostRecheck? {
-        val holds = (host.residualHolds() as? HostCall.Ok)?.value?.path("holds")?.takeIf { it.isArray } ?: return null
-        val open = holds.firstOrNull { it.path("markerId").asLong() == markerId }
-        return HostRecheck(open == null, open)
+    /** 읽기만 한다. 해소 행의 요청 id 가 [requestId] 일 때만 반영됨이다(다른 요청의 해소는 이 요청의 반영이 아니다). */
+    private fun recheckClear(robotId: String, markerId: Long, requestId: UUID): HostRecheck? = when (val call = host.residualHold(robotId, markerId)) {
+        is HostCall.Silent -> null
+        is HostCall.Ok -> {
+            val record = call.value
+            val clearing = record?.path("clearing")?.takeIf { it.isObject }
+            HostRecheck(clearing != null && clearing.path("requestId").asText() == requestId.toString(), record)
+        }
     }
 
     private fun instant(node: JsonNode): Instant? =

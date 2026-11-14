@@ -3,6 +3,7 @@ package dev.picasso.ops.service.web
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import dev.picasso.ops.service.actor.Actor
 import dev.picasso.ops.service.actor.Mode
 import dev.picasso.ops.service.executions.ExecutionControls
@@ -98,7 +99,12 @@ class ExecutionControlController(private val controls: ExecutionControls) {
         ResponseEntity.ok(controls.close(actor, jobOrderId, instanceId, executionId, reason, attested))
     }
 
-    /** 본문 `{reason}`. [markerId] 는 미해소 표시 목록의 `markerId` 다. */
+    /**
+     * 본문 `{reason, cited?}`. [markerId] 는 미해소 표시 목록의 `markerId` 다. `cited` 는 실행 호스트가 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 로 돌려준
+     * 충돌을 다시 확인할 때 지목하는 것이다(B2): `{conflictRequestId, kind, objectRef?, session?, sequence?}`. `conflictRequestId` 는 UUID 문자열, `kind` 는
+     * 비어 있지 않은 문자열, `objectRef`·`session` 은 문자열이나 널, `sequence` 는 10진 정수 문자열(관측 JSON 그대로)이나 정수나 널이다. 모양이 틀리면 400 `CLEAR_BAD_REQUEST` 다. 이 칸은 요청
+     * 본문에서만 오고 운영 서비스가 채우지 않는다. 그 칸만 옮겨 호스트에 보낸다.
+     */
     @PostMapping("/api/robots/{robotId}/residual-holds/{markerId}/clear", consumes = [MediaType.APPLICATION_JSON_VALUE])
     fun clear(
         @PathVariable robotId: String,
@@ -109,8 +115,36 @@ class ExecutionControlController(private val controls: ExecutionControls) {
     ): ResponseEntity<Any> = guarded(mode, user, Mode.OPERATOR) { actor ->
         val id = markerId.toLongOrNull()?.takeIf { it > 0 }
             ?: return@guarded reject(HttpStatus.BAD_REQUEST, CLEAR_BAD_REQUEST, "markerId 는 양의 정수다: $markerId")
-        val reason = reason(read(body)) ?: return@guarded reject(HttpStatus.BAD_REQUEST, REASON_REQUIRED, "빈손 확인 사유가 없다")
-        ResponseEntity.ok(controls.confirmEmpty(actor, robotId, id, reason))
+        val node = read(body)
+        val cited = node?.get("cited")?.takeUnless { it.isNull }?.let { cited(it) ?: return@guarded reject(HttpStatus.BAD_REQUEST, CLEAR_BAD_REQUEST, CITED_SHAPE) }
+        val reason = reason(node) ?: return@guarded reject(HttpStatus.BAD_REQUEST, REASON_REQUIRED, "빈손 확인 사유가 없다")
+        ResponseEntity.ok(controls.confirmEmpty(actor, robotId, id, reason, cited))
+    }
+
+    /** 모양이 맞으면 지목의 다섯 칸만 옮긴 새 객체, 아니면 널이다. */
+    private fun cited(node: JsonNode): ObjectNode? {
+        if (!node.isObject) return null
+        val conflict = text(node, "conflictRequestId")?.takeIf { runCatching { java.util.UUID.fromString(it) }.isSuccess } ?: return null
+        val kind = text(node, "kind") ?: return null
+        val copy = json.createObjectNode().put("conflictRequestId", conflict).put("kind", kind)
+        for (field in listOf("objectRef", "session")) {
+            val value = node.get(field)
+            when {
+                value == null || value.isNull -> copy.putNull(field)
+                value.isTextual -> copy.put(field, value.asText())
+                else -> return null
+            }
+        }
+        // 순번은 10진 문자열로 받고 그대로 넘긴다(2^53 을 넘어도 바뀌지 않게). 하위 호환으로 JSON 정수도 받는다.
+        val sequence = node.get("sequence")
+        when {
+            sequence == null || sequence.isNull -> copy.putNull("sequence")
+            sequence.isTextual && Regex("-?[0-9]{1,19}").matches(sequence.asText()) && sequence.asText().toLongOrNull() != null ->
+                copy.put("sequence", sequence.asText())
+            sequence.isIntegralNumber && sequence.canConvertToLong() -> copy.put("sequence", sequence.asLong())
+            else -> return null
+        }
+        return copy
     }
 
     private fun read(body: ByteArray?): JsonNode? = body?.let { runCatching { json.readTree(it) }.getOrNull() }?.takeIf { it.isObject }
@@ -143,6 +177,8 @@ class ExecutionControlController(private val controls: ExecutionControls) {
         const val CLEAR_BAD_REQUEST = "CLEAR_BAD_REQUEST"
         const val RELEASE_BAD_REQUEST = "RELEASE_BAD_REQUEST"
         const val CLOSE_BAD_REQUEST = "CLOSE_BAD_REQUEST"
+        const val CITED_SHAPE =
+            "cited 는 객체이고 conflictRequestId 는 UUID 문자열, kind 는 비어 있지 않은 문자열, objectRef·session 은 문자열이나 null, sequence 는 10진 정수 문자열이나 정수나 null 이다"
         const val SAW_FAULTS_SHAPE =
             "sawFaults 는 비어 있지 않은 배열이고 원소마다 errorType 은 비어 있지 않은 문자열, references 는 {key, value} 객체의 배열이다"
 

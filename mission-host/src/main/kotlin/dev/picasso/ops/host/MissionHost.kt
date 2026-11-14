@@ -58,6 +58,7 @@ import dev.picasso.ops.host.store.CancelRow
 import dev.picasso.ops.host.store.CloseRow
 import dev.picasso.ops.host.store.CopyResolutionRow
 import dev.picasso.ops.host.store.FaultReleaseRow
+import dev.picasso.ops.host.store.HoldObservation
 import dev.picasso.ops.host.store.HostRecords
 import dev.picasso.ops.host.store.IncidentCopyRow
 import dev.picasso.ops.host.store.JournalEvent
@@ -67,6 +68,7 @@ import dev.picasso.ops.host.store.MissionStore
 import dev.picasso.ops.host.store.ResponseContent
 import dev.picasso.ops.host.store.ResponseDisposition
 import dev.picasso.ops.host.store.ResponseLogRow
+import dev.picasso.ops.host.store.ResidualHoldConflictRow
 import dev.picasso.ops.host.store.ResidualHoldRow
 import dev.picasso.ops.host.store.SettledRow
 import org.slf4j.LoggerFactory
@@ -1807,16 +1809,126 @@ class MissionHost(
     fun residualHolds(): ResidualHoldsView = lock.withLock { ResidualHoldsView(openHolds.map(ResidualHoldView::of)) }
 
     /**
-     * 잔여 파지 표시 해소(P0-b2). 사람이 그 기체가 빈손임을 현장에서 확인했다는 기록을 적고 판정이 읽는 사본에서 뺀다. 원본은 DB 라
+     * 잔여 파지 표시 해소(P0-b2, B2). 사람이 그 기체가 빈손임을 현장에서 확인했다는 기록을 적고 판정이 읽는 사본에서 뺀다. 원본은 DB 라
      * 사본에 없더라도 DB 로 판정한다. 그 기체의 표시가 아니면 NotFound, 이미 해소했으면 AlreadyCleared 다. 승인자는 사람이어야 한다.
+     *
+     * 해소하기 전에 그 기체의 스냅숏을 지금 한 번 읽는다([HostRobotPort.snapshot] 은 미리 읽은 값을 쓰지 않는다). 발신자가 지금 든 채(HOLDING)라고
+     * 말하면 해소하지 않는다 — 그 관측을 충돌 행으로 적고(V15) [ClearOutcome.ObservationMismatch] 다. 사람이 현장에서 빈손을 확인했으면 그 저장된 충돌을
+     * [cited] 로 지목해 새 요청 id 로 다시 확인한다. 순서는 이렇다.
+     *
+     * 1. 같은 [requestId] 의 충돌 행이 있으면 그 저장된 충돌을 그대로 돌려준다(재전송·재기동 뒤에도 같다. 새 행 없음). 다른 표시의 충돌이면 RequestReused 다. 다른 표시의 해소 행에 쓴 요청 id 도 RequestReused 다.
+     * 2. [cited] 가 있으면 저장된 충돌과 대조한다: 있고, 같은 표시이고, 같은 승인자이고, 관측 키(종류·물품·세션·순번, 널끼리 같음)가 같아야 한다.
+     *    하나라도 어긋나면 CitationInvalid 이고 아무것도 적지 않는다.
+     * 3. 스냅숏을 읽는다. 못 읽으면 `UNREADABLE`, 발신자가 손을 말하지 않으면 `UNSPECIFIED`, 관측 불가면 `NOT_OBSERVABLE` 이다.
+     * 4. 지금 HOLDING 이 아니면 해소한다(어긋남 인지 없음). 지목이 있었으면 그 충돌을 해소 행에 잇는다.
+     *    지금 HOLDING 이고 지목한 충돌과 같은 손이면(물품이 같고, 세션이 둘 다 미상이거나 같은 세션에서 순번이 뒤로 가지 않았으면) 어긋남을 알고 해소한다.
+     *    지금 HOLDING 이고 지목이 없거나 손이 다르면 이번 요청 id 로 새 충돌 행을 적고 ObservationMismatch 다. 표시는 그대로다.
+     *
+     * [requestId] 가 없으면 호스트가 만든다(해소 행과 충돌 행은 요청 id 가 필수다).
      */
-    fun clearResidualHold(robotId: String, markerId: Long, approver: Approver, reason: String, requestId: String?): ClearOutcome = lock.withLock {
+    fun clearResidualHold(
+        robotId: String,
+        markerId: Long,
+        approver: Approver,
+        reason: String,
+        requestId: String?,
+        cited: CitedConflict? = null,
+    ): ClearOutcome = lock.withLock {
         if (approver.kind != ApproverKind.PERSON) return@withLock ClearOutcome.Refused("$AGENT_CLEAR_REFUSED: ${approver.id}")
         val (hold, clearing) = records.residualHold(markerId)?.takeIf { it.first.robotId == robotId } ?: return@withLock ClearOutcome.NotFound
         if (clearing != null) return@withLock ClearOutcome.AlreadyCleared(ResidualHoldClearingView.of(clearing))
-        val cleared = records.clearResidualHold(markerId, approver.id, approver.kind.name, reason)
+        val request = requestId?.let(UUID::fromString) ?: UUID.randomUUID()
+        records.residualHoldConflict(request)?.let { stored ->
+            if (stored.markerId != markerId) {
+                return@withLock ClearOutcome.RequestReused("요청 id $request 는 잔여 파지 표시 ${stored.markerId} 의 충돌에 이미 썼다")
+            }
+            return@withLock mismatch(stored, robotId)
+        }
+        records.residualHoldClearingMarker(request)?.let { other ->
+            return@withLock ClearOutcome.RequestReused("요청 id $request 는 잔여 파지 표시 $other 의 해소에 이미 썼다")
+        }
+        val conflict = cited?.let { key ->
+            val stored = records.residualHoldConflict(key.conflictRequestId)
+                ?: return@withLock ClearOutcome.CitationInvalid("지목한 충돌 ${key.conflictRequestId} 가 없다")
+            citationProblem(stored, key, markerId, approver.id)?.let { return@withLock ClearOutcome.CitationInvalid(it) }
+            stored
+        }
+        val observation = observeHand(robotId)
+        val holding = observation.observedKind == HAND_HOLDING
+        if (holding && (cited == null || !sameHand(cited, observation))) {
+            return@withLock mismatch(records.recordResidualHoldConflict(request, markerId, approver.id, approver.kind.name, reason, observation), robotId)
+        }
+        val cleared = records.clearResidualHold(markerId, approver.id, approver.kind.name, reason, request, observation, conflict?.requestId, holding)
         openHolds.removeAll { it.markerId == markerId }
-        ClearOutcome.Cleared(ResidualHoldClearedView(ResidualHoldView.of(hold), ResidualHoldClearingView.of(cleared), requestId))
+        ClearOutcome.Cleared(ResidualHoldClearedView(ResidualHoldView.of(hold), ResidualHoldClearingView.of(cleared), request.toString()))
+    }
+
+    /**
+     * 표시 하나와 그 해소 행(B2). 호스트 잠금 아래에서 읽는다 — 해소는 잠금 안에서 스냅숏을 읽느라 늦을 수 있고, 잠금 없이 읽으면 응답 없음 뒤 재조회가
+     * 처리 중인 해소를 «해소 행 없음» 으로 확정한다. 그 기체의 표시가 아니면 `null` 이다.
+     */
+    fun residualHoldRecord(robotId: String, markerId: Long): ResidualHoldRecordView? = lock.withLock {
+        records.residualHold(markerId)?.takeIf { it.first.robotId == robotId }
+            ?.let { (hold, clearing) -> ResidualHoldRecordView(ResidualHoldView.of(hold), clearing?.let(ResidualHoldClearingView::of)) }
+    }
+
+    private fun mismatch(stored: ResidualHoldConflictRow, robotId: String) =
+        ClearOutcome.ObservationMismatch(stored.requestId.toString(), stored.observation, stored.markerId, robotId)
+
+    /** 지목이 저장된 충돌과 어긋나는 까닭. 맞으면 `null` 이다. */
+    private fun citationProblem(stored: ResidualHoldConflictRow, cited: CitedConflict, markerId: Long, approverId: String): String? {
+        val seen = stored.observation
+        return when {
+            stored.markerId != markerId -> "지목한 충돌 ${stored.requestId} 는 잔여 파지 표시 ${stored.markerId} 의 것이다"
+            stored.approverId != approverId -> "지목한 충돌 ${stored.requestId} 는 다른 승인자(${stored.approverId})의 확인이다. 다시 확인하는 사람이 그 충돌을 받은 사람이어야 한다"
+            seen.observedKind != cited.kind || seen.observedObjectRef != cited.objectRef ||
+                seen.snapshotSession != cited.session || seen.snapshotSequence != cited.sequence ->
+                "지목한 관측이 저장된 충돌 ${stored.requestId} 와 다르다(저장값: ${seen.observedKind} ${seen.observedObjectRef} ${seen.snapshotSession} ${seen.snapshotSequence})"
+            else -> null
+        }
+    }
+
+    /**
+     * 지금 HOLDING 인 손이 지목한 충돌의 손과 같은가. 물품 이름은 널끼리 같고 한쪽만 널이면 다르다. 세션은 둘 다 미상이면 막지 않고(순번 역행 검사 생략)
+     * 한쪽만 미상이면 다르며, 둘 다 있으면 같아야 하고 지금 순번이 지목한 순번보다 뒤로 가지 않아야 한다.
+     */
+    private fun sameHand(cited: CitedConflict, now: HoldObservation): Boolean {
+        if (cited.kind != HAND_HOLDING || now.observedKind != HAND_HOLDING || cited.objectRef != now.observedObjectRef) return false
+        val session = cited.session
+        val current = now.snapshotSession
+        if (session == null || current == null) return session == null && current == null
+        val from = cited.sequence ?: return false
+        val at = now.snapshotSequence ?: return false
+        return session == current && at >= from
+    }
+
+    /** 그 기체의 스냅숏을 지금 한 번 읽어 손을 관측 칸 여덟로 옮긴다. 읽기 시작과 수신은 호스트 시계다. */
+    private fun observeHand(robotId: String): HoldObservation {
+        val startedAt = clock.now()
+        fun unreadable(detail: String) = HoldObservation(HAND_UNREADABLE, null, detail, null, null, null, startedAt, clock.now())
+        val snapshot = try {
+            robots.snapshot(robotId)
+        } catch (e: RuntimeException) {
+            return unreadable("스냅숏 읽기 실패: ${e.message ?: e.javaClass.simpleName}")
+        } ?: return unreadable("스냅숏을 읽지 못했다")
+        val receivedAt = clock.now()
+        val hold = snapshot.hold
+        val kind = when (hold?.kind) {
+            HoldKind.HOLD_KIND_HOLDING -> HAND_HOLDING
+            HoldKind.HOLD_KIND_EMPTY -> "EMPTY"
+            HoldKind.HOLD_KIND_NOT_OBSERVABLE -> "NOT_OBSERVABLE"
+            else -> "UNSPECIFIED"
+        }
+        return HoldObservation(
+            observedKind = kind,
+            observedObjectRef = hold?.objectRef?.takeIf { kind == HAND_HOLDING && it.isNotEmpty() },
+            observedDetail = hold?.reason?.takeIf { kind == "NOT_OBSERVABLE" && it.isNotEmpty() },
+            snapshotSession = snapshot.session.takeIf { it.isNotEmpty() },
+            snapshotSequence = snapshot.sequence,
+            snapshotOccurredAt = snapshot.occurredAt,
+            hostReadStartedAt = startedAt,
+            hostReadReceivedAt = receivedAt,
+        )
     }
 
     /**
@@ -2385,6 +2497,10 @@ class MissionHost(
 
         /** 에이전트 승인자의 취소·해소 거부 사유의 앞부분. 뒤에 승인자 id 가 붙는다. */
         const val AGENT_CANCEL_REFUSED = "에이전트는 실행을 취소하지 못한다. 실행 중단은 사람의 것이다"
+        /** 빈손 확인 관측의 종류 이름(V15 `observed_kind`). */
+        const val HAND_HOLDING = "HOLDING"
+        const val HAND_UNREADABLE = "UNREADABLE"
+
         const val AGENT_CLEAR_REFUSED = "에이전트는 잔여 파지 표시를 해소하지 못한다. 기체가 빈손인지는 사람이 현장에서 확인한다"
         const val AGENT_RELEASE_REFUSED = "에이전트는 결함을 수용하지 못한다. 결함을 안고 계속할지는 사람이 현장에서 정한다"
 

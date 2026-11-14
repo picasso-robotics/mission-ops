@@ -438,7 +438,8 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
 
   // 잔여 파지(P0-b2). pick_place 가 든 채로 실패했으므로 실행 호스트가 humanoid-01 에 표시를 세우고 일반 배정에서 뺀다(관문 확인용으로만
   // 후보가 되어 조치 제안을 얻을 뿐 실행은 서지 않는다, picasso §15.317). 운영자가
-  // 현장에서 빈손을 확인해 «기체 빈손 확인» 으로 풀어야 다음 작업 지시(운영자 보류)가 humanoid-01 에 배정된다.
+  // 현장에서 빈손을 확인해 «기체 빈손 확인» 으로 풀어야 다음 작업 지시(운영자 보류)가 humanoid-01 에 배정된다. mimic 손은 아직 든 채라 실행 호스트가
+  // 확인 순간 읽은 스냅숏이 HOLDING 이고 첫 확인은 어긋남(B2)이다. 그 관측을 지목하고 «현장에서 빈손을 확인했다» 를 켜 다시 확인해야 풀린다.
   const graspJobOrder = (await graspRun.getByRole('cell').nth(1).textContent())!.trim()
   await page.getByLabel('운영자').check()
   const residual = page.getByRole('region', { name: '잔여 파지 확인', exact: true })
@@ -457,6 +458,15 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   await emptyForm.getByLabel('빈손 확인 근거').fill('현장에서 그리퍼 빈손 확인')
   await emptyForm.getByLabel('기체 손에 남은 물체가 없음을 현장에서 직접 확인했습니다').check()
   await emptyForm.getByRole('button', { name: '기체 빈손 확인' }).click()
+  await expect(residual.getByRole('status', { name: '빈손 확인 결과' })).toHaveText(
+    `humanoid-01 기체 빈손 확인(${graspJobOrder} RACK-204.S01): 발신자가 기체가 아직 든 채라고 말해 해소하지 않음. 현장에서 빈손을 확인했으면 아래 관측을 지목해 다시 확인하십시오`,
+  )
+  const mismatch = emptyForm.getByRole('group', { name: '발신자 관측과 어긋남' })
+  await expect(mismatch).toContainText('HOLDING')
+  const reconfirm = mismatch.getByRole('button', { name: '관측을 지목해 다시 확인' })
+  await expect(reconfirm).toBeDisabled()
+  await mismatch.getByLabel(/^발신자는 지금 .+ 를 들고 있다고 말한다\. 현장에서 빈손을 확인했다$/).check()
+  await reconfirm.click()
   await expect(residual.getByRole('status', { name: '빈손 확인 결과' })).toHaveText(
     `humanoid-01 기체 빈손 확인(${graspJobOrder} RACK-204.S01): 빈손 확인이 기록되었습니다. 그 기체는 다음 배정 판정부터 다시 판정됩니다`,
   )

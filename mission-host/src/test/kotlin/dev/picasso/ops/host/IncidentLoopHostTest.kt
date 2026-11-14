@@ -139,12 +139,13 @@ class IncidentLoopHostTest {
     }
 
     /**
-     * 든 채 실패하고 잔여 파지 표시를 사람이 «빈손 확인» 으로 잘못 푼 기체(2026-11-13 조사 장면). 손은 여전히 든 채다. 그 기체에 빈손을 요구하는
-     * 순회를 내면 picasso 관문이 기체 스냅숏의 손으로 거절하고 조치 제안을 세운다(picasso §15.316, 계약 0.11.0).
+     * 든 채 실패하고 잔여 파지 표시를 사람이 «빈손 확인» 으로 잘못 푼 기체(2026-11-13 조사 장면). 손은 여전히 든 채다. B2 부터 첫 확인은 발신자의 HOLDING
+     * 으로 409 이고, 사람이 그 관측을 지목해 «현장에서 빈손을 확인했다» 고 다시 확인해야 풀린다(어긋남 인지). 그 기체에 빈손을 요구하는 순회를 내면 picasso
+     * 관문이 기체 스냅숏의 손으로 거절하고 조치 제안을 세운다(picasso §15.316, 계약 0.11.0).
      */
     private fun misclearedThenPatrol(bench: HostBench): JsonNode = heldThenPatrol(bench, clear = true)
 
-    /** 든 채 실패해 잔여 파지 표시가 선 기체에 순회를 낸다. [clear] 면 그 전에 사람이 «빈손 확인» 으로 (잘못) 푼다. */
+    /** 든 채 실패해 잔여 파지 표시가 선 기체에 순회를 낸다. [clear] 면 그 전에 사람이 어긋남을 지목하고 «빈손 확인» 으로 (잘못) 푼다. */
     private fun heldThenPatrol(bench: HostBench, clear: Boolean): JsonNode {
         bench.awaitPump()
         val rack = bench.post("/host/job-orders", request(HostBench.rack("JO-R", "RACK-204.S01"), "candidates", HUMANOID)).body!!
@@ -162,7 +163,11 @@ class IncidentLoopHostTest {
         assertEquals("FAILED", bench.driveUntil(rack["executionId"].asText(), setOf("FAILED", "UNVERIFIED", "ABORTED", "PARTIAL", "PHYSICALLY_DONE"))["physicalState"].asText())
         bench.eventually("잔여 파지 표시") { bench.get("/host/robots/residual-holds")["holds"].size() == 1 }
         val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
-        if (clear) assertEquals(200, bench.post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""").status)
+        if (clear) {
+            val cleared = bench.clearHeldCiting(HUMANOID, markerId)
+            assertEquals(200, cleared.status, cleared.body.toString())
+            assertEquals(true, cleared.body!!["clearing"]["acknowledgedMismatch"].asBoolean(), cleared.body.toString())
+        }
         bench.awaitPump()
         return bench.post("/host/job-orders", request(inspect("JO-P", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
     }
@@ -247,6 +252,38 @@ class IncidentLoopHostTest {
             assertEquals(false, held["passed"].asBoolean())
             assertTrue(held["reasons"].any { it.asText().startsWith(MissionHost.RESIDUAL_HOLD_REASON) }, held.toString())
             assertEquals(0, journaled("JO-Q"))
+        }
+    }
+
+    /**
+     * B2: 든 채인 기체의 빈손 확인은 충돌로 남는다. 그 뒤 관문 확인으로 선 조치 제안을 값 없이 승인해 회복 실행이 내려놓으면 손이 빈다. 그 충돌을 지목한
+     * 확인은 지금 관측(EMPTY)으로 해소하고 어긋남 인지는 없으며 충돌 연결과 V14 회복 연결은 그대로 남는다.
+     */
+    @Test
+    fun `충돌을 받은 뒤 회복 실행이 손을 비우면 그 충돌을 지목한 확인은 EMPTY 로 어긋남 인지 없이 해소한다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            heldThenPatrol(bench, clear = false)
+            val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
+            val refused = bench.clearHold(HUMANOID, markerId)
+            assertEquals(409, refused.status, refused.body.toString())
+            assertEquals("HOLDING", refused.body!!["observation"]["observedKind"].asText())
+            val conflict = refused.body["conflictRequestId"].asText()
+
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, approved) = approve(port, AGENT, "JO-P", saw = listOf("pick_place"))
+            assertEquals("APPROVED", approved["outcome"].asText(), approved.toString())
+            val executionId = approved["executionId"].asText()
+            assertEquals("PHYSICALLY_DONE", bench.driveUntil(executionId, settledStates)["physicalState"].asText())
+            val recovery = PostgresSupport.queryAll("SELECT marker_id, execution_id FROM mission.robot_residual_hold_recovery") { it.getLong(1) to it.getString(2) }
+            assertEquals(listOf(markerId to executionId), recovery)
+
+            val cleared = bench.clearHold(HUMANOID, markerId, cited = HostBench.cite(refused.body))
+            assertEquals(200, cleared.status, cleared.body.toString())
+            val clearing = cleared.body!!["clearing"]
+            assertEquals(listOf("EMPTY", conflict), listOf(clearing["observation"]["observedKind"], clearing["conflictRequestId"]).map { it.asText() })
+            assertEquals(false, clearing["acknowledgedMismatch"].asBoolean())
+            assertEquals(0, bench.get("/host/robots/residual-holds")["holds"].size())
+            assertEquals(recovery, PostgresSupport.queryAll("SELECT marker_id, execution_id FROM mission.robot_residual_hold_recovery") { it.getLong(1) to it.getString(2) })
         }
     }
 

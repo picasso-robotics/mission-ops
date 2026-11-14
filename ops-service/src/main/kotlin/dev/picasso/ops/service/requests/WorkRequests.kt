@@ -529,8 +529,10 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
      val receipt=get(receiptId)
      check(receipt.normalizedOrder?.path("workMasterId")?.asText()==snapshot["workMasterId"].asText()) {"result mission mismatch"}
      captureResult(receipt,snapshot["instanceId"].asText(),snapshot)
-     jdbc.sql("UPDATE ops.work_request SET state='ACCEPTED',updated_at=clock_timestamp() WHERE receipt_id=:id AND state IN ('RECEIVED','DISPATCHING','IN_DOUBT')")
-      .param("id",receiptId).update()
+     // The host reporting this job order's execution moves an uncertain submission, and an UNASSIGNED or REJECTED answer it later
+     // ran anyway (an approved remedy, B2), to ACCEPTED. The earlier answer stays in submission; detail becomes the observed fact.
+     jdbc.sql("UPDATE ops.work_request SET $OBSERVED_DETAIL,state='ACCEPTED',updated_at=clock_timestamp() WHERE receipt_id=:id AND state IN $PROMOTED")
+      .param("observedExecution",snapshot["executionId"].asText()).param("observedRobot",snapshot["robotId"].asText()).param("id",receiptId).update()
      matched++
     }
    }
@@ -608,11 +610,15 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
   val instance=body.get("instanceId").asText()
   // updated_at is the "still current" basis of review, recovery and confirmation: it moves when the observed state or evidence changed, not on a refresh.
   val changed=receipt.lastExecution==null || receipt.executionInstanceId!=instance || evidence(receipt.lastExecution)!=evidence(execution)
+  // An UNASSIGNED or REJECTED answer whose job order the host later ran (an approved remedy, B2) moves to ACCEPTED like an uncertain
+  // submission; its submission stays and detail becomes the observed fact. The SET items all read the row before this update.
   val observed=jdbc.sql("""UPDATE ops.work_request SET last_execution=CAST(:execution AS JSONB),execution_observed_at=:at,execution_instance_id=:instance,
-    state=CASE WHEN state IN ('RECEIVED','DISPATCHING','IN_DOUBT') THEN 'ACCEPTED' ELSE state END,
-    updated_at=CASE WHEN :changed OR state IN ('RECEIVED','DISPATCHING','IN_DOUBT') THEN clock_timestamp() ELSE updated_at END
+    $OBSERVED_DETAIL,
+    state=CASE WHEN state IN $PROMOTED THEN 'ACCEPTED' ELSE state END,
+    updated_at=CASE WHEN :changed OR state IN $PROMOTED THEN clock_timestamp() ELSE updated_at END
     WHERE receipt_id=:id AND (execution_observed_at IS NULL OR execution_observed_at < :at)""")
    .param("execution",execution.toString()).param("at",java.time.OffsetDateTime.ofInstant(observedAt,java.time.ZoneOffset.UTC))
+   .param("observedExecution",execution.path("executionId").asText()).param("observedRobot",execution.path("robotId").asText())
    .param("instance",instance).param("changed",changed).param("id",receipt.receiptId).update()
   if(observed>0 && !durableResults) captureResult(receipt,body.get("instanceId").asText(),execution)
  }
@@ -740,6 +746,11 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
   val CLOSED_KINDS=setOf("UNRESTORED_CLOSED")
   /** The SET item closing a work request's source confirmation round (V22); written in the statement that writes the dispatch's state. */
   private const val CLOSE_ROUND="source_confirmations_closed_at=clock_timestamp()"
+  /** States an observed execution of the work request's job order moves to ACCEPTED (B2 adds UNASSIGNED and REJECTED). */
+  private const val PROMOTED="('RECEIVED','DISPATCHING','IN_DOUBT','UNASSIGNED','REJECTED')"
+  /** The SET item replacing an UNASSIGNED or REJECTED detail with the observed execution; other details are kept. Binds `:observedExecution` and `:observedRobot`. */
+  private const val OBSERVED_DETAIL="detail=CASE WHEN state IN ('UNASSIGNED','REJECTED') THEN '실행 호스트가 이 작업 지시의 실행 '||:observedExecution||'('||:observedRobot||')을 알려 수락으로 바꿨습니다. 앞선 '||"+
+   "CASE state WHEN 'UNASSIGNED' THEN '미배정' ELSE '거부' END||' 답은 제출 기록에 남습니다' ELSE detail END"
   /**
    * A work request's latest result version that is not acknowledged, as `u`; the caller binds `u.receipt_id`. Reads only
    * unacknowledged versions through the partial index `work_result_unacknowledged` (V20) instead of every work request's latest.

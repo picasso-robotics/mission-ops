@@ -372,8 +372,18 @@ interface HostExecutionControls {
     /** `GET /host/robots/residual-holds` 본문 그대로. */
     fun residualHolds(): HostCall<JsonNode>
 
-    /** `POST /host/robots/{robotId}/residual-holds/{markerId}/clear`. 없는 표시는 404, 이미 해소한 표시는 409 다. */
-    fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID): HostWrite
+    /**
+     * `POST /host/robots/{robotId}/residual-holds/{markerId}/clear`. 없는 표시는 404, 이미 해소한 표시는 409 다. 발신자가 지금 든 채라고 말하면 409
+     * `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 이고 호스트가 충돌 행을 적는다(B2). [cited] 는 다시 확인할 때 지목하는 저장된 충돌이며 운영자 요청 본문에서만
+     * 온다. 있으면 본문의 `cited` 로 그대로 싣는다. 저장된 충돌과 다르면 400 `RESIDUAL_HOLD_CITATION_INVALID` 다.
+     */
+    fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID, cited: JsonNode? = null): HostWrite
+
+    /**
+     * 빈손 확인의 응답 없음 뒤 재조회가 쓴다(B2). `GET /host/robots/{robotId}/residual-holds/{markerId}` 본문(표시와 해소 행) 그대로이고, 그 기체에 그 표시가
+     * 없다는 호스트의 답(404 `RESIDUAL_HOLD_NOT_FOUND`)은 `Ok(null)` 이다. 다른 404·200 아님·닿지 않음은 모름이다.
+     */
+    fun residualHold(robotId: String, markerId: Long): HostCall<JsonNode?>
 }
 
 /** 장애 주입 전달(S4a 스펙 §7, T1). 시험이 호스트 없이 대신 끼운다. */
@@ -620,12 +630,28 @@ class HostClient(
 
     override fun residualHolds(): HostCall<JsonNode> = get("/host/robots/residual-holds")
 
-    override fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID): HostWrite {
+    override fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID, cited: JsonNode?): HostWrite {
         val body = json.createObjectNode()
             .put("approverId", approverId)
             .put("reason", reason)
             .put("requestId", requestId.toString())
+        if (cited != null) body.set<JsonNode>("cited", cited)
         return post("/host/robots/${segment(robotId)}/residual-holds/$markerId/clear", body)
+    }
+
+    override fun residualHold(robotId: String, markerId: Long): HostCall<JsonNode?> {
+        val request = HttpRequest.newBuilder(URI.create("$base/host/robots/${segment(robotId)}/residual-holds/$markerId")).GET()
+        val response = when (val write = send(request, requestTimeout)) {
+            is HostWrite.NoResponse -> return HostCall.Silent(write.cause)
+            is HostWrite.Answered -> write
+        }
+        val body = objectOrNull(response.body)
+        return when {
+            response.status == 200 && body != null -> HostCall.Ok(body)
+            response.status == 404 && body?.get("error")?.asText() == RESIDUAL_HOLD_NOT_FOUND -> HostCall.Ok(null)
+            response.status == 200 -> HostCall.Silent("본문 모양이 다르다")
+            else -> HostCall.Silent("HTTP ${response.status}")
+        }
     }
 
     override fun jobResponses(jobOrderId: String?, limit: Int?): HostCall<JsonNode> {
@@ -693,6 +719,9 @@ class HostClient(
 
         /** 종결 조회에서 종결하지 않았다는 호스트 오류 이름(결함 14). */
         const val NOT_CLOSED = "NOT_CLOSED"
+
+        /** 잔여 파지 표시 조회에서 그 기체에 그 표시가 없다는 호스트 오류 이름(P0-b2). */
+        const val RESIDUAL_HOLD_NOT_FOUND = "RESIDUAL_HOLD_NOT_FOUND"
 
         /** 인시던트 단건에서 그런 인시던트가 없다는 호스트 오류 이름(S4a JSON 계약 §4). */
         const val INCIDENT_NOT_FOUND = "INCIDENT_NOT_FOUND"

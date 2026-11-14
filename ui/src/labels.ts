@@ -112,6 +112,9 @@ export const KIND_LABEL: Record<string, string> = {
   CLEAR_BAD_REQUEST: '빈손 확인 본문 오류',
   RESIDUAL_HOLD_NOT_FOUND: '없는 잔여 파지 표시',
   RESIDUAL_HOLD_ALREADY_CLEARED: '이미 해소한 잔여 파지 표시',
+  // 빈손 확인과 발신자 관측의 어긋남(B2).
+  RESIDUAL_HOLD_OBSERVATION_MISMATCH: '발신자는 아직 든 채라고 말함',
+  RESIDUAL_HOLD_CITATION_INVALID: '지목한 관측이 저장된 충돌과 다름',
   // 운영자 결함 감수(S3a JSON 계약 §9.8). 요청 id 재사용(REQUEST_ID_REUSED)과 인스턴스 다름은 위의 이름을 같이 쓴다.
   RELEASE_BAD_REQUEST: '수용 본문 오류',
 }
@@ -300,6 +303,14 @@ export const EXECUTION_CONTROL_TEXT = {
   emptyConfirm: '기체 손에 남은 물체가 없음을 현장에서 직접 확인했습니다',
   emptyOperatorOnly: '기체 빈손 확인은 운영자 모드에서 합니다',
   emptyDone: '빈손 확인이 기록되었습니다. 그 기체는 다음 배정 판정부터 다시 판정됩니다',
+  // 빈손 확인과 발신자 관측의 어긋남(B2). 지목 값은 그 어긋남 응답에서만 온다.
+  mismatchHeading: '발신자 관측과 어긋남',
+  mismatchIntro:
+    '실행 호스트가 확인 순간 읽은 기체 스냅숏은 아직 든 채입니다. 해소하지 않았습니다. 현장에서 빈손을 직접 확인했을 때만 이 관측을 지목해 다시 확인하세요. 사람이 손을 비울 수단이 없는 기종은 조치 승인 경로로 내려놓는 것이 정상입니다.',
+  mismatchAcknowledge: (held: string) => `발신자는 지금 ${held} 를 들고 있다고 말한다. 현장에서 빈손을 확인했다`,
+  reconfirmButton: '관측을 지목해 다시 확인',
+  mismatchResult: '발신자가 기체가 아직 든 채라고 말해 해소하지 않음. 현장에서 빈손을 확인했으면 아래 관측을 지목해 다시 확인하십시오',
+  citationInvalidResult: '지목한 관측이 실행 호스트에 저장된 충돌과 달라 해소하지 않음. «기체 빈손 확인» 부터 다시 하십시오',
   // 운영자 결함 수용(S3a JSON 계약 §5.10·§9.8).
   releaseHeading: '결함 수용',
   releaseIntro: '수용은 결함을 지우지 않으며, 이 결함들이 다음 단위를 막지 않게 하고 다음 로봇 단위를 냅니다. 기체 상태를 현장에서 확인한 뒤 결정하세요.',

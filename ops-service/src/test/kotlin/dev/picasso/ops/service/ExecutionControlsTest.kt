@@ -108,10 +108,21 @@ class ExecutionControlsTest {
 
         override fun residualHolds(): HostCall<JsonNode> = holds.also { calls += mapOf("op" to "residualHolds") }
 
-        override fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID): HostWrite {
-            calls += mapOf("op" to "clear", "robotId" to robotId, "markerId" to markerId, "approverId" to approverId, "reason" to reason)
+        /** 빈손 확인 요청을 받을 때 표시 조회를 바꾼다. 재조회 본문이 이 요청의 id 를 실어야 할 때 쓴다. */
+        var onClear: (UUID) -> Unit = {}
+        var record: HostCall<JsonNode?> = HostCall.Silent("응답 없음: ConnectException")
+
+        override fun clearResidualHold(robotId: String, markerId: Long, approverId: String, reason: String, requestId: UUID, cited: JsonNode?): HostWrite {
+            calls += buildMap {
+                put("op", "clear"); put("robotId", robotId); put("markerId", markerId); put("approverId", approverId); put("reason", reason)
+                if (cited != null) put("cited", cited)
+            }
+            onClear(requestId)
             return clearAnswer
         }
+
+        override fun residualHold(robotId: String, markerId: Long): HostCall<JsonNode?> =
+            record.also { calls += mapOf("op" to "residualHold", "robotId" to robotId, "markerId" to markerId) }
 
         fun writes() = calls.filter { it["op"] in setOf("cancel", "clear", "release", "close") }
     }
@@ -225,7 +236,7 @@ class ExecutionControlsTest {
     }
 
     @Test
-    fun `빈손 확인은 승인자가 행위자이고 해소는 성공 404 409 는 거부이며 응답이 없으면 미해소 목록으로 대조한다`() {
+    fun `빈손 확인은 승인자가 행위자이고 해소는 성공 404 409 는 거부이며 응답이 없으면 그 표시의 해소 행 요청 id 로 대조한다`() {
         val cleared = assertIs<RobotEmptyOutcome>(clear("operator").body)
         assertEquals(OperationResult.SUCCEEDED, cleared.result)
         assertEquals(
@@ -239,19 +250,74 @@ class ExecutionControlsTest {
             json.readTree(row.request),
         )
 
-        listOf(404 to "RESIDUAL_HOLD_NOT_FOUND", 409 to "RESIDUAL_HOLD_ALREADY_CLEARED").forEach { (status, error) ->
+        listOf(404 to "RESIDUAL_HOLD_NOT_FOUND", 409 to "RESIDUAL_HOLD_ALREADY_CLEARED", 400 to "RESIDUAL_HOLD_CITATION_INVALID").forEach { (status, error) ->
             host.clearAnswer = HostWrite.Answered(status, """{"error":"$error","detail":"x"}""")
             val refused = assertIs<RobotEmptyOutcome>(clear("operator").body)
             assertEquals(OperationResult.REJECTED, refused.result)
             assertEquals(error, refused.rejection!!.error)
+            assertNull(refused.rejection!!.fields)
         }
 
+        // 응답 없음 뒤 재조회는 그 표시 하나의 조회만 읽고 다시 보내지 않는다. 해소 행의 요청 id 가 이 요청의 것일 때만 반영됨이다.
         host.clearAnswer = HostWrite.NoResponse("응답 없음: HttpTimeoutException")
+        host.calls.clear()
+        host.record = HostCall.Ok(json.readTree("""{"hold":$HOLD,"clearing":null}"""))
         assertEquals(OperationResult.CONFIRMED_NOT_APPLIED, assertIs<RobotEmptyOutcome>(clear("operator").body).confirmation)
-        host.holds = HostCall.Ok(json.readTree("""{"holds":[]}"""))
+        host.record = HostCall.Ok(json.readTree("""{"hold":$HOLD,"clearing":${clearing(UUID.randomUUID())}}"""))
+        assertEquals(OperationResult.CONFIRMED_NOT_APPLIED, assertIs<RobotEmptyOutcome>(clear("operator").body).confirmation, "다른 요청의 해소")
+        host.record = HostCall.Ok(null)
+        assertEquals(OperationResult.CONFIRMED_NOT_APPLIED, assertIs<RobotEmptyOutcome>(clear("operator").body).confirmation, "표시 없음")
+        host.onClear = { requestId -> host.record = HostCall.Ok(json.readTree("""{"hold":$HOLD,"clearing":${clearing(requestId)}}""")) }
         assertEquals(OperationResult.CONFIRMED_APPLIED, assertIs<RobotEmptyOutcome>(clear("operator").body).confirmation)
-        host.holds = HostCall.Silent("응답 없음")
+        host.onClear = { host.record = HostCall.Silent("응답 없음") }
         assertNull(assertIs<RobotEmptyOutcome>(clear("operator").body).confirmation)
+        assertEquals(5, host.calls.count { it["op"] == "clear" }, "재조회가 다시 보냈다")
+        assertEquals(List(5) { mapOf("op" to "residualHold", "robotId" to "humanoid-01", "markerId" to 7L) }, host.calls.filter { it["op"] != "clear" })
+    }
+
+    /**
+     * B2: 실행 호스트가 발신자의 HOLDING 으로 409 어긋남을 답하면 조작 기록은 거부이고 응답 칸에 호스트 본문 전체가 남으며, 호출 결과의 거부에 지목할
+     * 관측이 실린다. 다시 확인하는 요청의 `cited` 는 요청 본문의 것만 호스트에 가고 요청 칸에도 남는다. 모양이 틀린 지목은 호스트에 닿지 않는 400 이다.
+     */
+    @Test
+    fun `빈손 확인의 어긋남은 거부로 남고 관측이 화면에 닿으며 지목은 요청 본문에서만 호스트로 간다`() {
+        host.clearAnswer = HostWrite.Answered(409, MISMATCH)
+        val refused = assertIs<RobotEmptyOutcome>(clear("operator").body)
+        assertEquals(OperationResult.REJECTED, refused.result)
+        val rejection = refused.rejection!!
+        assertEquals(409 to "RESIDUAL_HOLD_OBSERVATION_MISMATCH", rejection.status to rejection.error)
+        val fields = rejection.fields!!
+        assertEquals(listOf("robotId", "markerId", "conflictRequestId", "observation"), fields.fieldNames().asSequence().toList())
+        assertEquals(CONFLICT, fields["conflictRequestId"].asText())
+        assertEquals("HOLDING", fields["observation"]["observedKind"].asText())
+        val first = log.list().single()
+        assertEquals(OperationResult.REJECTED, first.result)
+        assertEquals(json.readTree("""{"status":409,"body":$MISMATCH}"""), json.readTree(first.targetResponse))
+        assertEquals(null, host.writes().single()["cited"])
+
+        // 다시 확인: 지목은 본문 그대로(정해진 다섯 칸만) 호스트와 조작 기록에 간다.
+        host.clearAnswer = HostWrite.Answered(200, CLEARED)
+        val cited = """{"conflictRequestId":"$CONFLICT","kind":"HOLDING","objectRef":"C-1","session":"s-1","sequence":"9007199254740993","extra":"버린다"}"""
+        val again = assertIs<RobotEmptyOutcome>(clear("operator", body = """{"reason":"현장에서 빈손 확인","cited":$cited}""").body)
+        assertEquals(OperationResult.SUCCEEDED, again.result)
+        val sent = json.readTree("""{"conflictRequestId":"$CONFLICT","kind":"HOLDING","objectRef":"C-1","session":"s-1","sequence":"9007199254740993"}""")
+        assertEquals(sent, json.readTree(host.writes().last()["cited"].toString()))
+        assertEquals(sent, json.readTree(log.list().single { it.result == OperationResult.SUCCEEDED }.request)["cited"])
+
+        listOf(
+            """"x"""",
+            """{"kind":"HOLDING"}""",
+            """{"conflictRequestId":"not-a-uuid","kind":"HOLDING"}""",
+            """{"conflictRequestId":"$CONFLICT","kind":" "}""",
+            """{"conflictRequestId":"$CONFLICT","kind":"HOLDING","sequence":"12x"}""",
+            """{"conflictRequestId":"$CONFLICT","kind":"HOLDING","sequence":1.5}""",
+            """{"conflictRequestId":"$CONFLICT","kind":"HOLDING","session":7}""",
+        ).forEach { bad ->
+            val reply = clear("operator", body = """{"reason":"r","cited":$bad}""")
+            assertEquals(400, reply.statusCode.value(), bad)
+            assertEquals(ExecutionControlController.CLEAR_BAD_REQUEST, reply.rejection().error, bad)
+        }
+        assertEquals(2, host.writes().size)
     }
 
     @Test
@@ -509,8 +575,21 @@ class ExecutionControlsTest {
         const val HOLD =
             """{"markerId":7,"robotId":"humanoid-01","jobOrderId":"JO-1","executionId":"exec-1","instanceId":"mw-1","unitId":"RACK-204.S02","objectRef":"C-1","recordedAt":"2026-10-13T08:59:00Z"}"""
 
-        val CLEARED =
-            """{"hold":$HOLD,"clearing":{"approverId":"kim","approverKind":"PERSON","reason":"r","clearedAt":"2026-10-13T09:00:01Z"},"requestId":null}"""
+        const val CONFLICT = "8c5d3f0e-2b1a-4c7d-9e6f-0a1b2c3d4e5f"
+
+        const val OBSERVATION =
+            """{"observedKind":"HOLDING","observedObjectRef":"C-1","observedDetail":null,"snapshotSession":"s-1","snapshotSequence":"12",""" +
+                """"snapshotOccurredAt":"2026-10-13T09:00:00Z","hostReadStartedAt":"2026-10-13T09:00:00Z","hostReadReceivedAt":"2026-10-13T09:00:00.100Z"}"""
+
+        fun clearing(requestId: UUID) =
+            """{"approverId":"kim","approverKind":"PERSON","reason":"r","clearedAt":"2026-10-13T09:00:01Z","requestId":"$requestId",""" +
+                """"observation":$OBSERVATION,"conflictRequestId":null,"acknowledgedMismatch":false}"""
+
+        val CLEARED = """{"hold":$HOLD,"clearing":${clearing(UUID.fromString(CONFLICT))},"requestId":"$CONFLICT"}"""
+
+        const val MISMATCH =
+            """{"error":"RESIDUAL_HOLD_OBSERVATION_MISMATCH","detail":"발신자는 지금 든 채라고 말한다","robotId":"humanoid-01","markerId":7,""" +
+                """"conflictRequestId":"$CONFLICT","observation":$OBSERVATION}"""
 
         const val SAW = """[{"errorType":"LOCALIZATION_LOST","references":[]}]"""
 

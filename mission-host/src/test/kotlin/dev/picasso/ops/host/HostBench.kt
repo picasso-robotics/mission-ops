@@ -78,6 +78,13 @@ class HostBench(
     /** [gated] 일 때 호스트가 하위에 낸 `StartTask`(기체, 태스크 id). 같은 태스크 id 의 재전송도 하나씩 든다. */
     val starts = CopyOnWriteArrayList<Pair<String, String>>()
 
+    /**
+     * [gated] 일 때 이 스레드가 부른 스냅숏 읽기만 바꾼다(기체, 읽은 값 → 돌려줄 값). 시험 스레드가 호스트 메서드를 직접 부를 때 그 읽기만 바꾸고 pump 와
+     * 미리 읽기는 그대로 둔다.
+     */
+    @Volatile
+    var snapshotOverride: Pair<Thread, (RobotSnapshot?) -> RobotSnapshot?>? = null
+
     /** [gated] 일 때 호스트가 하위에 낸 취소(기체, 태스크 id). */
     val cancels = CopyOnWriteArrayList<Pair<String, String>>()
 
@@ -90,7 +97,11 @@ class HostBench(
             override fun cancel(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) =
                 delegate.cancel(robotId, handle).also { cancels += robotId to handle.taskId }
 
-            override fun snapshot(robotId: String): RobotSnapshot? = if (robotId in blockedSnapshots) null else delegate.snapshot(robotId)
+            override fun snapshot(robotId: String): RobotSnapshot? {
+                val read = if (robotId in blockedSnapshots) null else delegate.snapshot(robotId)
+                val override = snapshotOverride
+                return if (override != null && override.first == Thread.currentThread()) override.second(read) else read
+            }
         }
     }
 
@@ -268,6 +279,34 @@ class HostBench(
         return Reply(response.statusCode(), response.body().takeIf { it.isNotBlank() }?.let { runCatching { JSON.readTree(it) }.getOrNull() })
     }
 
+    /** 빈손 확인 한 번(B2). [cited] 는 지목할 저장된 충돌이다([cite] 가 409 본문에서 만든다). */
+    fun clearHold(
+        robotId: String,
+        markerId: Long,
+        approverId: String = "park",
+        reason: String = "빈손 확인",
+        requestId: String = java.util.UUID.randomUUID().toString(),
+        cited: Map<String, Any?>? = null,
+    ): Reply = post(
+        "/host/robots/$robotId/residual-holds/$markerId/clear",
+        JSON.writeValueAsString(
+            linkedMapOf<String, Any?>("approverId" to approverId, "reason" to reason, "requestId" to requestId).apply { if (cited != null) put("cited", cited) },
+        ),
+    )
+
+    /**
+     * 손이 아직 든 채인 기체의 빈손 확인(B2). 발신자가 지금 HOLDING 이라 첫 요청은 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 이고 충돌 행이 남는다.
+     * 사람이 현장에서 빈손을 확인했다고 보고 그 충돌을 지목해 새 요청 id 로 다시 확인한 답을 돌려준다. mimic 은 사람이 손을 비울 수단이 없어 든 채
+     * 정착한 기체는 늘 이 길이다.
+     */
+    fun clearHeldCiting(robotId: String, markerId: Long, approverId: String = "park", reason: String = "빈손 확인"): Reply {
+        val refused = clearHold(robotId, markerId, approverId, reason)
+        check(refused.status == 409 && refused.body?.get("error")?.asText() == "RESIDUAL_HOLD_OBSERVATION_MISMATCH") {
+            "든 채인 기체의 첫 빈손 확인이 어긋남이 아니다: ${refused.status} ${refused.body}"
+        }
+        return clearHold(robotId, markerId, approverId, reason, cited = cite(refused.body!!))
+    }
+
     /** 이 실행을 찾는다. 없으면 `null`. */
     fun execution(executionId: String): JsonNode? =
         get("/host/executions")["executions"].firstOrNull { it["executionId"].asText() == executionId }
@@ -330,6 +369,19 @@ class HostBench(
 
         /** 대역 뷰의 처음 행. 버전 1 과 picasso 케이퍼빌리티 기본값이며, 운영 서비스 마이그레이션이 만드는 버전 1 과 같다. */
         val STANDARD_TIMINGS: List<Long> = listOf(1, 30, 15, 60, 300)
+
+        /** 빈손 확인 409 본문에서 지목(`cited`)을 만든다. 화면이 그 응답에서만 만드는 것과 같다. */
+        fun cite(mismatch: JsonNode): Map<String, Any?> {
+            val seen = mismatch["observation"]
+            fun text(field: String) = seen[field]?.takeUnless { it.isNull }?.asText()
+            return linkedMapOf(
+                "conflictRequestId" to mismatch["conflictRequestId"].asText(),
+                "kind" to text("observedKind"),
+                "objectRef" to text("observedObjectRef"),
+                "session" to text("snapshotSession"),
+                "sequence" to seen["snapshotSequence"]?.takeUnless { it.isNull }?.asText(),
+            )
+        }
 
         val ROOT: Path = Path.of("..").toAbsolutePath().normalize()
         val HTTP: HttpClient = HttpClient.newHttpClient()

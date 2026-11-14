@@ -105,7 +105,8 @@ class HostJournalTest {
             // 든 채 실패라 그 기체에 잔여 파지 표시가 서고(P0-b2) 같은 작업 지시의 리비전도 배정에서 빠진다. 사람이 빈손을 확인한 뒤 낸다.
             bench.eventually("잔여 파지 표시") { bench.get("/host/robots/residual-holds")["holds"].size() == 1 }
             val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
-            val cleared = bench.post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""")
+            // mimic 손은 든 채라 첫 확인은 어긋남이다(B2). 현장 확인을 지목해 다시 확인한다.
+            val cleared = bench.clearHeldCiting(HUMANOID, markerId)
             assertEquals(200, cleared.status, cleared.body.toString())
 
             val revised =bench.post("/host/job-orders", request(rack("JO-1", S01).replace("\"version\":1", "\"version\":2"), "candidates", HUMANOID))

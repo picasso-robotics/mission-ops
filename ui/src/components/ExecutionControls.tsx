@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { cancelExecution, closeUnrestored, confirmRobotEmpty, faultBlocked, fetchResidualHolds, HOLD_EVICTED, releaseFaults, resolveHold } from '../api'
+import { useEffect, useRef, useState } from 'react'
+import { cancelExecution, citeMismatch, closeUnrestored, confirmRobotEmpty, faultBlocked, fetchResidualHolds, HOLD_EVICTED, mismatchOf, releaseFaults, resolveHold } from '../api'
 import type {
   Delivered,
   Execution,
@@ -7,6 +7,7 @@ import type {
   ExecutionCloseOutcome,
   ExecutionReleaseOutcome,
   HoldResolveOutcome,
+  ObservationMismatch,
   ResidualHold,
   ResidualHoldsView,
   ReworkableTarget,
@@ -461,6 +462,11 @@ interface HoldsProps {
 /**
  * 미해소 잔여 파지 표시와 기체 빈손 확인(P0-b2). 표시가 있는 기체는 실행 호스트 판정이 배정에서 뺀다(배정 가능 표의 이유 칸에도
  * 보인다). 확인은 물리 확인이라 사유와 현장 확인 체크가 있어야 보낸다. 운영자 모드에서만 조작한다. 못 읽으면 직전 값을 지우지 않는다.
+ *
+ * 어긋남(B2): 실행 호스트가 확인 순간 읽은 스냅숏이 아직 든 채면 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH` 로 해소하지 않는다. 그때는 폼을 닫지 않고
+ * 그 관측을 보이며, 기본 꺼진 체크(«발신자는 지금 X 를 들고 있다고 말한다. 현장에서 빈손을 확인했다»)를 켜야 재확인이 산다. 재확인은 그 어긋남 응답의
+ * 값으로 만든 지목(`cited`)을 싣고 운영 서비스가 새 요청 id 로 보낸다. 지목 값은 그 응답에서만 오고 폼을 닫거나 그 표시가 목록에서 사라지면 버린다. 또
+ * 어긋남이 오면 새 관측으로 바꾸고 체크를 끈다.
  */
 export function ResidualHolds({ session, tick, onConfirmed }: HoldsProps) {
   const [read, setRead] = useState<HostRead<ResidualHoldsView>>({ value: null, error: null })
@@ -470,12 +476,30 @@ export function ResidualHolds({ session, tick, onConfirmed }: HoldsProps) {
   const [busy, setBusy] = useState(false)
   const [last, setLast] = useState<{ what: string; sent: Delivered<RobotEmptyOutcome> } | null>(null)
   const [own, setOwn] = useState(0)
+  /** 지금 폼의 표시가 받은 어긋남. 지목 값의 유일한 출처다. */
+  const [mismatch, setMismatch] = useState<{ markerId: number; value: ObservationMismatch } | null>(null)
+  const [acknowledged, setAcknowledged] = useState(false)
+  /** 지금 고른 표시. 목록을 읽은 콜백이 표시 소멸을 볼 때 쓴다. */
+  const chosenId = useRef<number | null>(null)
+
+  const choose = (markerId: number | null) => {
+    chosenId.current = markerId
+    setSelected(markerId)
+    setReason('')
+    setConfirmed(false)
+    setMismatch(null)
+    setAcknowledged(false)
+  }
 
   useEffect(() => {
     let alive = true
     fetchResidualHolds(session)
       .then((value) => {
-        if (alive) setRead({ value, error: null })
+        if (!alive) return
+        setRead({ value, error: null })
+        // 고른 표시가 목록에서 사라졌으면 선택·사유·체크·지목을 버린다. 같은 표시가 다시 보여도 앞 지목과 체크가 살아나지 않는다.
+        const listed = Array.isArray(value.holds) ? value.holds : null
+        if (listed !== null && chosenId.current !== null && !listed.some((hold) => hold.markerId === chosenId.current)) choose(null)
       })
       .catch((error: unknown) => {
         if (alive) setRead((previous) => ({ ...previous, error: message(error) }))
@@ -488,20 +512,32 @@ export function ResidualHolds({ session, tick, onConfirmed }: HoldsProps) {
   // 운영 서비스가 다른 모양을 주면 목록이 없다. 없는 목록도 모름이다.
   const holds = read.value !== null && Array.isArray(read.value.holds) ? read.value.holds : null
   const chosen = holds?.find((hold) => hold.markerId === selected) ?? null
+  // 지목은 지금 고른 표시의 어긋남일 때만 쓴다. 폼이 닫혔거나 표시가 목록에서 사라졌으면 버린 것과 같다.
+  const pending = mismatch !== null && chosen !== null && mismatch.markerId === chosen.markerId ? mismatch.value : null
 
   const send = (hold: ResidualHold) => {
-    if (reason.trim() === '' || !confirmed) return
+    if (reason.trim() === '' || !confirmed || (pending !== null && !acknowledged)) return
     const what = `${hold.robotId} ${TEXT.emptyButton}(${hold.jobOrderId} ${hold.unitId})`
     setBusy(true)
-    confirmRobotEmpty(session, hold, reason.trim())
-      .then((sent) => setLast({ what, sent }))
-      .finally(() => {
-        setBusy(false)
-        setReason('')
-        setConfirmed(false)
-        setSelected(null)
+    confirmRobotEmpty(session, hold, reason.trim(), pending === null ? undefined : citeMismatch(pending))
+      .then((sent) => {
+        setLast({ what, sent })
+        const next = sent.kind === 'outcome' ? mismatchOf(sent.outcome) : null
+        if (next !== null) {
+          // 폼을 열어 둔다. 새 관측으로 바꾸고 체크를 끈다. 목록은 그대로라 다시 읽지 않는다.
+          setMismatch({ markerId: hold.markerId, value: next })
+          setAcknowledged(false)
+          setBusy(false)
+          return
+        }
+        choose(null)
         setOwn((value) => value + 1)
         onConfirmed()
+        setBusy(false)
+      })
+      .catch(() => {
+        choose(null)
+        setBusy(false)
       })
   }
 
@@ -549,7 +585,7 @@ export function ResidualHolds({ session, tick, onConfirmed }: HoldsProps) {
                       <td>{hold.recordedAt}</td>
                       <td>
                         {session.mode === 'operator' ? (
-                          <button type="button" disabled={busy} onClick={() => { setSelected(hold.markerId); setReason(''); setConfirmed(false) }}>
+                          <button type="button" disabled={busy} onClick={() => choose(hold.markerId)}>
                             {TEXT.emptyButton}
                           </button>
                         ) : (
@@ -577,9 +613,38 @@ export function ResidualHolds({ session, tick, onConfirmed }: HoldsProps) {
                 <input type="checkbox" checked={confirmed} disabled={busy} onChange={(event) => setConfirmed(event.target.checked)} />
                 {TEXT.emptyConfirm}
               </label>{' '}
-              <button type="button" disabled={busy || reason.trim() === '' || !confirmed} onClick={() => send(chosen)}>
-                {TEXT.emptyButton}
-              </button>
+              {pending === null ? (
+                <button type="button" disabled={busy || reason.trim() === '' || !confirmed} onClick={() => send(chosen)}>
+                  {TEXT.emptyButton}
+                </button>
+              ) : (
+                <fieldset aria-label={TEXT.mismatchHeading}>
+                  <legend>{TEXT.mismatchHeading}</legend>
+                  <p>{TEXT.mismatchIntro}</p>
+                  <dl aria-label="발신자 관측">
+                    <dt>손</dt>
+                    <dd>{pending.observation.observedKind}</dd>
+                    <dt>든 것</dt>
+                    <dd>{pending.observation.observedObjectRef ?? TEXT.objectUnnamed}</dd>
+                    <dt>세션</dt>
+                    <dd>{pending.observation.snapshotSession ?? '미상'}</dd>
+                    <dt>순번</dt>
+                    <dd>{pending.observation.snapshotSequence ?? '미상'}</dd>
+                    <dt>호스트가 읽은 시각</dt>
+                    <dd>{pending.observation.hostReadReceivedAt ?? '미상'}</dd>
+                  </dl>
+                  <label>
+                    <input type="checkbox" checked={acknowledged} disabled={busy} onChange={(event) => setAcknowledged(event.target.checked)} />
+                    {TEXT.mismatchAcknowledge(pending.observation.observedObjectRef ?? TEXT.objectUnnamed)}
+                  </label>{' '}
+                  <button type="button" disabled={busy || reason.trim() === '' || !confirmed || !acknowledged} onClick={() => send(chosen)}>
+                    {TEXT.reconfirmButton}
+                  </button>{' '}
+                  <button type="button" disabled={busy} onClick={() => choose(null)}>
+                    닫기
+                  </button>
+                </fieldset>
+              )}
             </form>
           )}
         </>
@@ -593,12 +658,14 @@ function describeEmpty(sent: Delivered<RobotEmptyOutcome>): string {
   if (sent.kind === 'unknown') return `결과 모름(${sent.cause}). 잔여 파지 표에서 확인하십시오`
   const { result, rejection, confirmation } = sent.outcome
   if (result === 'SUCCEEDED') return TEXT.emptyDone
+  if (mismatchOf(sent.outcome) !== null) return TEXT.mismatchResult
+  if (rejection?.error === 'RESIDUAL_HOLD_CITATION_INVALID') return `${TEXT.citationInvalidResult}${rejection.detail ? `. ${rejection.detail}` : ''}`
   if (rejection !== null) return rejectionText('실행 호스트가 거부함', rejection)
   switch (confirmation) {
     case 'CONFIRMED_APPLIED':
-      return '응답은 없었으나 다시 읽어 보니 표시가 해소됨'
+      return '응답은 없었으나 다시 읽어 보니 이 요청으로 표시가 해소됨'
     case 'CONFIRMED_NOT_APPLIED':
-      return '응답 없음. 다시 읽어 보니 표시가 그대로임. 잔여 파지 표에서 확인하십시오'
+      return '응답 없음. 다시 읽어 보니 이 요청의 해소가 없음. 잔여 파지 표에서 확인하십시오'
     default:
       return '응답 없음. 해소됐을 수 있음. 다시 읽지도 못해 확인하지 못했습니다. 잔여 파지 표에서 확인하십시오'
   }

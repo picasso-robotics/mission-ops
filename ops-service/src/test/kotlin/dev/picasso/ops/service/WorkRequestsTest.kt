@@ -790,6 +790,38 @@ class WorkRequestsTest {
   jdbc.sql("ALTER TABLE ops.work_result DROP CONSTRAINT refuse_second").update()
   assertEquals(2,worker.collectResults())
  }
+ /**
+  * B2: a host UNASSIGNED or REJECTED whose job order the host later runs (a remedy approved on a gate-trial robot) moves to ACCEPTED
+  * when the host reports the execution, through the execution read and the result feed alike. The earlier answer stays in submission,
+  * detail becomes the observed fact, and observing it again adds no result version.
+  */
+ @Test fun `실행 읽기가 미배정과 거부로 끝난 작업 요청의 실행을 보면 수락으로 올리고 제출 기록은 남기며 다시 봐도 결과를 더하지 않는다`() {
+  fun order(n:Int)=body.deepCopy<com.fasterxml.jackson.databind.node.ObjectNode>().put("externalOrderId","ORDER-B2-$n")
+  bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01")))
+  val unassigned=service.receive("mes",order(1)).receipt;assertEquals("UNASSIGNED",unassigned.state)
+  bench.answer=HostWrite.Answered(200,rejectedBy("관문이 막았다"))
+  val rejected=service.receive("mes",order(2)).receipt;assertEquals("REJECTED",rejected.state)
+  for((row,answer) in listOf(unassigned to "미배정",rejected to "거부")) {
+   observeResult(row.jobOrderId,state="RUNNING");service.detail(row.receiptId)
+   val after=service.get(row.receiptId)
+   assertEquals("ACCEPTED",after.state)
+   assertEquals(row.submission,after.submission)
+   assertEquals("실행 호스트가 이 작업 지시의 실행 exec-1(humanoid-01)을 알려 수락으로 바꿨습니다. 앞선 $answer 답은 제출 기록에 남습니다",after.detail)
+   service.detail(row.receiptId)
+   assertEquals(after.detail,service.get(row.receiptId).detail)
+   assertEquals(1L,jdbc.sql("SELECT count(*) FROM ops.work_result WHERE receipt_id=:id").param("id",row.receiptId).query(Long::class.java).single())
+  }
+ }
+ @Test fun `결과 피드가 미배정으로 끝난 작업 요청의 실행을 알리면 수락으로 올리고 제출 기록은 남긴다`() {
+  bench.answer=HostWrite.Answered(200,unassignedBy(refusal("humanoid-01")))
+  val row=service.receive("mes",body).receipt;assertEquals("UNASSIGNED",row.state)
+  val page=feed(row.jobOrderId)
+  bench.executions=HostCall.Silent("offline")
+  assertEquals(2,durable{HostCall.Ok(page)}.collectResults())
+  val after=service.get(row.receiptId)
+  assertEquals("ACCEPTED",after.state);assertEquals(row.submission,after.submission)
+  assertEquals("실행 호스트가 이 작업 지시의 실행 exec-1(humanoid-01)을 알려 수락으로 바꿨습니다. 앞선 미배정 답은 제출 기록에 남습니다",after.detail)
+ }
  @Test fun `concurrent durable collectors commit one set of versions`() {
   val row=service.receive("mes",body).receipt;val page=feed(row.jobOrderId)
   val gate=CountDownLatch(2)
