@@ -7,6 +7,7 @@ import type {
   CancelResult,
   HoldDecision,
   IncidentDecision,
+  OpeningKind,
   HostSubmitResult,
   JobResponseDisposition,
   MockRunFailure,
@@ -216,6 +217,18 @@ export const RESOLUTION_LABEL: Record<IncidentDecision, string> = {
   ...DECISION_LABEL,
   OPERATOR_CANCEL: '운영자 취소',
   REMEDY_APPLIED: '회복 조치 승인',
+}
+
+/** 인시던트가 열린 방식(picasso §15.322). */
+export const OPENING_LABEL: Record<OpeningKind, string> = {
+  NEW: '새로 섬',
+  REOPENED: '재기동이 다시 엶',
+}
+
+/** 판단자의 종류(picasso `ApproverKind`). 원문 id 와 함께 보인다. */
+export const DECIDER_KIND_LABEL: Record<string, string> = {
+  PERSON: '사람',
+  AGENT: '에이전트',
 }
 
 /** 실행 호스트 취소 결과(P0-b2). */

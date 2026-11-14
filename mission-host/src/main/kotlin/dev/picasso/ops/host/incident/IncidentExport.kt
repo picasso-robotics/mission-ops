@@ -23,10 +23,13 @@ import java.time.Instant
  * 사본은 이 프로세스 메모리에만 있고 상한이 없다. 재기동하면 새 인스턴스의 것부터 다시 쌓인다(작업 응답 줄은 인스턴스 id 를 든다).
  * 개념 증명 범위다.
  *
+ * 안내(`manifest.json`)는 [instanceId] 를 싣는다(내보내기 판 8, picasso §15.322). 한 벌은 한 인스턴스의 것이고, 인시던트 줄의
+ * `incidentKey` 가 재기동 앞 인스턴스의 벌과 같은 사건을 잇는다. [instanceId] 는 미들웨어의 것(기동마다 새 값)이다.
+ *
  * 호스트 잠금 아래에서만 부른다. [BundleWriter] 는 부르는 쪽이 직렬화한다.
  */
 class IncidentExport(dir: Path, private val instanceId: String) {
-    private val writer = BundleWriter(dir)
+    private val writer = BundleWriter(dir, instanceId)
     private val incidents = LinkedHashMap<String, IncidentBundle>()
     private val searches = LinkedHashMap<String, RemedySearchRecord>()
     private val responses = LinkedHashMap<String, JobResponse>()

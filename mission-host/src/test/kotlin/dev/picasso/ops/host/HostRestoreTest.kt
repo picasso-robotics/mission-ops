@@ -1,6 +1,7 @@
 package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import dev.picasso.contracts.v1.ParameterValue
 import dev.picasso.mimic.engine.ForceOutcome
 import dev.picasso.mimic.engine.StartOutcome
@@ -17,6 +18,7 @@ import dev.picasso.registry.PostgresSupport
 import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -154,6 +156,70 @@ class HostRestoreTest {
             assertEquals(3, sent.size)
             assertEquals(sent, feed.map { it["snapshot"]["instanceId"].asText() to it["snapshot"]["jobResponse"]["jobResponseId"].asText() })
             assertEquals(listOf("OPERATOR_HOLD", "RUNNING", "OPERATOR_HOLD"), feed.map { it["snapshot"]["physicalState"].asText() })
+        }
+    }
+
+    @Test
+    fun `재기동이 다시 연 보류 인시던트는 REOPENED 이고 원래 보류의 열쇠와 처음 선 시각을 이으며 사본도 같은 열쇠를 들고 재작업 뒤 새로 선 보류는 새 열쇠다`() {
+        HostBench().use { bench ->
+            val first = bench.host.instanceId
+            val executionId = bench.submitHeldOrder("JO-1")
+            bench.driveToHold(executionId)
+            bench.eventually("첫 보류의 사본") { copies(first) == 1 }
+            val opened = bench.get("/host/incidents")["incidents"].single()
+            assertEquals("NEW", opened["openingKind"].asText(), opened.toString())
+            assertTrue(opened["attempt"].isInt, opened.toString())
+            val key = opened["incidentKey"].asText()
+            val firstOpenedAt = opened["firstOpenedAt"].asText()
+            // 처음 선 인시던트의 처음 선 시각은 그 봉인의 시각이다.
+            assertEquals(opened["at"].asText(), firstOpenedAt, opened.toString())
+
+            // 인스턴스 id 는 기동마다 새 값이다(열쇠의 유일성을 진다). 다시 지은 실행은 판단 기록의 보류 판정으로 그 보류를 다시 연다.
+            bench.restartHost()
+            val second = bench.host.instanceId
+            assertNotEquals(first, second)
+            bench.driveToHold("exec-1")
+            bench.eventually("다시 연 보류") { bench.get("/host/incidents")["incidents"].any { it["held"].asBoolean() } }
+            val list = bench.get("/host/incidents")
+            val reopened = list["incidents"].single()
+            assertEquals(
+                listOf("REOPENED", key, firstOpenedAt),
+                listOf(reopened["openingKind"].asText(), reopened["incidentKey"].asText(), reopened["firstOpenedAt"].asText()),
+                reopened.toString(),
+            )
+            val detail = bench.get("/host/incidents/${reopened["incidentId"].asText()}")
+            assertEquals(IDENTITY_FIELDS, detail.fieldNames().asSequence().toList().takeLast(4))
+            assertEquals(listOf(key, firstOpenedAt, "REOPENED"), IDENTITY_FIELDS.take(3).map { detail[it].asText() }, detail.toString())
+            // 앞 인스턴스의 사본도 같은 열쇠를 든다. 화면은 이 열쇠로 둘을 잇는다.
+            val copy = list["earlier"].single()
+            assertEquals(listOf(first, key, "NEW"), listOf(copy["instanceId"].asText(), copy["incidentKey"].asText(), copy["openingKind"].asText()))
+            val copyDetail = bench.get("/host/incidents/${copy["incidentId"].asText()}?instanceId=$first")
+            assertEquals(listOf(key, firstOpenedAt, "NEW"), IDENTITY_FIELDS.take(3).map { copyDetail[it].asText() }, copyDetail.toString())
+
+            // 다시 연 보류를 재작업한 뒤 또 선 보류는 새 사건이다 — 새 열쇠이고 처음 선 것이다.
+            assertEquals("Resolved", bench.resolve("exec-1", WAIT, "REWORK", "kim").body!!["result"].asText())
+            bench.driveToHold("exec-1")
+            bench.eventually("재작업 뒤 보류") { bench.get("/host/incidents")["incidents"].size() == 2 }
+            val again = bench.get("/host/incidents")["incidents"].first()
+            assertEquals("NEW", again["openingKind"].asText(), again.toString())
+            assertNotEquals(key, again["incidentKey"].asText(), again.toString())
+            assertEquals(again["at"].asText(), again["firstOpenedAt"].asText(), again.toString())
+
+            // 이 칸들이 생기기 전에 적은 사본(네 칸 없는 상세 글자)은 넷 다 null 로 읽는다 — 열림의 종류도 모른다.
+            val stored = JSON.readTree(
+                PostgresSupport.queryOne("SELECT detail::text FROM mission.incident_copy WHERE instance_id = '$first'") { it.getString(1) },
+            ) as ObjectNode
+            IDENTITY_FIELDS.forEach { stored.remove(it) }
+            stored.put("instanceId", "mw-old")
+            PostgresSupport.execute(
+                """
+                INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail)
+                VALUES ('mw-old', 'incident-1', 'exec-1', 'JO-0', '$WAIT', '${JSON.writeValueAsString(stored).replace("'", "''")}'::json)
+                """.trimIndent(),
+            )
+            val old = bench.get("/host/incidents/incident-1?instanceId=mw-old")
+            assertTrue(IDENTITY_FIELDS.all { old[it].isNull }, old.toString())
+            assertTrue(bench.get("/host/incidents")["earlier"].single { it["instanceId"].asText() == "mw-old" }.let { row -> IDENTITY_FIELDS.all { row[it].isNull } })
         }
     }
 
@@ -301,6 +367,12 @@ class HostRestoreTest {
             "executionId", "jobOrderId", "workMasterId", "missionVersion", "robotId", "physicalState", "units", "jobResponse", "restoredFrom", "cancel",
             "permitBlock", "blockedFaults", "releases",
         )
+
+        /** 인시던트 목록 줄과 상세의 끝 네 칸(picasso §15.322). */
+        val IDENTITY_FIELDS = listOf("incidentKey", "firstOpenedAt", "openingKind", "attempt")
+
+        fun copies(instanceId: String): Int =
+            PostgresSupport.queryOne("SELECT count(*) FROM mission.incident_copy WHERE instance_id = '$instanceId'") { it.getInt(1) }
 
         val RESTORE_ROW_FIELDS = listOf("jobOrderId", "robotId", "previousInstanceId", "previousExecutionId", "result", "executionId", "reason", "close")
 

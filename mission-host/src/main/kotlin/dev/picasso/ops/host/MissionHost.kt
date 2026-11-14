@@ -561,6 +561,11 @@ class MissionHost(
     private val lock = ReentrantLock(true)
     private val signals = CellBandSignals()
 
+    /**
+     * `instanceId` 를 넘기지 않는다 — picasso 기본값(`mw-<UUID>`)이 생성마다 새 값이다. 그 값이 인시던트 열쇠(`incidentKey`)의 유일성을
+     * 진다(picasso §15.322): 인시던트 id 는 재기동마다 `incident-1` 부터 다시 세므로, 고정하면 다른 사건이 같은 열쇠를 얻어 읽는 쪽이
+     * 서로 다른 보류를 한 사건으로 접는다. 실행 일지·사본·송신 기록의 인스턴스 칸도 이 값이다.
+     */
     private val middleware = Middleware(
         robots = robots, cell = signals, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
         retirements = retirements, entitlements = entitlements,

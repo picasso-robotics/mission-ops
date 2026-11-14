@@ -108,9 +108,9 @@ describe('인시던트', () => {
     const table = await within(region).findByRole('table', { name: '인시던트 목록' })
     expect(within(region).getByText('실행 호스트 인스턴스 mw-1, 인시던트 7건 가운데 최신 3건')).toBeInTheDocument()
     expect(within(table).getAllByRole('row').slice(1).map(cells)).toEqual([
-      ['incident-3', 'h30', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결', '보류 중'],
-      ['incident-2', 'h10', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨', '-'],
-      ['incident-1', 'h5', 'humanoid-01', 'exec-0', 'RACK-204.S01', 'GRASP_FAILED', 'ROBOT', '모름', '코드 정의', '판단 대상 아님', '-'],
+      ['incident-3', 'h30', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결', '보류 중'],
+      ['incident-2', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨', '-'],
+      ['incident-1', 'h5', '-', 'humanoid-01', 'exec-0', 'RACK-204.S01', 'GRASP_FAILED', 'ROBOT', '모름', '코드 정의', '판단 대상 아님', '-'],
     ])
   })
 
@@ -558,6 +558,7 @@ describe('재기동 뒤 인시던트', () => {
       '인스턴스',
       '인시던트',
       '발생 시각',
+      '열림',
       '기체',
       '실행 id',
       '단위',
@@ -568,8 +569,8 @@ describe('재기동 뒤 인시던트', () => {
       '판단',
     ])
     expect(within(table).getAllByRole('row').slice(1).map(cells)).toEqual([
-      ['mw-0', 'incident-1', 'h10', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨'],
-      ['mw-00', 'incident-2', 'h3', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결'],
+      ['mw-0', 'incident-1', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨'],
+      ['mw-00', 'incident-2', 'h3', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결'],
     ])
     expect(within(table).queryByText('보류 중')).toBeNull()
     // 지금 인스턴스의 같은 id 줄은 지금 표에 따로 있다.
@@ -638,6 +639,83 @@ describe('재기동 뒤 인시던트', () => {
     const earlier = screen.getByRole('table', { name: '이전 인스턴스 인시던트 목록' })
     expect(within(earlier).getAllByRole('row')[1]).toHaveClass('selected')
     expect(within(screen.getByRole('table', { name: '인시던트 목록' })).getAllByRole('row')[1]).not.toHaveClass('selected')
+  })
+
+  it('재기동이 다시 연 보류는 열림 칸에 보이고 상세가 같은 사건 열쇠의 이전 인스턴스 사본만 같은 사건으로 잇는다', async () => {
+    const fake = installFakeOps(emptyList)
+    const origin = { incidentKey: 'mw-0/incident-1', firstOpenedAt: 'h5', attempt: 1 }
+    fake.incidents = {
+      ...incidentsView([incidentRow({ ...origin, openingKind: 'REOPENED' })]),
+      earlierTotal: 2,
+      earlier: [
+        earlierRow({ ...origin, openingKind: 'NEW', at: 'h5', resolution: null }),
+        earlierRow({ instanceId: 'mw-00', incidentId: 'incident-2', incidentKey: 'mw-00/incident-2', firstOpenedAt: 'h3', openingKind: 'NEW', attempt: 1 }),
+      ],
+    }
+    fake.incidentDetails.set('incident-1', incidentDetail({ ...origin, openingKind: 'REOPENED' }))
+    fake.earlierDetails.set(
+      'mw-0/incident-1',
+      incidentDetail({ ...origin, instanceId: 'mw-0', at: 'h5', openingKind: 'NEW', unitState: null }),
+    )
+    open()
+    const table = await screen.findByRole('table', { name: '인시던트 목록' })
+    expect(cells(within(table).getAllByRole('row')[1])[2]).toBe('재기동이 다시 엶')
+    const earlier = screen.getByRole('table', { name: '이전 인스턴스 인시던트 목록' })
+    expect(within(earlier).getAllByRole('row').slice(1).map((row) => cells(row)[3])).toEqual(['새로 섬', '새로 섬'])
+
+    const detail = await select('incident-1')
+    const identity = await within(detail).findByRole('region', { name: '사건 정체성' })
+    expect(within(identity).getByRole('note')).toHaveTextContent(
+      '재기동이 다시 연 보류입니다. 새 사건이 아니라 h5에 처음 선 보류와 같은 사건입니다',
+    )
+    expect(field(identity, '사건 열쇠')).toBe('mw-0/incident-1')
+    expect(field(identity, '처음 선 시각')).toBe('h5')
+    expect(field(identity, '시도')).toBe('1')
+    const linked = within(identity).getByRole('list', { name: '같은 사건의 다른 기록' })
+    expect(within(linked).getAllByRole('listitem').map((item) => item.textContent)).toEqual(['mw-0 incident-1 새로 섬, 발생 h5'])
+
+    await userEvent.click(within(linked).getByRole('button', { name: 'mw-0 incident-1 같은 사건 보기' }))
+    expect(await screen.findByRole('heading', { name: 'incident-1 상세(이전 인스턴스 mw-0)' })).toBeInTheDocument()
+    const back = await screen.findByRole('list', { name: '같은 사건의 다른 기록' })
+    expect(within(back).getByRole('button', { name: 'mw-1 incident-1 같은 사건 보기' })).toBeInTheDocument()
+  })
+
+  it('열쇠 없이 다시 연 보류는 연결 불명으로 보이고 열쇠 없는 다른 줄과 잇지 않으며 정체성 칸 없는 사본은 모름이다', async () => {
+    const fake = installFakeOps(emptyList)
+    const unlinked = { incidentKey: null, firstOpenedAt: null, openingKind: 'REOPENED' as const, attempt: 1 }
+    fake.incidents = {
+      ...incidentsView([incidentRow(unlinked)]),
+      earlierTotal: 2,
+      earlier: [earlierRow(unlinked), earlierRow({ instanceId: 'mw-00' })],
+    }
+    fake.incidentDetails.set('incident-1', incidentDetail(unlinked))
+    fake.earlierDetails.set('mw-00/incident-1', incidentDetail({ instanceId: 'mw-00', unitState: null, resolution: rework }))
+    open()
+    const table = await screen.findByRole('table', { name: '인시던트 목록' })
+    expect(cells(within(table).getAllByRole('row')[1])[2]).toBe('재기동이 다시 엶(연결 불명)')
+    const detail = await select('incident-1')
+    const identity = await within(detail).findByRole('region', { name: '사건 정체성' })
+    expect(within(identity).getByRole('note')).toHaveTextContent('원래 보류와의 연결을 모릅니다(연결 불명). 추측해 잇지 않습니다')
+    expect(field(identity, '사건 열쇠')).toBe('없음(연결 불명)')
+    expect(within(identity).queryByRole('list', { name: '같은 사건의 다른 기록' })).toBeNull()
+    expect(identity).not.toHaveTextContent('같은 사건의 다른 기록')
+
+    await userEvent.click(screen.getByRole('button', { name: 'mw-00 incident-1 상세 보기' }))
+    expect(await screen.findByRole('region', { name: '사건 정체성' })).toHaveTextContent(
+      '사건 정체성 모름: 정체성 칸이 생기기 전에 적은 기록입니다',
+    )
+  })
+
+  it('판단자의 종류를 원문 id 와 함께 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    const byAgent: IncidentResolution = { ...rework, decidedBy: { id: 'agent-7', kind: 'AGENT' } }
+    fake.incidents = incidentsView([incidentRow({ held: false, resolution: byAgent })])
+    fake.incidentDetails.set('incident-1', incidentDetail({ held: false, resolution: byAgent }))
+    open()
+    const detail = await select('incident-1')
+    const asserted = await within(detail).findByRole('region', { name: '사람의 판단' })
+    expect(asserted).toHaveTextContent('에이전트가 판단함: agent-7, w20')
+    expect(asserted).not.toHaveTextContent('사람이 판단함')
   })
 
   it('판단은 상세의 instanceId 를 싣고 실행 호스트가 409 INSTANCE_MISMATCH 로 막으면 그 이름을 풀어 보인다', async () => {

@@ -120,7 +120,8 @@ data class IntentView(
 )
 
 /**
- * 인시던트 목록의 한 줄(S3c 스펙 §7.2, S4a 스펙 §6). 앞 14칸은 S3c 그대로이고 뒤 다섯 칸이 S4a 에서 더해졌다.
+ * 인시던트 목록의 한 줄(S3c 스펙 §7.2, S4a 스펙 §6). 앞 14칸은 S3c 그대로이고 그 뒤 다섯 칸이 S4a 에서, 끝 네 칸(정체성)이 picasso
+ * `2711660` 반입 때 더해졌다(S4a JSON 계약 §3 의 20~23).
  *
  * @param at 봉인 라운드의 미들웨어 시각(호스트 시계)
  * @param missionVersion 임무 버전. `null` 이면 코드 정의다
@@ -133,6 +134,7 @@ data class IntentView(
  * @param held 그 단위가 지금 운영자 보류이고 이 인시던트가 그 단위의 가장 최근 미해결(`unresolved` 이고 판단 없음) 인시던트다.
  *   재작업 뒤 다시 보류가 서면 새 인시던트만 참이다
  * @param confirmedWithoutEvidence 판단이 완료 확인이고 봉인 때 확인 결과가 MATCHED 가 아니다(설비 근거 없이 완료 확인)
+ * @param incidentKey·firstOpenedAt·openingKind·attempt 재기동을 넘는 정체성(picasso §15.322, [IncidentIdentity])
  */
 data class IncidentView(
     val incidentId: String,
@@ -154,7 +156,31 @@ data class IncidentView(
     val fault: FaultSummaryView?,
     val held: Boolean,
     val confirmedWithoutEvidence: Boolean,
+    val incidentKey: String? = null,
+    val firstOpenedAt: Instant? = null,
+    val openingKind: String? = null,
+    val attempt: Int? = null,
 )
+
+/**
+ * 재기동을 넘는 인시던트 정체성(picasso §15.322 의 `IncidentBundle.origin`·`openingKind`·`attempt`). 목록 줄과 상세의 끝 네 칸이다.
+ *
+ * - `incidentKey`: **불투명한** 열쇠. 최초 봉인마다 하나 서고 같으면 같은 사건이다 — 재기동이 다시 연 보류는 원래 보류의 열쇠를 잇는다.
+ *   뜯어 읽지 않는다. 다시 연 인시던트의 열쇠가 `null` 이면 옛 판(1~4) 판단 기록으로 다시 연 것이라 **연결 불명**이며, 실행·단위·분류로
+ *   추측해 잇지 않는다. 연결 불명은 이후의 재기동에서도 `null` 로 이어진다.
+ * - `firstOpenedAt`: 최초 봉인의 가상 시계. 다시 연 인시던트의 `at` 은 다시 연 시각이고 이것은 처음 선 시각이다. 열쇠와 함께 있거나 함께 없다.
+ * - `openingKind`: `NEW`(이 인스턴스가 관측으로 연 것)·`REOPENED`(재기동이 판단 기록의 운영자 보류로 다시 연 것).
+ * - `attempt`: 봉인 때 그 단위의 시도 번호. 재발 판정의 재료이고 같은 보류를 잇는 데 쓰지 않는다.
+ *
+ * 넷 다 `null` 이면 이 칸들이 생기기 전(picasso `2711660` 반입 전)에 적은 사본이다 — 열림의 종류도 모른다. 이 호스트가 지금 내는 줄은
+ * `openingKind`·`attempt` 가 늘 있다. 사본(`mission.incident_copy.detail`)은 상세 본문 글자를 그대로 적으므로 이 넷도 함께 남는다(구조 변경 없음).
+ */
+internal data class IncidentIdentity(val incidentKey: String?, val firstOpenedAt: Instant?, val openingKind: String, val attempt: Int) {
+    companion object {
+        fun of(bundle: IncidentBundle) =
+            IncidentIdentity(bundle.origin?.key, bundle.origin?.firstOpenedAt, bundle.openingKind.name, bundle.attempt)
+    }
+}
 
 /**
  * `GET /host/incidents` 의 본문. [incidents] 는 최신부터 많아야 limit 개이고 [total] 은 자르기 전의 수다.
@@ -183,6 +209,7 @@ data class EarlierIncidentView(
  * @param unitState 그 단위의 지금 상태. 실행이 없으면 `null` 이다
  * @param verification 봉인 때의 설비 확인 결과. `NOT_REQUESTED` 는 확인 결과를 묻지 않았다는 뜻이지 설비 확인을 안 했다는 뜻이 아니다
  * @param windowTruncated 근거 윈도우 밖이라 버린 관측이 있는가
+ * @param incidentKey·firstOpenedAt·openingKind·attempt 재기동을 넘는 정체성(picasso §15.322, [IncidentIdentity]). 목록 줄과 같다
  */
 data class IncidentDetailView(
     val instanceId: String,
@@ -214,6 +241,10 @@ data class IncidentDetailView(
     val effectMismatch: String?,
     val linkBroken: Boolean,
     val intent: IntentView,
+    val incidentKey: String? = null,
+    val firstOpenedAt: Instant? = null,
+    val openingKind: String? = null,
+    val attempt: Int? = null,
 )
 
 /**
@@ -236,6 +267,7 @@ internal object IncidentViews {
 
     fun item(bundle: IncidentBundle, held: Boolean): IncidentView {
         val intent = bundle.intent
+        val identity = IncidentIdentity.of(bundle)
         return IncidentView(
             incidentId = bundle.incidentId,
             executionId = bundle.executionId,
@@ -256,6 +288,10 @@ internal object IncidentViews {
             fault = bundle.fault?.let(FaultSummaryView::of),
             held = held,
             confirmedWithoutEvidence = confirmedWithoutEvidence(bundle),
+            incidentKey = identity.incidentKey,
+            firstOpenedAt = identity.firstOpenedAt,
+            openingKind = identity.openingKind,
+            attempt = identity.attempt,
         )
     }
 
@@ -280,10 +316,15 @@ internal object IncidentViews {
         fault = detail.fault?.let { FaultSummaryView(it.failureClass, it.errorType, it.errorHint) },
         held = detail.held,
         confirmedWithoutEvidence = detail.confirmedWithoutEvidence,
+        incidentKey = detail.incidentKey,
+        firstOpenedAt = detail.firstOpenedAt,
+        openingKind = detail.openingKind,
+        attempt = detail.attempt,
     )
 
     fun detail(instanceId: String, bundle: IncidentBundle, held: Boolean, unitState: String?): IncidentDetailView {
         val intent = bundle.intent
+        val identity = IncidentIdentity.of(bundle)
         return IncidentDetailView(
             instanceId = instanceId,
             incidentId = bundle.incidentId,
@@ -332,6 +373,10 @@ internal object IncidentViews {
                 inDoubtGraceSeconds = intent.inDoubtGrace?.let(::seconds),
                 stallWindowSeconds = intent.stallWindow?.let(::seconds),
             ),
+            incidentKey = identity.incidentKey,
+            firstOpenedAt = identity.firstOpenedAt,
+            openingKind = identity.openingKind,
+            attempt = identity.attempt,
         )
     }
 }

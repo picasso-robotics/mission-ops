@@ -122,7 +122,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 
 쿼리 `limit`(선택, 기본 50, 1~500 정수, 밖이면 400 `BAD_REQUEST`)은 S3c 그대로다. 본문 `{"instanceId", "total", "incidents"}` 도 그대로이며 `incidents` 는 최신부터(봉인 역순) 많아야 `limit` 개, `total` 은 자르기 전의 수다. 호스트 잠금 아래에서 읽는다. 호스트 인시던트는 메모리에만 있어 호스트를 재기동하면 사라지고 `instanceId` 가 바뀐다.
 
-줄 하나(19칸, 이 순서):
+줄 하나(23칸, 이 순서):
 
 | # | 칸 | 형 | 뜻 |
 |---|---|---|---|
@@ -142,6 +142,12 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 | 17 | `fault` | 객체 또는 `null` | 이 단위를 실패로 만든 결함의 요약 `{failureClass, errorType, errorHint}`. 하류가 결함 없이 실패를 알렸으면(설비 대기 기한 포함) `null` |
 | 18 | `held` | 참거짓 | 보류 중(아래 정의) |
 | 19 | `confirmedWithoutEvidence` | 참거짓 | `resolution.decision` 이 `CONFIRM_DONE` 이고 봉인 때 확인 결과(`verification`, 상세 칸)가 `MATCHED` 가 아님. 화면의 «설비 근거 없이 완료 확인» 이 이것이다. 호스트가 계산해 낸다(화면이 다시 계산할 필요 없음) |
+| 20 | `incidentKey` | 문자열 또는 `null` | 재기동을 넘는 사건 열쇠(picasso §15.322 `IncidentOrigin.key`). **불투명**하며 같으면 같은 사건이다. 재기동이 다시 연 보류는 원래 보류의 열쇠를 잇는다. `REOPENED` 인데 `null` 이면 옛 판(1~4) 판단 기록으로 다시 연 것이라 연결 불명이고 추측해 잇지 않는다 |
+| 21 | `firstOpenedAt` | 시각 또는 `null` | 최초 봉인의 호스트 시계. `incidentKey` 와 함께 있거나 함께 없다 |
+| 22 | `openingKind` | 문자열 또는 `null` | `NEW`(이 인스턴스가 관측으로 연 것)·`REOPENED`(재기동이 판단 기록의 운영자 보류로 다시 연 것). 지금 호스트는 늘 싣는다 |
+| 23 | `attempt` | 정수 또는 `null` | 봉인 때 그 단위의 시도 번호. 재발 판정의 재료이고 같은 보류를 잇는 데 쓰지 않는다. 지금 호스트는 늘 싣는다 |
+
+20~23 은 picasso `2711660` 반입 때 끝에 붙었다. 넷 다 `null` 이면 그 전에 적은 인시던트 사본(S4b H3)이다 — 사본은 상세 본문 글자를 그대로 적으므로 반입 뒤의 사본은 넷을 함께 든다.
 
 `resolution`(4칸, 이 순서):
 
@@ -175,7 +181,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 
 호스트 잠금 아래에서 읽는다. 없으면 404 `{"error": "INCIDENT_NOT_FOUND", ...}`(재기동으로 사라진 id 도 이것이다).
 
-본문(29칸, 이 순서):
+본문(33칸, 이 순서):
 
 | 칸 | 형 | 뜻 |
 |---|---|---|
@@ -198,6 +204,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 | `effectMismatch` | 문자열 또는 `null` | 효과와 관측의 어긋남 |
 | `linkBroken` | 참거짓 | 실행이 연결이 끊긴 채 돌던 중이었는가 |
 | `intent` | 객체 | 의도 전체(아래) |
+| `incidentKey`, `firstOpenedAt`, `openingKind`, `attempt` | | 목록과 같다(§3 의 20~23) |
 
 결함 객체(9칸, 이 순서): `failureClass`, `errorType`, `vendorDetail`(빈 문자열 가능), `errorHint`(빈 문자열 가능), `references`(`[{key, value}]`, 스킬 수준이면 `KEY_SKILL_ID`·`KEY_TASK_ID`, 로봇 수준이면 빈 배열일 수 있다), `canContinueCurrentTask`, `canAcceptNewTask`, `activeUntilKind`(`KIND_UNTIL_CLEARED`, `KIND_UNTIL_NEW_TASK`, `KIND_UNTIL`), `activeUntilTime`(빈 문자열 가능).
 
@@ -370,7 +377,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 호스트 `GET /host/incidents`(§3)를 그대로 중계한다. 모드와 관계없다.
 
 - 쿼리 `limit`(선택). 있으면 1~500 정수여야 하고 그대로 호스트에 싣는다. 없으면 싣지 않는다(호스트 기본 50). 정수가 아니거나 범위 밖이거나 빈 값(`?limit=`)이면 400 `INCIDENT_BAD_REQUEST`(detail `limit 은 1~500 의 정수다: <값>`)이고 호스트를 부르지 않는다.
-- 200: §3 본문 그대로(`{"instanceId", "total", "incidents"}`, 줄은 19칸).
+- 200: §3 본문 그대로(`{"instanceId", "total", "incidents"}`, 줄은 23칸).
 - 호스트 불통(연결 실패, 시간 초과, 200 아님, 객체 아님): 503 `{"error": "HOST_SILENT", "detail": "실행 호스트가 답하지 않는다: <이유>"}`.
 
 ### 9.3 `GET /api/incidents/{incidentId}`
@@ -379,7 +386,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 
 | 호스트가 한 것 | 운영 서비스 |
 |---|---|
-| 200 객체 | 200, §4 본문 그대로(29칸) |
+| 200 객체 | 200, §4 본문 그대로(33칸) |
 | 404 이고 `error` 가 `INCIDENT_NOT_FOUND` | 404, 호스트 본문 그대로(`{"error": "INCIDENT_NOT_FOUND", "detail": "..."}`) |
 | 그 밖(연결 실패, 시간 초과, 다른 404, 5xx, 200 인데 객체 아님) | 503 `HOST_SILENT` |
 
