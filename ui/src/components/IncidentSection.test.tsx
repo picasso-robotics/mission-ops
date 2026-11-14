@@ -255,6 +255,28 @@ describe('인시던트', () => {
     expect(detail).not.toHaveTextContent('설비 근거 없이 완료 확인')
   })
 
+  it('사람의 걸음(운영자 취소·회복 조치 승인)도 판단 구역에 이름과 원래 값으로 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    const canceled: IncidentResolution = { ...rework, decision: 'OPERATOR_CANCEL' }
+    const applied: IncidentResolution = { ...rework, decision: 'REMEDY_APPLIED' }
+    fake.incidents = incidentsView([
+      incidentRow({ incidentId: 'incident-2', held: false, resolution: canceled }),
+      incidentRow({ incidentId: 'incident-1', held: false, resolution: applied }),
+    ])
+    fake.incidentDetails.set('incident-2', incidentDetail({ incidentId: 'incident-2', held: false, resolution: canceled }))
+    fake.incidentDetails.set('incident-1', incidentDetail({ incidentId: 'incident-1', held: false, resolution: applied }))
+    open()
+    let detail = await select('incident-2')
+    expect(await within(detail).findByRole('region', { name: '사람의 판단' })).toHaveTextContent(
+      '결정 운영자 취소(OPERATOR_CANCEL), 호스트 시각 h20',
+    )
+    detail = await select('incident-1')
+    await waitFor(() => expect(within(detail).getByRole('heading', { name: 'incident-1 상세' })).toBeInTheDocument())
+    expect(await within(detail).findByRole('region', { name: '사람의 판단' })).toHaveTextContent(
+      '결정 회복 조치 승인(REMEDY_APPLIED), 호스트 시각 h20',
+    )
+  })
+
   it('설비 근거 없이 완료 확인은 호스트가 준 표시로만 보이고 화면이 다시 계산하지 않는다', async () => {
     const fake = installFakeOps(emptyList)
     const confirm: IncidentResolution = { ...rework, decision: 'CONFIRM_DONE' }

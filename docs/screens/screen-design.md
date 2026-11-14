@@ -475,6 +475,7 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 | `FAULT_KIND_LABEL` | SKILL_EXECUTION_FAILED «스킬 실패», CONNECTION «연결 상태» | `labels.ts` |
 | `DISPOSITION_LABEL` | SENT «송신», RESTART_DUPLICATE «재기동 중복(송신 안 함)» | `labels.ts` |
 | `DECISION_LABEL` | CONFIRM_DONE «완료 확인», REWORK «재작업» | `labels.ts` |
+| `RESOLUTION_LABEL`(인시던트 판단 칸) | `DECISION_LABEL` 의 둘, OPERATOR_CANCEL «운영자 취소», REMEDY_APPLIED «회복 조치 승인»(모르는 값은 코드 그대로) | `labels.ts` |
 | `CANCEL_RESULT_LABEL` | CANCELED «취소를 걸었습니다. 실행 호스트의 다음 pump 에서 중단(ABORTED)으로 종결합니다», NOT_CANCELABLE «취소할 수 없는 실행입니다», NOT_FOUND «지금 실행 호스트 인스턴스에 없는 실행입니다», REFUSED «에이전트는 실행을 취소하지 못합니다» | `labels.ts` |
 | `REMEDY_CAUSE_LABEL` | NO_CAPABILITY «케이퍼빌리티 없음», DEPTH_LIMIT «탐색 상한 도달»(모르는 값은 코드 그대로) | `labels.ts` |
 | `reviewLabels`(현장 관측) | NOT_CONFIRMED «현장 상태 미확인», NOT_STARTED «현장 미착수 확인», IN_PROGRESS «현장 진행 중 확인», COMPLETED «현장 완료 관측» | `labels.ts` |

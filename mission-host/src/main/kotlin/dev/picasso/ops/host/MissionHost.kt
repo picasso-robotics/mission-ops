@@ -21,6 +21,7 @@ import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.ExecutionUnit
 import dev.picasso.middleware.ForgetOutcome
 import dev.picasso.middleware.IncidentBundle
+import dev.picasso.middleware.IncidentDecision
 import dev.picasso.middleware.InspectAsset
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.JobResponse
@@ -29,6 +30,7 @@ import dev.picasso.middleware.Middleware
 import dev.picasso.middleware.OperatorDecision
 import dev.picasso.middleware.PhysicalState
 import dev.picasso.middleware.PrepareSequencedRack
+import dev.picasso.middleware.ProposalTarget
 import dev.picasso.middleware.RemedyOutcome
 import dev.picasso.middleware.RemedySearchRecord
 import dev.picasso.middleware.Route
@@ -890,6 +892,9 @@ class MissionHost(
      *
      * picasso 가 붙는 것은 로봇 단위의 태스크뿐이다. 플릿 운반이 돌던 실행은 첫 pump 가 플릿에 취소를 보내지 않고 정착한다. 기체에 끝나지
      * 않은 태스크가 없는 경우라 앞 방식(기체에 끝나지 않은 태스크가 있을 때만 미룸)에서도 곧바로 걸었고 거동이 같다.
+     *
+     * 운영자 취소 입구(`cancelByOperator`)가 아니라 `cancel` 이다 — 사람의 걸음은 앞 인스턴스에서 이미 났고 그 인시던트의 판단 칸에 실렸다. 다시
+     * 지은 실행이 다시 연 보류의 인시던트에 지금 시각으로 다시 실으면 사람이 다시 닫은 것처럼 읽힌다.
      */
     private fun carryCancel(cancel: CancelRow, execution: Middleware.Execution) {
         cancels[execution.executionId] = cancel
@@ -951,8 +956,18 @@ class MissionHost(
      * **판정이 막은 기체에는 승인으로도 실행을 세우지 않는다.** picasso 0.11.0 부터 도는 단위 없는 기체에도 제안이 서므로(§15.316) 이 경로가 실제로
      * 닿는다. 승인 접수는 미들웨어 관문을 다시 지나지만 관문은 이 호스트의 제한(진행 중인 실행, 복원 못 한 행, 증언 종결 확인 전, 잔여 파지 표시,
      * 현장 시간값 미적용, 실행 일지 막힘)을 모르므로 [robotRestrictions] 로 먼저 보고 `REFUSED_BY_GATE` 로 거부한다. 제안은 지우지 않는다.
+     *
+     * **발신자 거부 뒤 회복 제안(picasso §15.320)은 맨 앞에서 미들웨어에 그대로 넘긴다.** 그 제안은 사람만 승인하고 값 없는 문은 늘
+     * `HUMAN_APPROVAL_REQUIRED`(대상이 낡았으면 `REMEDY_NOT_APPLIED`)를 받으므로 이 문으로는 실행도 조치도 서지 않는다. 호스트 판정이 먼저
+     * `REFUSED_BY_GATE` 로 답하면 부르는 쪽이 «나중에 다시» 로 읽고 사람에게 넘기지 않는다. 이 호스트는 사람의 회복 입구(`approveRecovery`)를
+     * 아직 열지 않았다 — 그 보류는 운영자 판단(재작업·완료 확인)이나 운영자 취소로 닫는다.
      */
     fun attemptApproval(attempt: ApprovalAttempt): ApprovalOutcome = lock.withLock {
+        if (middleware.proposalTarget(attempt.robotId, attempt.jobOrderId) is ProposalTarget.Hold) {
+            return@withLock approve(middleware, attempt).also {
+                check(it !is ApprovalOutcome.Approved) { "값 없는 문이 회복 제안을 승인했다: ${attempt.robotId} ${attempt.jobOrderId}" }
+            }
+        }
         if (journalBlocked().isNotEmpty()) {
             return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 일지 저장 실패: 호스트 복구 전 승인 차단")
         }
@@ -1531,7 +1546,7 @@ class MissionHost(
         return stored.copy(
             resolution = resolution,
             held = false,
-            confirmedWithoutEvidence = resolution?.decision == OperatorDecision.CONFIRM_DONE.name &&
+            confirmedWithoutEvidence = resolution?.decision == IncidentDecision.CONFIRM_DONE.name &&
                 stored.verification != Verification.MATCHED.name,
             unitState = null,
         )
@@ -1761,14 +1776,16 @@ class MissionHost(
             records.settledSnapshots(instanceId, executionIds = setOf(executionId)).isNotEmpty()
 
     /**
-     * 운영자 실행 취소(P0-b2). 호스트 잠금 아래에서 판정하고, 취소를 DB 에 적은 뒤 미들웨어 `cancel` 을 부른다. 적지 못하면 예외가
-     * 나가고 취소하지 않는다. 실제 중단은 다음 pump 가 하류를 읽고 확정하며, 그 뒤는 보통의 정착 기록(정착 이벤트, `ABORTED` 작업
+     * 운영자 실행 취소(P0-b2). 호스트 잠금 아래에서 판정하고, 취소를 DB 에 적은 뒤 미들웨어 운영자 취소 입구(`cancelByOperator`, picasso
+     * §15.320)를 승인자와 함께 부른다. 적지 못하면 예외가 나가고 취소하지 않는다. 그 입구는 그 실행의 운영자 보류·미확정 단위의 인시던트 판단
+     * 칸에 `OPERATOR_CANCEL` 을 승인자와 함께 싣는다 — «인시던트 → 사람이 닫음 → 탐색» 이 인시던트 데이터로 남는다. 상류의 취소가 아니므로
+     * 판단 칸 없는 `cancel` 을 쓰지 않는다. 실제 중단은 다음 pump 가 하류를 읽고 확정하며, 그 뒤는 보통의 정착 기록(정착 이벤트, `ABORTED` 작업
      * 응답, 잔여 파지 표시)이다.
      *
      * 받는 실행은 물리 상태가 `pumps` 인 것(정착하지 않았거나 부분 완료 `PARTIAL`)뿐이다. 이미 취소를 건 실행(`CANCELING`, 또는 이
      * 인스턴스의 취소 행이 있음)과 실행 일지에 없는 실행은 NOT_CANCELABLE 이다. 이 인스턴스가 정착을 적고 놓은 실행도 정착한 실행이라
-     * NOT_CANCELABLE 이다(상태는 마지막 정착 이벤트의 것). 승인자는 사람이어야 한다(ADR 47 과 같은 규칙).
-     * picasso 의 `cancel` 은 승인자를 받지 않으므로 이 판정은 호스트가 한다.
+     * NOT_CANCELABLE 이다(상태는 마지막 정착 이벤트의 것). 승인자는 사람이어야 한다(ADR 47 과 같은 규칙). picasso 의 입구도 에이전트를
+     * 거절하지만 호스트가 먼저 판정해 취소 행을 적지 않는다.
      *
      * `NOT_FOUND` 는 «그 실행이 지금 인스턴스에 없다» 일 뿐 그 작업 지시를 보내지 않았다는 증거가 아니다(값 없는 승인이 뒤에 실행을 세울 수 있다).
      * 미실행 작업 지시를 폐기하는 취소를 만들면 같은 철회([withdraw])를 거친다.
@@ -1791,7 +1808,8 @@ class MissionHost(
         if (refusal != null) return@withLock CancelView(CancelResult.NOT_CANCELABLE, executionId, state.name, refusal, requestId)
         val row = records.cancel(instanceId, executionId, execution.order.jobOrderId, state.name, approver.id, approver.kind.name, reason)
         cancels[executionId] = row
-        check(middleware.cancel(executionId)) { "미들웨어가 취소를 받지 않았다: $executionId ${state.name}" }
+        val outcome = middleware.cancelByOperator(executionId, approver)
+        check(outcome == ResolveOutcome.Resolved) { "미들웨어가 운영자 취소를 받지 않았다: $executionId ${state.name} $outcome" }
         CancelView(CancelResult.CANCELED, executionId, state.name, null, requestId)
     }
 

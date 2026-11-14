@@ -85,6 +85,12 @@ class HostBench(
     @Volatile
     var snapshotOverride: Pair<Thread, (RobotSnapshot?) -> RobotSnapshot?>? = null
 
+    /**
+     * [gated] 일 때 스냅숏에서 손(`hold`)을 지우는 기체. 손을 싣지 않는 옛 발신자 포트를 흉내 낸다 — 관문은 손을 몰라 받고, 기체에서야 파지
+     * 주어의 사전 조건 거부가 난다(picasso §15.320 의 장면). 바꾸면 다음 호출부터 미친다.
+     */
+    val hiddenHands: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     /** [gated] 일 때 호스트가 하위에 낸 취소(기체, 태스크 id). */
     val cancels = CopyOnWriteArrayList<Pair<String, String>>()
 
@@ -98,7 +104,7 @@ class HostBench(
                 delegate.cancel(robotId, handle).also { cancels += robotId to handle.taskId }
 
             override fun snapshot(robotId: String): RobotSnapshot? {
-                val read = if (robotId in blockedSnapshots) null else delegate.snapshot(robotId)
+                val read = if (robotId in blockedSnapshots) null else delegate.snapshot(robotId)?.let { if (robotId in hiddenHands) it.copy(hold = null) else it }
                 val override = snapshotOverride
                 return if (override != null && override.first == Thread.currentThread()) override.second(read) else read
             }

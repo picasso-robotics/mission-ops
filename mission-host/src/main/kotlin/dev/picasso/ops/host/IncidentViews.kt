@@ -6,9 +6,9 @@ import dev.picasso.contracts.v1.Fault
 import dev.picasso.middleware.Approver
 import dev.picasso.middleware.FaultDetail
 import dev.picasso.middleware.IncidentBundle
+import dev.picasso.middleware.IncidentDecision
 import dev.picasso.middleware.IncidentResolution
 import dev.picasso.middleware.Middleware
-import dev.picasso.middleware.OperatorDecision
 import dev.picasso.middleware.Verification
 import java.time.Duration
 import java.time.Instant
@@ -232,7 +232,7 @@ internal object IncidentViews {
     private fun seconds(iso: String): Long = Duration.parse(iso).seconds
 
     fun confirmedWithoutEvidence(bundle: IncidentBundle): Boolean =
-        bundle.resolution?.decision == OperatorDecision.CONFIRM_DONE && bundle.verification != Verification.MATCHED
+        bundle.resolution?.decision == IncidentDecision.CONFIRM_DONE && bundle.verification != Verification.MATCHED
 
     fun item(bundle: IncidentBundle, held: Boolean): IncidentView {
         val intent = bundle.intent

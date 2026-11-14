@@ -151,7 +151,7 @@ S4a 설계 스펙(`docs/superpowers/specs/2026-10-09-s4a-faults-incidents-design
 
 | 칸 | 뜻 |
 |---|---|
-| `decision` | `CONFIRM_DONE` 또는 `REWORK` |
+| `decision` | `CONFIRM_DONE`·`REWORK`(운영자 판단)·`OPERATOR_CANCEL`(사람의 운영자 취소)·`REMEDY_APPLIED`(사람의 회복 조치 승인) 가운데 하나(picasso `IncidentDecision`, §15.320). 이 호스트가 내는 것은 앞의 셋이다(회복 입구 없음). 판단 요청(§5)의 `decision` 은 앞의 둘뿐이다 |
 | `at` | 판단 시각, 호스트 시계 |
 | `wallClockAt` | 판단 시각, 실제 시각. **운영 서비스의 재조회 대조는 이 칸을 쓴다**(§5.4) |
 | `decidedBy` | `{id, kind}`. `kind` 는 호스트 REST 로 낸 판단이면 늘 `PERSON` 이다. `id` 는 판단 요청의 `approverId` 그대로다 |

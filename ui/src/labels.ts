@@ -6,6 +6,7 @@ import type {
   FaultKind,
   CancelResult,
   HoldDecision,
+  IncidentDecision,
   HostSubmitResult,
   JobResponseDisposition,
   MockRunFailure,
@@ -205,6 +206,16 @@ export const DISPOSITION_LABEL: Record<JobResponseDisposition, string> = {
 export const DECISION_LABEL: Record<HoldDecision, string> = {
   CONFIRM_DONE: '완료 확인',
   REWORK: '재작업',
+}
+
+/**
+ * 인시던트 판단 칸의 값 넷(picasso §15.320). 운영자 판단 둘에 사람의 걸음 둘을 더한다. 회복 조치 승인은 «회복 완료» 가 아니다 — 조치와
+ * 원래 단위의 결과는 그 뒤의 인시던트·작업 응답으로 읽는다.
+ */
+export const RESOLUTION_LABEL: Record<IncidentDecision, string> = {
+  ...DECISION_LABEL,
+  OPERATOR_CANCEL: '운영자 취소',
+  REMEDY_APPLIED: '회복 조치 승인',
 }
 
 /** 실행 호스트 취소 결과(P0-b2). */

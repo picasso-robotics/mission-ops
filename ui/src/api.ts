@@ -1054,7 +1054,7 @@ export const writeCellSignal = (session: Session, name: string, value: string) =
 
 /** 사람이 인시던트의 단위에 낸 판단(S4a JSON 계약 §3). `at` 은 호스트 시계, `wallClockAt` 은 실제 시각이다. */
 export interface IncidentResolution {
-  decision: HoldDecision
+  decision: IncidentDecision
   at: string
   wallClockAt: string
   decidedBy: { id: string; kind: string }
@@ -1238,6 +1238,12 @@ export interface FaultInjectionOutcome {
 }
 
 export type HoldDecision = 'CONFIRM_DONE' | 'REWORK'
+
+/**
+ * 인시던트 판단 칸의 값(picasso `IncidentDecision`, §15.320). 운영자 판단 둘에 사람의 걸음 둘이 더해졌다 — 운영자 취소(`OPERATOR_CANCEL`)와
+ * 회복 조치 승인(`REMEDY_APPLIED`). 판단 입구([HoldDecision])로는 둘째 둘을 보내지 않는다.
+ */
+export type IncidentDecision = HoldDecision | 'OPERATOR_CANCEL' | 'REMEDY_APPLIED'
 
 /** 판단 결과 `NotHeld` 의 `detail` 이 이 값이면 그 실행을 호스트가 보존 기간이 지나 이빅션했다. 호스트 `MissionHost.EVICTED` 와 같은 글자다. */
 export const HOLD_EVICTED = 'EVICTED'
