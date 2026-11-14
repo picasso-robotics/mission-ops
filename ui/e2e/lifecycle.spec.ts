@@ -431,9 +431,9 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   const grasp = incidentTable.getByRole('row').filter({ hasText: 'GRASP_FAILED' })
   // 현장 설정은 버전 3(stallWindow 변경), 임무는 데이터 정의 버전 1 이다.
   await expect(grasp).toContainText('humanoid-01')
-  await expect(grasp.getByRole('cell').nth(7)).toHaveText('버전 3')
-  await expect(grasp.getByRole('cell').nth(8)).toHaveText('버전 1')
-  await expect(grasp.getByRole('cell').nth(9)).toHaveText('판단 대상 아님')
+  await expect(grasp.getByRole('cell').nth(8)).toHaveText('버전 3')
+  await expect(grasp.getByRole('cell').nth(9)).toHaveText('버전 1')
+  await expect(grasp.getByRole('cell').nth(10)).toHaveText('판단 대상 아님')
   await expect(graspRun).toContainText('RACK-204.S01 pick_place: FAILED')
 
   // 잔여 파지(P0-b2). pick_place 가 든 채로 실패했으므로 실행 호스트가 humanoid-01 에 표시를 세우고 일반 배정에서 뺀다(관문 확인용으로만
@@ -502,8 +502,8 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   await expect(holdRun).toContainText('rack-arrival equipment_wait: RUNNING')
   const held = incidentTable.getByRole('row').filter({ hasText: '보류 중' })
   await expect(held).toContainText('SIGNAL_DEADLINE')
-  await expect(held.getByRole('cell').nth(8)).toHaveText('버전 2')
-  await expect(held.getByRole('cell').nth(9)).toHaveText('미해결')
+  await expect(held.getByRole('cell').nth(9)).toHaveText('버전 2')
+  await expect(held.getByRole('cell').nth(10)).toHaveText('미해결')
   await held.getByRole('button', { name: /상세 보기$/ }).click()
   const incidentDetail = page.getByRole('region', { name: '인시던트 상세' })
   await expect(incidentDetail).toContainText('사람의 판단 없음. 아래 값은 모두 관측입니다')
@@ -525,8 +525,8 @@ test('화면에서 기체 생애주기와 어댑터 등록을 한 번 돌고 reg
   await expect(asserted).toContainText('결정 재작업(REWORK)')
   const deadline = incidentTable.getByRole('row').filter({ hasText: 'SIGNAL_DEADLINE' })
   await expect(deadline).toHaveCount(1)
-  await expect(deadline.getByRole('cell').nth(9)).toHaveText('판단됨')
-  await expect(deadline.getByRole('cell').nth(10)).toHaveText('-')
+  await expect(deadline.getByRole('cell').nth(10)).toHaveText('판단됨')
+  await expect(deadline.getByRole('cell').nth(11)).toHaveText('-')
 
   // 작업 응답 송신 기록(S4b 스펙 T10·T11). 보류 작업 지시가 낸 응답이 송신 행으로 남는다. 재기동하지 않았으므로 재기동 중복은
   // 없다. 재기동 단계는 통합 시험(RestartRecoveryTest)이 본다.
