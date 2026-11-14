@@ -12,7 +12,7 @@ export interface WorkRejection {
  /** 이미 끝나 이빅션한 작업 지시라 받지 않았다. 칸이 없던 서버 본문은 undefined 다. */
  forgottenJobOrder?: boolean
 }
-function remedy(rejection: WorkRejection) {
+function remedy(rejection: Pick<WorkRejection, 'remedy' | 'remedyWithheld'>) {
  if(rejection.remedyWithheld) return '조치 제안 보류 · 사람이 먼저 진단'
  const value = rejection.remedy
  if(!value) return null
@@ -25,6 +25,13 @@ export function RejectionSummary({ rejection }: { rejection: WorkRejection }) {
   {missing && <p>{sourceMissingLabel(missing)}</p>}
   {rejection.sourceUnobserved && <p>{sourceUnobservedLabel(rejection.sourceUnobserved)}</p>}
   {other && <p>{other}</p>}{fix && <p>{fix}</p>}</section>
+}
+/** Per-robot remedy answers of a host UNASSIGNED (a proposal stands per robot and job order). Robots without one are left out. */
+export function UnassignedRemedies({ refusals }: { refusals: UnassignedRefusal[] }) {
+ const rows = refusals.map(refusal => ({ refusal, fix: remedy({ remedy: refusal.remedy ?? null, remedyWithheld: refusal.remedyWithheld === true }) })).filter(row => row.fix)
+ if(rows.length === 0) return null
+ return <section aria-label="기체별 조치 제안"><h4>기체별 조치 제안</h4><ul>{rows.map(({ refusal, fix }) => <li key={refusal.robotId}><strong>{refusal.robotId}</strong>
+  <p>{fix}</p>{(refusal.residualHoldMarkers?.length ?? 0) > 0 && <p>잔여 파지 표시 {refusal.residualHoldMarkers!.join(', ')} · 관문 확인으로 얻은 제안 · 승인 뒤에도 표시는 사람이 해소</p>}</li>)}</ul></section>
 }
 /** Per-robot source-missing answers of a host UNASSIGNED. Robots refused for another reason carry none and are left out. */
 export function UnassignedSourceMissing({ refusals }: { refusals: UnassignedRefusal[] }) {

@@ -73,3 +73,15 @@ it('이미 끝나 놓은 작업 지시라는 거부는 거부 사유와 함께 �
   } }} />)
   expect(screen.queryByText(FORGOTTEN_JOB_ORDER_TEXT)).not.toBeInTheDocument()
 })
+
+it('미배정의 기체별 조치 제안을 보이고 관문 확인으로 얻은 제안에는 표시가 남는다는 안내를 붙인다', () => {
+  show([
+    { robotId: 'humanoid-01', reason: '기체 스냅숏의 파지', remedy: { kind: 'FOUND', steps: [{ skillType: 'pick_place' }] }, residualHoldMarkers: [7] },
+    { robotId: 'quadruped-01', reason: '자리가 찼다' },
+  ])
+  const list = screen.getByRole('region', { name: '기체별 조치 제안' })
+  expect(within(list).getByText('humanoid-01')).toBeTruthy()
+  expect(within(list).getByText('조치 제안 1단계: pick_place')).toBeTruthy()
+  expect(within(list).getByText(/잔여 파지 표시 7 · 관문 확인으로 얻은 제안/)).toBeTruthy()
+  expect(within(list).queryByText('quadruped-01')).toBeNull()
+})

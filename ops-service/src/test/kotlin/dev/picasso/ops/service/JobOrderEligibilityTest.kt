@@ -140,4 +140,16 @@ class JobOrderEligibilityTest {
         assertEquals(HostState.OK, view.host)
         assertEquals(emptyList(), bench.judged)
     }
+
+    @Test
+    fun `관문 확인용 기체는 배정 가능이되 표시 사유를 이유 칸에 싣지 않고 관문 확인용으로 낸다`() {
+        bench.robots = RegistryCall.Ok(listOf(robot(HUMANOID)))
+        bench.bindings = RegistryCall.Ok(listOf(binding(HUMANOID)))
+        bench.judge = { ids -> HostCall.Ok(ids.map { pass(it).copy(reasons = listOf("잔여 파지 확인 필요: JO-R rack"), gateTrial = true) }) }
+        val row = judge().row(HUMANOID)
+        assertTrue(row.eligible)
+        assertTrue(row.gateTrial)
+        assertEquals(emptyList(), row.reasons)
+        assertEquals(listOf("잔여 파지 확인 필요: JO-R rack"), row.host!!.reasons)
+    }
 }

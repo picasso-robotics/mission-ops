@@ -64,8 +64,8 @@ export function EligibilityTable({ read, formKey }: Props) {
                 <td>{connection(row)}</td>
                 <td>{row.host === null ? '모름' : (row.host.runningExecutionId ?? '없음')}</td>
                 <td>{skills(row.host?.requiredSkills)}</td><td>{skills(row.host?.availableSkills)}</td><td>{skillFit(row)}</td>
-                <td>{row.eligible ? '가능' : '불가'}</td>
-                <td>{row.reasons.join('; ')}</td>
+                <td>{row.eligible ? (row.gateTrial === true ? '관문 확인용' : '가능') : '불가'}</td>
+                <td>{row.gateTrial === true ? `${(row.host?.reasons ?? []).join('; ')} · 조치 제안만 얻고 실행은 세우지 않음` : row.reasons.join('; ')}</td>
               </tr>
             ))}
           </tbody>

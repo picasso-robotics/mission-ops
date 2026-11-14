@@ -144,7 +144,8 @@ class FaultIncidentTest {
         val request = json.readTree(logged["request"].asText())
         assertEquals("SKILL_EXECUTION_FAILED" to true, request["kind"].asText() to request["state"].isNull, "$logged")
 
-        // 잔여 파지(P0-b2). pick_place 가 든 채로 FAILED 에 정착했으므로 실행 호스트가 표시를 세우고 humanoid-01 을 배정에서 뺀다.
+        // 잔여 파지(P0-b2). pick_place 가 든 채로 FAILED 에 정착했으므로 실행 호스트가 표시를 세운다. 표시만 남은 기체는 일반 배정에서 빠지고
+        // «관문 확인용» 으로만 후보가 된다(조치 제안만 얻고 실행은 세우지 않는다, picasso §15.317). 표시 사유는 호스트 행에 있다.
         val hold = awaitResidualHold()
         assertEquals(
             listOf(HUMANOID, jobOrderId, executionId, "RACK-204.S01"),
@@ -152,8 +153,8 @@ class FaultIncidentTest {
             "$hold",
         )
         val excluded = humanoidEligibility()
-        assertEquals(false, excluded["eligible"].asBoolean(), "$excluded")
-        assertTrue(excluded["reasons"].any { it.asText() == "잔여 파지 확인 필요: $jobOrderId RACK-204.S01" }, "$excluded")
+        assertEquals(true to true, excluded["eligible"].asBoolean() to excluded["gateTrial"].asBoolean(), "$excluded")
+        assertTrue(excluded["host"]["reasons"].any { it.asText() == "잔여 파지 확인 필요: $jobOrderId RACK-204.S01" }, "$excluded")
 
         // 운영자가 현장에서 빈손을 확인해 표시를 푼다. 그 뒤 단계의 작업 지시가 humanoid-01 에 배정된다.
         val markerId = hold["markerId"].asLong()
@@ -167,7 +168,7 @@ class FaultIncidentTest {
             "$clearedRow",
         )
         val assignable = humanoidEligibility()
-        assertEquals(true, assignable["eligible"].asBoolean(), "$assignable")
+        assertEquals(true to false, assignable["eligible"].asBoolean() to assignable["gateTrial"].asBoolean(), "$assignable")
     }
 
     @Test

@@ -442,6 +442,8 @@ export interface HostEligibility {
   runningExecutionId: string | null
   passed: boolean
   reasons: string[]
+  /** 관문 확인용으로만 넘기는 기체(남은 이유가 잔여 파지 표시뿐). 칸이 없던 본문은 undefined 다. */
+  gateTrial?: boolean
 }
 
 /**
@@ -456,6 +458,8 @@ export interface RobotEligibility {
   host: HostEligibility | null
   eligible: boolean
   reasons: string[]
+  /** 배정 가능이지만 관문 확인용이다 — 일반 배정은 서지 않고 조치 제안만 얻는다. 칸이 없던 본문은 undefined 다. */
+  gateTrial?: boolean
 }
 
 export type HostState = 'OK' | 'HOST_SILENT'
@@ -484,7 +488,14 @@ export interface SourceUnobserved { material: string | null; source: string; occ
  * 미배정의 기체별 사유. 가운데 두 칸은 REJECTED 의 같은 이름 칸과 모양이 같고, 그 기체가 출발 결품으로 떨어졌을 때만 값이 있다.
  * `sourceUnobserved` 는 출발 미관측으로 떨어진 기체에만 있다.
  */
-export interface UnassignedRefusal { robotId: string; reason: string; alternativeLocations?: string[] | null; sourceMissing?: SourceMissing | null; sourceUnobserved?: SourceUnobserved | null }
+export interface UnassignedRefusal {
+  robotId: string; reason: string; alternativeLocations?: string[] | null; sourceMissing?: SourceMissing | null; sourceUnobserved?: SourceUnobserved | null
+  /** 이 기체의 조치 탐색 응답. 칸이 없던 본문은 undefined 다. */
+  remedy?: { kind: 'FOUND'; steps: { skillType: string }[] } | { kind: 'NONE'; cause: string } | null
+  remedyWithheld?: boolean
+  /** 관문 확인용으로 넘긴 표시 기체면 그때 열려 있던 잔여 파지 표시 id. */
+  residualHoldMarkers?: number[]
+}
 
 /**
  * 실행 호스트의 제출 결과(S3a JSON 계약 §4). `refusals` 는 미배정일 때 기체별 게이트 사유, `excluded` 는 호스트가 판정에서 뺀 기체다.

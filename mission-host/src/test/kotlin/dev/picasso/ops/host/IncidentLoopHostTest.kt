@@ -142,7 +142,10 @@ class IncidentLoopHostTest {
      * 든 채 실패하고 잔여 파지 표시를 사람이 «빈손 확인» 으로 잘못 푼 기체(2026-11-13 조사 장면). 손은 여전히 든 채다. 그 기체에 빈손을 요구하는
      * 순회를 내면 picasso 관문이 기체 스냅숏의 손으로 거절하고 조치 제안을 세운다(picasso §15.316, 계약 0.11.0).
      */
-    private fun misclearedThenPatrol(bench: HostBench): JsonNode {
+    private fun misclearedThenPatrol(bench: HostBench): JsonNode = heldThenPatrol(bench, clear = true)
+
+    /** 든 채 실패해 잔여 파지 표시가 선 기체에 순회를 낸다. [clear] 면 그 전에 사람이 «빈손 확인» 으로 (잘못) 푼다. */
+    private fun heldThenPatrol(bench: HostBench, clear: Boolean): JsonNode {
         bench.awaitPump()
         val rack = bench.post("/host/job-orders", request(HostBench.rack("JO-R", "RACK-204.S01"), "candidates", HUMANOID)).body!!
         assertEquals("ACCEPTED", rack["result"].asText(), rack.toString())
@@ -159,7 +162,7 @@ class IncidentLoopHostTest {
         assertEquals("FAILED", bench.driveUntil(rack["executionId"].asText(), setOf("FAILED", "UNVERIFIED", "ABORTED", "PARTIAL", "PHYSICALLY_DONE"))["physicalState"].asText())
         bench.eventually("잔여 파지 표시") { bench.get("/host/robots/residual-holds")["holds"].size() == 1 }
         val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
-        assertEquals(200, bench.post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""").status)
+        if (clear) assertEquals(200, bench.post("/host/robots/$HUMANOID/residual-holds/$markerId/clear", """{"approverId":"park","reason":"빈손 확인"}""").status)
         bench.awaitPump()
         return bench.post("/host/job-orders", request(inspect("JO-P", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
     }
@@ -202,6 +205,67 @@ class IncidentLoopHostTest {
             )
         }
     }
+
+    @Test
+    fun `표시를 풀지 않은 기체는 관문 확인으로 조치 제안을 얻고, 값 없는 승인이 표시 예외로 회복 실행을 세우되 표시는 남는다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            bench.awaitPump()
+            // 판정은 표시 사유만 남은 기체를 «관문 확인용» 으로 통과시킨다 — 운영 서비스가 후보로 넘길 수 있게.
+            val patrol = heldThenPatrol(bench, clear = false)
+            val markerId = bench.get("/host/robots/residual-holds")["holds"][0]["markerId"].asLong()
+            assertEquals("UNASSIGNED", patrol["result"].asText(), patrol.toString())
+            val refusal = patrol["refusals"].single()
+            assertEquals(HUMANOID, refusal["robotId"].asText())
+            assertEquals("FOUND", refusal["remedy"]["kind"].asText(), refusal.toString())
+            assertEquals(listOf(markerId), refusal["residualHoldMarkers"].map { it.asLong() })
+            assertEquals(0, patrol["excluded"].size(), patrol.toString())
+            assertEquals(0, journaled("JO-P"), "관문 확인용 기체에 실행이 섰다")
+
+            val eligibility = bench.post("/host/eligibility", request(inspect("JO-E", "T1" to "bay-7"), "robotIds", HUMANOID)).body!!["robots"].single()
+            assertEquals(listOf(true, true), listOf(eligibility["passed"].asBoolean(), eligibility["gateTrial"].asBoolean()), eligibility.toString())
+
+            // 값 없는 승인 — 이번 인스턴스가 관문 확인으로 세운 제안이라 표시 사유를 빼고 받는다. 일지·판단 기록·연결이 한 트랜잭션이다.
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, approved) = approve(port, AGENT, "JO-P", saw = listOf("pick_place"))
+            assertEquals("APPROVED", approved["outcome"].asText(), approved.toString())
+            val executionId = approved["executionId"].asText()
+            assertEquals(1, journaled("JO-P"))
+            assertEquals(
+                listOf(markerId to executionId),
+                PostgresSupport.queryAll("SELECT marker_id, execution_id FROM mission.robot_residual_hold_recovery WHERE job_order_id = 'JO-P'") {
+                    it.getLong(1) to it.getString(2)
+                },
+            )
+            assertEquals(1, bench.get("/host/robots/residual-holds")["holds"].size(), "승인이 표시를 풀었다")
+
+            // 회복 실행이 내려놓아 손이 비어도 표시는 그대로다. 다음 순회는 관문이 통과시키지만 채택하지 않고 표시 사유로 뺀다.
+            assertEquals("PHYSICALLY_DONE", bench.driveUntil(executionId, settledStates)["physicalState"].asText(), "조치 뒤 원래 순회가 끝나지 않았다")
+            val next = bench.post("/host/job-orders", request(inspect("JO-Q", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
+            assertEquals("UNASSIGNED", next["result"].asText(), next.toString())
+            assertEquals(0, next["refusals"].size(), next.toString())
+            val held = next["excluded"].single()
+            assertEquals(false, held["passed"].asBoolean())
+            assertTrue(held["reasons"].any { it.asText().startsWith(MissionHost.RESIDUAL_HOLD_REASON) }, held.toString())
+            assertEquals(0, journaled("JO-Q"))
+        }
+    }
+
+    @Test
+    fun `관문 확인으로 세우지 않은 제안은 표시 기체에서 값 없이 승인되지 않는다`() {
+        HostBench(incidentLoop = loop(putDown)).use { bench ->
+            heldThenPatrol(bench, clear = false)
+            // JO-P 의 제안은 관문 확인으로 섰다. 다른 작업 지시는 이 인스턴스가 관문 확인으로 세운 제안이 없다 — 표시 사유가 남아 미들웨어에 넘기기 전에 막는다.
+            bench.host.approve = { _, attempt -> fail("미들웨어에 넘기지 않아야 한다: $attempt") }
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val (_, refused) = approve(port, AGENT, "JO-NONE", saw = listOf("pick_place"))
+            assertEquals(listOf("REFUSED", "REFUSED_BY_GATE"), listOf(refused["outcome"].asText(), refused["refusal"].asText()), refused.toString())
+            assertTrue(MissionHost.RESIDUAL_HOLD_REASON in refused["reason"].asText(), refused.toString())
+            assertEquals(0, journaled("JO-NONE"))
+        }
+    }
+
+    private fun journaled(jobOrderId: String): Int =
+        PostgresSupport.queryAll("SELECT count(*) FROM mission.execution_journal WHERE job_order_id = '$jobOrderId'") { it.getInt(1) }.single()
 
     /** 작업 지시 하나를 정착시키고 picasso 메모리에서 놓일 때까지 기다린다. 그 작업 응답 id 를 돌려준다. */
     private fun settle(bench: HostBench, jobOrderId: String): String {

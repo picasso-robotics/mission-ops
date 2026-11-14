@@ -152,8 +152,9 @@ class ExecutionControlTest {
                 listOf("robotId", "jobOrderId", "executionId", "instanceId", "unitId").map { hold[it].asText() },
             )
 
+            // 표시만 남은 기체는 «관문 확인용» 으로만 통과한다 — 일반 배정은 서지 않는다(picasso §15.317).
             val excluded = bench.judge()
-            assertEquals(false, excluded["passed"].asBoolean())
+            assertEquals(true to true, excluded["passed"].asBoolean() to excluded["gateTrial"].asBoolean(), excluded.toString())
             assertTrue(excluded["runningExecutionId"].isNull, excluded.toString())
             assertEquals(listOf("${MissionHost.RESIDUAL_HOLD_REASON}: JO-1 $S02"), excluded["reasons"].map { it.asText() })
             val submitted = bench.post("/host/job-orders", request(rack("JO-9", S03), "candidates", HUMANOID)).body!!
@@ -176,7 +177,7 @@ class ExecutionControlTest {
             assertEquals(hold, cleared.body["hold"])
             assertEquals(listOf("park", "PERSON", "현장에서 기체 빈손 확인"), listOf("approverId", "approverKind", "reason").map { cleared.body["clearing"][it].asText() })
             assertEquals(emptyList(), bench.holds())
-            assertEquals(true, bench.judge()["passed"].asBoolean())
+            assertEquals(true to false, bench.judge().let { it["passed"].asBoolean() to it["gateTrial"].asBoolean() })
 
             val again = bench.clear(HUMANOID, markerId)
             assertEquals(409, again.status)

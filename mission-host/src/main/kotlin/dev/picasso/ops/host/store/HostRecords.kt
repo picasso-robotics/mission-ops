@@ -736,6 +736,31 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .query { rs, _ -> clearingRow(rs) }
             .single()
 
+    /**
+     * 표시와 회복 실행의 연결 한 행을 적는다(V14). 실행 일지와 같은 [inTransaction] 안에서 부른다. 같은 (표시, 실행)이 이미 있으면
+     * `DuplicateKeyException`(쓰기 실패)이다.
+     */
+    fun residualHoldRecovery(markerId: Long, executionId: String, jobOrderId: String, approverId: String) {
+        jdbc.sql(
+            """
+            INSERT INTO mission.robot_residual_hold_recovery (marker_id, execution_id, job_order_id, approver_id)
+            VALUES (:markerId, :executionId, :jobOrderId, :approverId)
+            """.trimIndent(),
+        )
+            .param("markerId", markerId)
+            .param("executionId", executionId)
+            .param("jobOrderId", jobOrderId)
+            .param("approverId", approverId)
+            .update()
+    }
+
+    /** 표시 하나의 회복 실행들(V14). 적은 순서다. 화면이 해소 전에 보여 준다. */
+    fun residualHoldRecoveries(markerId: Long): List<Pair<String, String>> =
+        jdbc.sql("SELECT execution_id, job_order_id FROM mission.robot_residual_hold_recovery WHERE marker_id = :markerId ORDER BY approved_at, execution_id")
+            .param("markerId", markerId)
+            .query { rs, _ -> rs.getString(1) to rs.getString(2) }
+            .list()
+
     // ── 운영자 결함 감수(V11)
 
     /** 감수 한 행을 적는다. 같은 [requestId] 가 이미 있으면 `DuplicateKeyException`(쓰기 실패)이다. */

@@ -137,7 +137,7 @@ function InterfaceCaller({ row, session }: { row: MissionInterfaceView; session:
   }, [deploymentSignature])
   const signature = JSON.stringify([input, row.status, row.deployment?.deploymentVersion, session.mode, session.user])
   const currentAssessment = assessment?.signature === signature ? assessment.value : null
-  const ready = currentAssessment?.eligibility.registry === 'OK' && currentAssessment.eligibility.host === 'OK' && currentAssessment.eligibility.robots?.some(robot => robot.eligible === true) === true
+  const ready = currentAssessment?.eligibility.registry === 'OK' && currentAssessment.eligibility.host === 'OK' && currentAssessment.eligibility.robots?.some(robot => robot.eligible === true && robot.gateTrial !== true) === true
   const canRequest = !!currentAssessment && (ready || !!row.requiredStationId)
   async function assess() {
     if (sending.current) return
