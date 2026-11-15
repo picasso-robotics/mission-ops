@@ -178,6 +178,20 @@
 - 기대하는 결과: 복원 보고가 그 작업 지시를 «리빌드했습니다» 로 보이고, 다시 지은 실행이 같은 참조로 그 운반에 다시 붙어 끝까지 따라가 E2 로 끝납니다. `dispatches` 는 재기동 전과 같습니다(새 운반 없음). 근거 시험: 통합 시험 `FleetTransportTest` 의 `실행 호스트만 재기동하면 같은 운반에 다시 붙어 끝까지 추적하고 현장의 맡긴 횟수는 하나다`.
 - 다르면: 운반 단위가 `FAILED`(«모르는 운반») 로 끝나면 현장도 재기동돼 플릿 장부가 비었을 수 있습니다 — 그 결과는 운반 실패가 아니라 «모름» 입니다(보장 아님: 현장 재기동 복구, 장부 소실과 빈 장부 구분 불가). 현장에서 용기가 어디 있는지 확인합니다. 복원 못 한 행으로 남은 플릿 운반 작업 지시는 운영자 종결로 닫지 않습니다(`FLEET_UNIT_OPEN`, 계획을 못 지어 모르는 것도 플릿 임무면 플릿으로 봄) — 기체 정지 확인은 플릿 정지의 증거가 아닙니다. 플릿 포트 없이 띄운 실행 호스트는 그 행을 «미룬 실행»(`FLEET_PORT_ABSENT`)으로 두므로, 플릿 포트를 붙여 실행 호스트를 다시 띄우면 복원됩니다. 정지한 동안 인계가 끝나 근거 창을 넘겼으면 그 단위는 `UNVERIFIED` 로 끝납니다. 끝나지 않은 플릿 단위가 있는 작업 지시의 잔여 파지 표시도 빈손 확인을 받지 않습니다(409 `FLEET_UNIT_OPEN`). 작업 허가는 플릿 맡기기를 막지 않습니다(picasso §15.219) — 셀 문을 열어도 플릿 운반은 나갑니다.
 
+### D1-7 사본 확인 전 내림 경고
+- 사전 조건: 실행 호스트 로그에 경고 «사본 확인 전 내림이 올랐다 — 사본 표에서 빠졌을 수 있다: 인시던트 a→b (대기 n), 탐색 c→d (대기 m)» 이 났거나, `GET /host/executions/summary` 의 `ledgerCopy.incidents`·`ledgerCopy.remedySearches` 에서 `evictedBeforeCopy` 가 0 이 아닙니다. 실행 호스트는 pump 마다 두 대장의 줄을 사본 표(`mission.incident_copy`·`incident_copy_revision`·`remedy_search_copy`)에 커밋하고 확인하므로 평소 `pending` 은 0 이고 `evictedBeforeCopy` 는 늘 0 입니다.
+- 조작: 같은 응답의 `pending`·`overCap`·`exposed` 와 `journalBlockedExecutionIds` 를 봅니다. 실행 호스트 로그에서 «pump 뒤 기록 실패, 다음 pump 에 다시 한다» 경고가 이어지는지 봅니다(DB 쓰기 실패면 확인이 멈추고 `pending` 이 늘기만 합니다). `journalBlockedExecutionIds` 가 비지 않았으면 pump 가 서 있어 확인도 멈춥니다 — 일지 막힘부터 복구합니다(«판단 기록으로 재기동 넘기기»). DB 를 복구하면 다음 pump 가 남은 줄을 적고 확인해 `pending` 이 0 으로 돌아옵니다.
+- 확인할 곳: 실행 호스트 `GET /host/executions/summary` 의 `ledgerCopy`(루프백), `GET /host/incidents`·`GET /host/remedy-searches`(지금 인스턴스 대장과 이전 인스턴스 사본), DB 의 세 사본 표.
+- 기대하는 결과: `pending` 이 0 으로 돌아오고 `evictedBeforeCopy` 가 더 오르지 않습니다. 누계는 그 인스턴스가 뜬 뒤의 값이라 0 으로 내려가지 않습니다(재기동하면 0 부터). 근거 시험: `LedgerCopyHostTest` 의 `사본은 식별자로 모아 작은 상한에서 이빅션한 뒤에도 인시던트 줄이 빠지지 않고 판단은 개정 줄로 적으며 확인 전 내림은 0 이다`, `내보내기 파일은 DB 커밋 뒤에만 게시되고 커밋이 풀리면 사본 표와 같은 줄을 게시한다`.
+- 다르면: 오른 만큼의 줄은 사본 표에 없을 수 있고 picasso 메모리에서도 내려가 되살릴 길이 없습니다(복원 입구 없음, 보장 문서 «두 대장 사본의 범위»). 빠진 시간대를 사고 기록으로 남기고, 그 시간대의 인시던트는 송신 기록(`job_response_log`)·판단 기록·실행 일지로 대조합니다. 확인 대기 한도는 picasso 기본(대장 상한과 같음)이라 운영 설정으로 열지 않습니다.
+
+### D1-8 pump 뒤 기록의 되풀이 실패
+- 사전 조건: 실행 호스트 로그에 «pump 뒤 기록 실패, 다음 pump 에 다시 한다» 경고가 pump 마다(250ms) 같은 SQL 오류로 되풀이됩니다. 함께 `GET /host/executions/summary` 의 `ledgerCopy.*.pending` 이 늘기만 하고, 작업 응답 송신 기록(`GET /host/job-responses`)과 결과 피드에 새 행이 없으며, 정착한 실행이 놓이지 않습니다.
+- 조작: 오류 문장이 DB 연결·권한 문제인지, 특정 행(사본 표의 제약 이름 `remedy_search_copy_*`·`incident_copy_line_pair`, `jsonb` 변환 오류 «unsupported Unicode escape sequence» 등)인지 가릅니다. 연결·권한이면 DB 를 복구합니다 — 다음 pump 가 남은 것을 한 번에 적고 확인합니다. 특정 줄이면 운영 조작으로 풀 길이 없습니다: 그 줄이 picasso 대장에 남는 동안(확인 전이라 상한도 내리지 않음) 되풀이되므로 사고로 올리고 개발 쪽이 원인 줄을 고칩니다. 실행 호스트 재기동은 그 줄을 메모리에서 버려 기록을 다시 돌게 하지만, 그 인스턴스의 확인 안 된 줄과 송신 안 된 작업 응답이 함께 사본에서 빠집니다(재기동 뒤 다시 지은 실행은 판단 기록으로 이어짐).
+- 확인할 곳: 실행 호스트 로그, `GET /host/executions/summary` 의 `ledgerCopy`·`pumpedAt`, `GET /host/job-responses`.
+- 기대하는 결과: 원인을 고친 뒤 경고가 그치고 `pending` 이 0 으로 돌아오며 밀린 송신 기록이 적힙니다.
+- 다르면: 보장 문서 «두 대장 사본의 범위» 의 DB 거부 줄 항목입니다.
+
 ### D1 에서 확인하는 기록
 | 기록 | 화면 | API | 알 수 있는 것 |
 |---|---|---|---|
@@ -187,6 +201,7 @@
 | 기체 퇴역 지금 | 없음 | 실행 호스트 `GET /host/retirements`(루프백, 운영 서비스 경로 없음) | `declared`(registry 주소가 있어 퇴역 포트를 붙였는가), `retired[]`(기체 id 순, 칸 `robotId`·`reason`), `readAt`(마지막 읽기 성공 시각), `lastReadAt`(성공 실패를 가리지 않은 마지막 읽기 시각), `readError`(마지막 읽기가 실패했으면 그 까닭). 주소가 비면 `declared` false. |
 | 잔여 파지 표시 | 운영 → «배정 가능» 아래 «잔여 파지 확인» | `GET /api/robots/residual-holds` | 미해소 표시(`markerId`, `robotId`, `jobOrderId`, `executionId`, `instanceId`, `unitId`, `objectRef`, `recordedAt`). 해소한 표시는 목록에서 빠지고 해소 기록(승인자·사유·시각)은 호스트 표 `mission.robot_residual_hold_clearing` 과 조작 기록 `CONFIRM_ROBOT_EMPTY` 행에 있음. |
 | 작업 응답 송신 기록 | 운영 → «작업 응답 송신 기록» | `GET /api/job-responses?jobOrderId=` | `SENT` 와 `RESTART_DUPLICATE` 처분 |
+| 두 대장의 사본과 같은 조치 승인 횟수 | 없음 | 실행 호스트 `GET /host/executions/summary` 의 `ledgerCopy`, `GET /host/remedy-searches`, `GET /host/repeated-remedies?atLeast=`(루프백, 운영 서비스 경로 없음) | 사본 확인 대기·확인 전 내림(D1-7), 지금 인스턴스와 이전 인스턴스의 조치 탐색 줄(picasso 글자 그대로, 가림 줄에 `steps` 없음), 인스턴스를 넘어 합산한 (기체, 조치 유형 열)마다 승인 수 |
 | 플릿 연결과 플릿 세계 | 운영 개요 «호스트 실행 관측» 의 «플릿 연결» | `GET /api/executions/summary` 의 `fleet`(`connected`·`url`), 현장 `GET /fleet/world`(루프백, 운영 서비스 경로 없음) | 실행 호스트에 플릿 포트가 있는가와 그 주소, 인계 자리마다 용기와 놓인 시각, 막힌 자리, 맡긴 횟수(`dispatches`, 같은 참조 재전송은 세지 않음) |
 | 결과 버전과 전달 | «외부 결과 · 수신 확인», «로컬 Mock MES 결과 전달» | `GET /api/work-requests/{id}` 의 `latestResult`·`deliveries`, `GET /integration/v1/job-orders/{id}/results/{version}` | 결과 버전, `resultHash`, 전달 상태, 수신 확인 |
 | 결과 수집 상태 | 운영 개요 «결과 자동 수집» | `GET /api/work-requests/collector` | 커서 순번, 마지막 번호, 생산자 id |

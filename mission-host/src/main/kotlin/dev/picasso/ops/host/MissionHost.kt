@@ -18,6 +18,8 @@ import dev.picasso.middleware.ApprovalRefusal
 import dev.picasso.middleware.Approver
 import dev.picasso.middleware.DeliverContainer
 import dev.picasso.middleware.ApproverKind
+import dev.picasso.middleware.CopyAck
+import dev.picasso.middleware.CopyAckState
 import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.ExecutionUnit
@@ -30,6 +32,7 @@ import dev.picasso.middleware.InspectAsset
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.JobResponse
 import dev.picasso.middleware.JudgmentRecordWire
+import dev.picasso.middleware.LedgerExport
 import dev.picasso.middleware.LogicalCapability
 import dev.picasso.middleware.Middleware
 import dev.picasso.middleware.OperatorDecision
@@ -68,11 +71,14 @@ import dev.picasso.ops.host.web.BadRequest
 import dev.picasso.ops.host.web.HostRequests
 import dev.picasso.ops.host.store.CancelRow
 import dev.picasso.ops.host.store.CloseRow
+import dev.picasso.ops.host.store.ApprovalFactWrite
 import dev.picasso.ops.host.store.CopyResolutionRow
 import dev.picasso.ops.host.store.FaultReleaseRow
 import dev.picasso.ops.host.store.HoldObservation
 import dev.picasso.ops.host.store.HostRecords
 import dev.picasso.ops.host.store.IncidentCopyRow
+import dev.picasso.ops.host.store.IncidentRevisionWrite
+import dev.picasso.ops.host.store.SearchCopyWrite
 import dev.picasso.ops.host.store.JournalEvent
 import dev.picasso.ops.host.store.JournalRow
 import dev.picasso.ops.host.store.JournalEventKind
@@ -537,8 +543,14 @@ data class HostFootprint(
  * 기록(판정·검증 결과·정착, 송신 기록과 한 트랜잭션), 운영자 판단 직후다. 직전에 적은 글자와 같으면 적지 않는다. 기동 복원은 그
  * 작업 지시의 가장 최근 기록을 `resume` 에 넘긴다. 못 읽는 기록과 picasso 가 거부한 기록(`RESUME_RECORD_MISMATCH`)은 GAVE_UP 으로
  * 보고하고 기록 없이 다시 짓지 않는다. 결함 감수([release])는 감수 직후 기록을 적어 `acknowledgedFaults` 칸이 재기동을 넘는다. 이
- * 호스트는 조치 승인(`approveRemedy`)을 부르지 않으므로 `approval` 칸은 이 호스트가 지은 실행에서 늘 비어 있다. 기록이 들고 오면 그대로
- * 넘긴다.
+ * 호스트는 사람이 값을 넣는 조치 승인(`approveRemedy`)을 부르지 않으므로 `approval` 칸은 값 없는 승인([attemptApproval])으로 선 실행에만
+ * 있고, 그 기록은 실행 일지·같은 조치 승인 사실과 한 트랜잭션으로 적는다([journalApproval]). 기록이 들고 오면 그대로 넘긴다.
+ *
+ * ## 두 대장의 사본(picasso §15.166·§15.327, V17)
+ *
+ * 인시던트 대장과 조치 탐색 대장의 영속 소유자는 이 호스트다 — 보관·조회이고 picasso 로 되돌려 넣는 복원 입구는 없다. [RETENTION] 이 사본을
+ * 선언하고, pump 뒤 기록([recordAfterPump])이 줄을 picasso `LedgerExport` 글자 그대로 사본 표에 적어 커밋한 뒤 확인한다. 같은 조치의 승인 횟수의
+ * 정본은 승인 사실 표의 합산이다([repeatedRemedies]).
  *
  * ## 인스턴스와 심장박동(HA 설계 기록 §8 단계 0)
  *
@@ -668,8 +680,28 @@ class MissionHost(
      */
     private data class SettleMark(val responseId: String?, val at: Instant, val reopened: Boolean = false)
 
-    /** 사본을 적은 인시던트 수. 미들웨어의 인시던트 목록은 덧붙이기만 하므로 이 색인 뒤가 새로 봉인된 것이다. */
-    private var copiedIncidents = 0
+    /**
+     * 사본에 줄을 적은 인시던트 — 인시던트 id 에서 마지막으로 적은 번들·개정 번호·줄(V17, picasso §15.327). **개수가 아니라 식별자로 고른다** — 사본
+     * 선언 아래에서는 확인한 줄을 상한이 앞에서부터 내리므로 목록의 길이가 상한에 머물고, 개수로 세면 그 뒤 새 인시던트를 영영 적지 않는다. 대장에 남은
+     * id 만 든다(커밋 뒤 대장에 없는 id 를 뺀다 — 내린 인시던트는 다시 바뀌지 않는다). [CopiedLine.bundle] 은 같은 객체면 줄이 같다는 빠른 판정이다
+     * (picasso 는 바뀐 번들을 새 객체로 갈아 끼운다).
+     */
+    private val copiedLines = mutableMapOf<String, CopiedLine>()
+
+    private data class CopiedLine(val bundle: IncidentBundle, val revision: Int, val line: String)
+
+    /** 사본에 적은 탐색 id. 대장에 남은 id 만 든다. 탐색 기록은 적힌 뒤 바뀌지 않는다. */
+    private val copiedSearches = mutableSetOf<String>()
+
+    /**
+     * 값 없는 승인으로 섰는데 실행 일지·판단 기록·승인 사실을 적지 못한 실행 id([attemptApproval] 일반 경로). 일지에 없으므로 [journalBlocked] 에 들어
+     * pump·제출·승인을 막고, 다음 pump 가 그것들 앞에서 한 트랜잭션으로 다시 적는다([saveApprovals]). 프로세스 안에만 있다 — 죽으면 그 실행은 넘어오지
+     * 않지만 그 사이 pump 도 돌지 않아 로봇 명령은 나가지 않았다.
+     */
+    private val unjournaledApprovals = linkedSetOf<String>()
+
+    /** 마지막으로 본 «확인 전 내림» 누계(인시던트, 탐색). 오르면 경고를 남긴다([watchCopyAcks]). */
+    private var evictedBeforeCopy = 0L to 0L
 
     /** 판단 행을 적은 인시던트 id. */
     private val copiedResolutions = mutableSetOf<String>()
@@ -1019,6 +1051,8 @@ class MissionHost(
                 permits?.observe(cell, fetchedAt)
                 val at = clock.now()
                 retryDeferred()
+                // 값 없는 승인으로 섰는데 적지 못한 실행도 pump 전에 다시 적는다(일지 없이 그 실행의 로봇 명령이 나가지 않게).
+                saveApprovals()
                 // 다시 돈 실행의 기록이 커밋되기 전에는 미들웨어 pump 를 돌리지 않는다(그 실행의 로봇 명령이 pump 에서 나간다).
                 recordReruns()
                 // 판단 뒤 적지 못한 판단 기록도 pump 전에 다시 적는다(재작업의 새 시도가 그 기록보다 먼저 나가지 않게).
@@ -1027,9 +1061,9 @@ class MissionHost(
                 (robots as? HostRobotPort)?.readNowFor(startingRobots())
                 middleware.pump()
                 pumpedAt = at
-                // 기록 뒤에는 정착한 실행을 놓아 그 작업 응답이 아웃박스에서 빠질 수 있다. 그 전에 사본에 담는다.
-                exportIncidents()
+                // 기록이 커밋된 뒤 사본을 확인하고 파일을 게시하며, 그 뒤에 정착한 실행을 놓는다([recordAfterPump]).
                 recordAfterPump()
+                watchCopyAcks()
             }
         } catch (e: Exception) {
             log.warn("pump 실패: {}", e.toString())
@@ -1037,17 +1071,62 @@ class MissionHost(
     }
 
     /**
-     * 인시던트 고리로 파일을 낸다. pump 직후, 기록과 놓기([recordAfterPump]) 전에 부른다. 실패는 pump 를 멈추지 않는다 — 다음 pump 가 같은
-     * 사본을 다시 쓴다. 호스트 잠금 아래에서 부른다.
+     * 인시던트 고리로 파일을 낸다. [recordAfterPump] 가 **DB 커밋 뒤, 놓기([forgetSettled]) 앞**에 부른다 — 커밋이 실패한 pump 의 줄은 게시하지 않는다
+     * (파일이 DB 보다 앞서지 않는다). 자료([incidents]·[searches]·[responses])는 기록이 커밋한 것과 같은 것으로 놓기 전에 모은다. 실패는 pump 를 멈추지
+     * 않는다 — [IncidentExport] 가 본 줄을 들고 있어 다음 게시가 같은 사본을 다시 쓴다. 커밋이 실패하면 놓지도 확인하지도 않으므로 그 자료는
+     * 미들웨어에 남아 다음 pump 가 다시 모은다. 호스트 잠금 아래에서 부른다.
      */
-    private fun exportIncidents() {
+    private fun publish(incidents: List<IncidentBundle>, searches: List<RemedySearchRecord>, responses: List<JobResponse>) {
         val export = exported ?: return
         try {
-            export.observe(middleware.incidents(), middleware.remedySearches(), middleware.responses(), clock.now())
+            export.observe(incidents, searches, responses, clock.now())
         } catch (e: Exception) {
-            log.warn("인시던트 고리 내보내기 실패: {}", e.toString())
+            log.warn("인시던트 고리 내보내기 실패, 다음 pump 에 다시 쓴다: {}", e.toString())
         }
     }
+
+    /**
+     * 사본 확인 상태를 읽어 «확인 전 내림»(picasso `CopyLedgerState.evictedBeforeCopy`)이 올랐으면 경고를 남긴다. 그만큼 사본 표에서 빠졌을 수 있다
+     * (확인 대기 한도를 넘었다 — 사본 수집이 멈췄거나 한도가 작다). pump 마다 잠금 아래에서 부른다.
+     */
+    private fun watchCopyAcks() {
+        val state = middleware.copyAcks()
+        val now = state.incidents.evictedBeforeCopy to state.remedySearches.evictedBeforeCopy
+        if (now.first > evictedBeforeCopy.first || now.second > evictedBeforeCopy.second) {
+            log.warn(
+                "사본 확인 전 내림이 올랐다 — 사본 표에서 빠졌을 수 있다: 인시던트 {}→{} (대기 {}), 탐색 {}→{} (대기 {})",
+                evictedBeforeCopy.first, now.first, state.incidents.pending, evictedBeforeCopy.second, now.second, state.remedySearches.pending,
+            )
+        }
+        evictedBeforeCopy = now
+    }
+
+    /**
+     * 줄 글자가 같은 새 번들([recordAfterPump] 의 `unchanged`)을 든 것으로 바꾸고 그 id 를 다시 확인한다. 그 줄은 앞 트랜잭션에서 이미 커밋됐다 —
+     * 확인하지 않으면 picasso 가 다시 올린 확인 대기(`pending`)가 영영 남아 상한이 그 번들을 내리지 못한다. 기록 트랜잭션이 실패한 pump 에서는 부르지
+     * 않고 다음 pump 가 다시 견준다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun reackUnchanged(unchanged: List<CopiedLine>) {
+        if (unchanged.isEmpty()) return
+        unchanged.forEach { copiedLines[it.bundle.incidentId] = it }
+        middleware.ackCopiedIncidents(unchanged.map { it.bundle.incidentId })
+    }
+
+    /**
+     * picasso `LedgerExport.incidentLine` 을 부르는 자리. 시험이 줄에 싣지 않는 변경(같은 글자 재검토)을 만들려고 바꾼다. 호스트 잠금 아래에서 부른다.
+     */
+    @Volatile
+    internal var incidentLine: (IncidentBundle) -> String = LedgerExport::incidentLine
+
+    /**
+     * 인시던트 검토(picasso `Middleware.reviewIncident`). REST 로 열지 않았다 — 시험이 검토로 줄이 바뀌는(또는 같은 글자로 다시 확인 대기에 오르는) 장면을
+     * 만드는 자리다. 호스트 잠금 아래에서 부른다.
+     */
+    internal fun reviewIncident(incidentId: String, verdict: dev.picasso.middleware.ReviewVerdict, cause: String): Boolean =
+        lock.withLock { middleware.reviewIncident(incidentId, verdict, cause) }
+
+    /** 사본 선언의 지금 상태(picasso `Middleware.copyAcks`, §15.327). 호스트 상태 응답이 싣는다. */
+    internal fun copyAcks(): CopyAckState = lock.withLock { middleware.copyAcks() }
 
     /**
      * 값 없는 승인 시도(picasso `Middleware.attemptApproval`, ADR 44). 승인 호스트가 부른다. 호스트 잠금 아래에서 판정하고, 승인으로 새 실행이
@@ -1107,9 +1186,15 @@ class MissionHost(
                 journalRecovery(execution, markers, attempt.approver.id)
                 trialProposals.remove(attempt.robotId to attempt.jobOrderId)
             } else if (!existed) {
+                // 일반 승인 경로도 일지·판단 기록·승인 사실을 한 트랜잭션에 적는다. 실패하면 [unjournaledApprovals] 에 두어 pump·제출·승인을 막고 다음 pump
+                // 앞에서 다시 적는다 — 판단 기록만 빠진 채 일지가 커밋되면 그 사이 죽을 때 승인된 조치 열과 소모가 복원 기록에서 빠진다.
                 val execution = middleware.executions().first { it.executionId == outcome.executionId }
-                journal(execution)
-                persistRecord(execution.executionId)
+                try {
+                    journalApproval(execution)
+                } catch (e: Exception) {
+                    unjournaledApprovals += execution.executionId
+                    throw JournalWriteFailed(execution.executionId, e)
+                }
             } else {
                 recordReruns()?.let { throw JournalWriteFailed(outcome.executionId, it) }
             }
@@ -1453,22 +1538,67 @@ class MissionHost(
      * 판단 기록을 따로 적으면 그 실패가 경고로 끝나 다음 pump 전에 죽을 때 승인된 조치 열이 복원 기록에서 빠진다. 실패는 [JournalWriteFailed] 다.
      */
     private fun journalRecovery(execution: Middleware.Execution, markers: List<Long>, approverId: String) {
-        val order = execution.order
-        val text = changedRecords().firstOrNull { it.first.executionId == execution.executionId }?.second
         try {
-            records.inTransaction {
-                records.journal(
-                    order.jobOrderId, execution.robotId, orderJson(order), order.workMasterId, execution.missionVersion,
-                    middleware.instanceId, execution.executionId,
-                )
-                text?.let { writeRecord(execution, it) }
-                markers.forEach { records.residualHoldRecovery(it, execution.executionId, order.jobOrderId, approverId) }
-            }
+            journalApproval(execution, markers, approverId)
         } catch (e: Exception) {
             throw JournalWriteFailed(execution.executionId, e)
         }
+    }
+
+    /**
+     * 승인으로 선 새 실행의 실행 일지, 판단 기록(승인 칸에 조치 열과 소모가 든다), 같은 조치 승인 사실(V17), [markers] 가 있으면 표시와 실행의 연결을
+     * **한 트랜잭션**에 적는다. 판단 기록은 일지보다 먼저 정해지므로 [changedRecords](일지에 있는 실행만 본다)가 아니라 미들웨어에서 바로 읽는다.
+     * 커밋한 뒤에만 [journaled]·[recorded] 를 고친다. 실패하면 예외가 나가고 아무것도 남지 않는다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun journalApproval(execution: Middleware.Execution, markers: List<Long> = emptyList(), approverId: String? = null) {
+        val order = execution.order
+        val text = middleware.judgmentRecord(execution.executionId)?.let(JudgmentRecordWire::encode)
+        val fact = approvalFact(execution)
+        records.inTransaction {
+            records.journal(
+                order.jobOrderId, execution.robotId, orderJson(order), order.workMasterId, execution.missionVersion,
+                middleware.instanceId, execution.executionId,
+            )
+            text?.let { writeRecord(execution, it) }
+            fact?.let { records.approvalFact(instanceId, it) }
+            markers.forEach { records.residualHoldRecovery(it, execution.executionId, order.jobOrderId, checkNotNull(approverId)) }
+        }
         journaled[order.jobOrderId] = order.version
         text?.let { recorded[order.jobOrderId] = it }
+    }
+
+    /**
+     * 그 실행의 판단 기록이 든 승인(`RecordedApproval`)을 같은 조치 승인 사실로 옮긴다. 승인으로 서지 않은 실행이면 `null` 이다. 서명은 (기체, 승인된
+     * 걸음의 조치 유형 열)이고 승인자 종류로 가르지 않는다(picasso `RemedyDesk.settle` 과 같은 규칙).
+     */
+    private fun approvalFact(execution: Middleware.Execution): ApprovalFactWrite? =
+        middleware.judgmentRecord(execution.executionId)?.approval?.let { a ->
+            ApprovalFactWrite(
+                execution.executionId, execution.order.jobOrderId, a.robotId, a.steps.map { it.skillType }, a.approver.id, a.approver.kind.name,
+                a.at, a.wallClockAt,
+            )
+        }
+
+    /**
+     * [unjournaledApprovals] 를 다시 적는다([journalApproval]). 적었거나 더 적을 것이 없으면(실행이 메모리에 없음, 이미 일지에 있음) 뺀다. 실패하면 남겨
+     * pump 를 막고 다음 pump 가 다시 한다. pump 가 막혀 있었으므로 그 실행은 승인 때 그대로이고 판단 기록도 같은 글자다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun saveApprovals() {
+        if (unjournaledApprovals.isEmpty()) return
+        val live = middleware.executions().associateBy { it.executionId }
+        unjournaledApprovals.toList().forEach { executionId ->
+            val execution = live[executionId]
+            if (execution == null || execution.order.jobOrderId in journaled) {
+                unjournaledApprovals -= executionId
+                return@forEach
+            }
+            try {
+                journalApproval(execution)
+                unjournaledApprovals -= executionId
+            } catch (e: Exception) {
+                log.warn("승인으로 선 실행을 적지 못했다, 적을 때까지 pump·제출·승인을 막는다: {} {}", executionId, e.toString())
+            }
+        }
     }
 
     private fun orderJson(order: JobOrder): String = json.writeValueAsString(
@@ -1564,6 +1694,7 @@ class MissionHost(
             states = states,
             journalBlockedExecutionIds = journalBlocked(),
             fleet = fleetLink,
+            ledgerCopy = LedgerCopyView.of(middleware.copyAcks()),
         )
     }
 
@@ -1738,6 +1869,37 @@ class MissionHost(
         )
     }
 
+    /**
+     * 조치 탐색 대장(V17). 지금 인스턴스의 것은 호스트 잠금 아래에서 미들웨어 대장을 picasso 줄로 옮기고, 이전 인스턴스의 것은 잠금 밖에서 사본 표로
+     * 읽는다. 둘 다 최근부터 많아야 [limit] 개다. 줄은 picasso 글자 그대로라 `WITHHELD` 줄에 `steps` 가 없다.
+     */
+    fun remedySearches(limit: Int): RemedySearchesView {
+        val (total, live) = lock.withLock {
+            val all = remedySearches(middleware)
+            all.size to all.asReversed().take(limit).map { record ->
+                val line = LedgerExport.remedySearchLine(record)
+                RemedySearchLineView(
+                    instanceId, record.searchId, record.jobOrderId, record.robotId, json.readTree(line).path("outcome").asText(),
+                    LedgerExport.LINE_SCHEMA_VERSION, line,
+                )
+            }
+        }
+        return RemedySearchesView(
+            instanceId = instanceId,
+            total = total,
+            searches = live,
+            earlierTotal = records.earlierSearchCount(instanceId),
+            earlier = records.earlierSearches(instanceId, limit).map(RemedySearchLineView::of),
+        )
+    }
+
+    /**
+     * 같은 조치가 [atLeast] 번 이상 승인된 것 — 승인 사실 표의 합산(인스턴스를 넘어, V17)이다. picasso `repeatedRemedies` 는 이 인스턴스 안의 수라
+     * 쓰지 않는다. DB 만 읽고 호스트 잠금을 잡지 않는다.
+     */
+    fun repeatedRemedies(atLeast: Int): RepeatedRemediesView =
+        RepeatedRemediesView(atLeast, records.repeatedRemedies(atLeast).map(RepeatedRemedyView::of))
+
     /** 송신 기록(S4b 스펙 T6). 최근부터 많아야 [limit] 개다. DB 만 읽고 호스트 잠금을 잡지 않는다. */
     fun jobResponses(jobOrderId: String?, limit: Int): JobResponsesView = JobResponsesView(
         instanceId = instanceId,
@@ -1758,18 +1920,44 @@ class MissionHost(
      *
      * 잔여 파지 표시(P0-b2): 정착 이벤트를 적는 실행 가운데 [residualHoldUnit] 이 단위를 내는 것은 같은 트랜잭션에서 표시를 적는다.
      * 작업 지시마다 하나라 이미 있으면 적지 않는다. 판정이 읽는 사본은 커밋된 뒤에만 늘린다.
+     *
+     * 두 대장의 사본(V17, picasso §15.327): 같은 트랜잭션에 새 인시던트의 첫 줄, 줄이 바뀐 인시던트(검토·판단)의 개정 줄, 새 탐색의 줄을 picasso
+     * `LedgerExport` 의 글자 그대로 적는다. 고르는 것은 개수가 아니라 식별자다([copiedLines]·[copiedSearches]). **커밋한 뒤에** 그 id 로
+     * `ackCopiedIncidents`·`ackCopiedSearches` 를 부른다 — 커밋 전에 부르면 그 사이 죽을 때 상한이 줄을 내려 사본에서 빠진다. 트랜잭션이 실패하면
+     * 확인하지 않으므로 줄이 picasso 에 남아 다음 pump 가 다시 적는다(유일 열쇠로 멱등). 파일 게시([publish])는 커밋 뒤, 놓기 앞이다.
      */
     private fun recordAfterPump() {
         val pending = middleware.pending()
         val incidents = middleware.incidents()
-        val fresh = incidents.drop(copiedIncidents)
+        val searches = remedySearches(middleware)
+        val responses = middleware.responses()
+        val fresh = incidents.filter { it.incidentId !in copiedLines }
+        // 줄이 같은 새 객체 — 적을 것은 없지만 picasso 가 그 id 를 다시 확인 대기로 올렸을 수 있다(`revised`). 이미 커밋된 줄이므로 확인만 다시 보낸다.
+        val unchanged = mutableListOf<CopiedLine>()
+        val revised = incidents.mapNotNull { bundle ->
+            val copied = copiedLines[bundle.incidentId] ?: return@mapNotNull null
+            if (copied.bundle === bundle) return@mapNotNull null
+            val line = incidentLine(bundle)
+            if (line == copied.line) {
+                unchanged += copied.copy(bundle = bundle)
+                null
+            } else {
+                CopiedLine(bundle, copied.revision + 1, line)
+            }
+        }
+        val freshSearches = searches.filter { it.searchId !in copiedSearches }
         val resolved = incidents.filter { it.resolution != null && it.incidentId !in copiedResolutions }
-        val latest = latestResponses(middleware.responses())
+        val latest = latestResponses(responses)
         val settled = middleware.executions().filter {
             !it.physicalState.pumps && it.order.jobOrderId in journaled && !settleRecorded(it, latest)
         }
         val judgments = changedRecords(latest)
-        if (pending.isEmpty() && fresh.isEmpty() && resolved.isEmpty() && settled.isEmpty() && judgments.isEmpty()) {
+        if (
+            pending.isEmpty() && fresh.isEmpty() && revised.isEmpty() && freshSearches.isEmpty() && resolved.isEmpty() &&
+            settled.isEmpty() && judgments.isEmpty()
+        ) {
+            reackUnchanged(unchanged)
+            publish(incidents, searches, responses)
             forgetSettled(latest)
             return
         }
@@ -1778,6 +1966,12 @@ class MissionHost(
         // 정착 이력(HA 설계 기록 §10): 정착 이벤트에 그때의 실행 본문을 같이 적는다. 화면은 정착 실행을 메모리가 아니라 이것에서 읽는다.
         val snapshots = if (settled.isEmpty()) emptyList() else view(settled).executions.map(json::writeValueAsString)
         val copies = fresh.map { it to json.writeValueAsString(IncidentViews.detail(instanceId, it, it.incidentId in held, unitStateOf(it))) }
+        val freshLines = fresh.associate { it.incidentId to incidentLine(it) }
+        val searchRows = freshSearches.map { record ->
+            // 줄은 picasso 글자 그대로다 — 가림(`WITHHELD`)의 걸음을 제안 표에서 꺼내 채우지 않는다. outcome 칸은 그 줄에서 읽는다.
+            val line = LedgerExport.remedySearchLine(record)
+            SearchCopyWrite(record.searchId, record.jobOrderId, record.robotId, json.readTree(line).path("outcome").asText(), line)
+        }
         val marked = mutableListOf<ResidualHoldRow>()
         try {
             records.inTransaction {
@@ -1789,8 +1983,16 @@ class MissionHost(
                 )
                 pending.forEach(::logResponse)
                 copies.forEach { (bundle, detail) ->
-                    records.copyIncident(instanceId, bundle.incidentId, bundle.executionId, bundle.jobOrderId, bundle.unitId, detail)
+                    records.copyIncident(
+                        instanceId, bundle.incidentId, bundle.executionId, bundle.jobOrderId, bundle.unitId, detail,
+                        LedgerExport.LINE_SCHEMA_VERSION, freshLines.getValue(bundle.incidentId),
+                    )
                 }
+                records.copyIncidentRevisions(
+                    instanceId, LedgerExport.LINE_SCHEMA_VERSION,
+                    revised.map { IncidentRevisionWrite(it.bundle.incidentId, it.revision, it.line) },
+                )
+                records.copySearches(instanceId, LedgerExport.LINE_SCHEMA_VERSION, searchRows)
                 resolved.forEach { bundle ->
                     val resolution = bundle.resolution!!
                     records.copyResolution(
@@ -1812,13 +2014,25 @@ class MissionHost(
             log.warn("pump 뒤 기록 실패, 다음 pump 에 다시 한다: {}", e.toString())
             return
         }
-        copiedIncidents = incidents.size
+        fresh.forEach { copiedLines[it.incidentId] = CopiedLine(it, 1, freshLines.getValue(it.incidentId)) }
+        revised.forEach { copiedLines[it.bundle.incidentId] = it }
+        copiedSearches += freshSearches.map { it.searchId }
         judgments.forEach { (execution, text) -> recorded[execution.order.jobOrderId] = text }
         copiedResolutions += resolved.map { it.incidentId }
+        // 대장에서 내린 id 는 다시 오지 않는다(인스턴스 안의 셈) — 남은 id 만 든다.
+        val present = incidents.mapTo(HashSet()) { it.incidentId }
+        copiedLines.keys.retainAll(present)
+        copiedResolutions.retainAll(present)
+        copiedSearches.retainAll(searches.mapTo(HashSet()) { it.searchId })
+        // 커밋 뒤 확인 — pump 와 같은 스레드·잠금이다. 확인한 줄은 picasso 의 다음 정리에서 상한대로 내린다.
+        (fresh.map { it.incidentId } + revised.map { it.bundle.incidentId }).takeIf { it.isNotEmpty() }?.let(middleware::ackCopiedIncidents)
+        reackUnchanged(unchanged.filter { it.bundle.incidentId in present })
+        freshSearches.takeIf { it.isNotEmpty() }?.let { middleware.ackCopiedSearches(it.map(RemedySearchRecord::searchId)) }
         val committedAt = clock.now()
         settled.forEach { settleMarks[it.executionId] = SettleMark(latest[it.executionId]?.jobResponseId, committedAt) }
         openHolds += marked
         pending.forEach { middleware.ack(it.jobResponseId) }
+        publish(incidents, searches, responses)
         forgetSettled(latest)
     }
 
@@ -1852,6 +2066,13 @@ class MissionHost(
     /** picasso `Middleware.attemptApproval` 을 부르는 자리. 시험이 승인으로 선 실행을 주입하려고 바꾼다. 호스트 잠금 아래에서 부른다. */
     @Volatile
     internal var approve: (Middleware, ApprovalAttempt) -> ApprovalOutcome = { m, attempt -> m.attemptApproval(attempt) }
+
+    /**
+     * picasso `Middleware.remedySearches` 를 부르는 자리. 이 호스트는 가림(`withholdEvery`)을 켜지 않으므로 `WITHHELD` 탐색이 서지 않는다 — 시험이 그
+     * 줄을 사본 경로에 주입하려고 바꾼다. 호스트 잠금 아래에서 부른다.
+     */
+    @Volatile
+    internal var remedySearches: (Middleware) -> List<RemedySearchRecord> = { it.remedySearches() }
 
     /** picasso `Middleware.forget` 를 부르는 자리. 시험이 거절과 모름을 주입하려고 바꾼다. 호스트 잠금 아래에서 부른다. */
     @Volatile
@@ -2334,8 +2555,11 @@ class MissionHost(
         if (reruns.isEmpty()) return null
         val ids = reruns.mapTo(HashSet()) { it.execution.executionId }
         val judgments = changedRecords().filter { it.first.executionId in ids }
+        // 값 없는 승인이 이미 선 실행에 조치 열을 실으면 개정판으로 다시 돈다. 그 승인 사실도 같은 트랜잭션에 적는다(같은 승인은 열쇠가 한 번만 받는다).
+        val facts = reruns.filter { it.revised }.mapNotNull { approvalFact(it.execution) }
         try {
             records.inTransaction {
+                facts.forEach { records.approvalFact(instanceId, it) }
                 reruns.forEach { rerun ->
                     val execution = rerun.execution
                     val jobOrderId = execution.order.jobOrderId
@@ -2836,10 +3060,13 @@ class MissionHost(
         val DEFAULT_REVISABLE_RETENTION: Duration = Duration.ofMinutes(5)
 
         /**
-         * 미들웨어에 넘기는 보존 상한(picasso `Retention`). 상한은 모두 picasso 기본이고 놓은 작업 지시 표시의 넘침만 `EVICT` 로 선언한다
-         * (picasso §15.324) — 실행 일지가 같은 작업 지시 id 의 접수와 승인을 picasso 를 부르기 전에 거부하므로([journalRefusal]) 그 약속을 진다.
+         * 미들웨어에 넘기는 보존 상한(picasso `Retention`). 상한은 모두 picasso 기본이고 두 가지를 선언한다.
+         * - 놓은 작업 지시 표시의 넘침 `EVICT`(picasso §15.324) — 실행 일지가 같은 작업 지시 id 의 접수와 승인을 picasso 를 부르기 전에 거부하므로
+         *   ([journalRefusal]) 그 약속을 진다.
+         * - 두 대장의 사본 `CopyAck()`(picasso §15.327) — 인시던트 줄·탐색 줄은 pump 뒤 기록이 사본 표에 커밋하고 확인할 때까지 상한이 내리지 않는다
+         *   ([recordAfterPump]). 확인 대기 한도는 picasso 기본(대장 상한과 같음)이다 — 확인은 pump 마다라 한 주기에 쌓이는 줄(개정 줄 포함)은 한도보다 훨씬 적다.
          */
-        val RETENTION: Retention = Retention(forgottenOverflow = ForgottenOverflow.EVICT)
+        val RETENTION: Retention = Retention(forgottenOverflow = ForgottenOverflow.EVICT, copyAck = CopyAck())
 
         /**
          * 받은 재작업 시도를 처음 내기 직전에 다시 읽은 손·자리가 물리 관문을 못 지나 태스크 없이 `FAILED` 로 닫힌 시도의 실패 분류(picasso §15.323

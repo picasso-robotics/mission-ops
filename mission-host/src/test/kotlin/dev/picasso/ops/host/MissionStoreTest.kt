@@ -23,7 +23,7 @@ class MissionStoreTest {
     @BeforeTest
     fun freshSchema() {
         PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        assertEquals(16, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+        assertEquals(17, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
     }
 
     private fun draft(workMaster: String = PSR) = store.saveDraft(workMaster, "{}", "lee", UUID.randomUUID())
@@ -39,7 +39,8 @@ class MissionStoreTest {
             listOf(
                 "draft", "execution_cancel", "execution_close", "execution_close_confirmed", "execution_fault_release", "execution_journal", "execution_journal_event", "execution_journal_revision", "execution_judgment_record",
                 "flyway_schema_history",
-                "host_instance", "incident_copy", "incident_copy_resolution", "job_order_withdrawal", "job_response_log", "mission_version", "mock_run", "result_outbox",
+                "host_instance", "incident_copy", "incident_copy_resolution", "incident_copy_revision", "job_order_withdrawal", "job_response_log", "mission_version",
+                "mock_run", "remedy_approval", "remedy_search_copy", "result_outbox",
                 "result_producer", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
             ),
             placed,
@@ -101,6 +102,52 @@ class MissionStoreTest {
         assertFailsWith<SQLException> {
             PostgresSupport.execute("INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, detail) VALUES ('JO-1', 'FORGOTTEN', 'mw-1', 'x')")
         }
+    }
+
+    @Test
+    fun `V17 사본 표 셋은 덧붙이기만 하고 유일 열쇠가 한 번만 받으며 WITHHELD 탐색 줄은 steps 를 들지 못한다`() {
+        PostgresSupport.execute(
+            "INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail, wire_version, line) " +
+                "VALUES ('mw-1', 'incident-1', 'exec-1', 'JO-1', 'u', '{}', '9', '{\"incidentId\":\"incident-1\"}')",
+        )
+        // 줄 칸이 생기기 전의 행은 둘 다 NULL 이다. 하나만 있으면 받지 않는다.
+        PostgresSupport.execute(
+            "INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail) VALUES ('mw-0', 'incident-1', 'exec-1', 'JO-0', 'u', '{}')",
+        )
+        val revision = "INSERT INTO mission.incident_copy_revision (instance_id, incident_id, revision, wire_version, line) VALUES ('mw-1', 'incident-1', 2, '9', '{}')"
+        PostgresSupport.execute(revision)
+        val search = "INSERT INTO mission.remedy_search_copy (instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line) " +
+            "VALUES ('mw-1', 'search-1', 'JO-1', 'r', 'WITHHELD', '9', '{\"searchId\":\"search-1\",\"outcome\":\"WITHHELD\"}')"
+        PostgresSupport.execute(search)
+        val approval = "INSERT INTO mission.remedy_approval (instance_id, execution_id, job_order_id, robot_id, remedy_types, approver_id, approver_kind, approved_at, wall_clock_at) " +
+            "VALUES ('mw-1', 'exec-1', 'JO-1', 'r', '[\"pick_place\"]', 'a', 'AGENT', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        PostgresSupport.execute(approval)
+        listOf(
+            "incident_copy_revision" to "line = 'x'", "remedy_search_copy" to "outcome = 'x'", "remedy_approval" to "approver_id = 'x'",
+        ).forEach { (table, set) ->
+            listOf("UPDATE mission.$table SET $set", "DELETE FROM mission.$table", "TRUNCATE mission.$table CASCADE").forEach { sql ->
+                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                assertTrue("덧붙이기만 한다" in e.message!!, "$sql: ${e.message}")
+            }
+        }
+        listOf(
+            // 같은 개정·탐색·승인은 두 번 적지 못한다(호스트는 ON CONFLICT DO NOTHING 으로 멱등하게 적는다).
+            revision, search, approval.replace("'mw-1', 'exec-1'", "'mw-2', 'exec-9'"),
+            // 개정은 2 부터이고 사본 없는 인시던트의 개정은 없다.
+            revision.replace(", 2,", ", 1,"), revision.replace("'incident-1'", "'incident-9'"),
+            // 줄과 판은 함께 있다.
+            "INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail, line) VALUES ('mw-1', 'incident-2', 'e', 'JO', 'u', '{}', '{}')",
+            // 탐색의 outcome 칸은 줄의 outcome 이고, WITHHELD 줄은 steps 를 들지 못한다.
+            search.replace("'search-1', 'JO-1'", "'search-2', 'JO-1'").replace("'WITHHELD', '9'", "'FOUND', '9'"),
+            search.replace("search-1", "search-3").replace("\"WITHHELD\"}", "\"WITHHELD\",\"steps\":[]}"),
+            // 줄에 outcome 키가 없으면(NULL 비교) 받지 않는다.
+            search.replace("search-1", "search-4").replace(",\"outcome\":\"WITHHELD\"}", "}"),
+            // 승인자 종류는 둘뿐이다.
+            approval.replace("'AGENT'", "'ROBOT'").replace("'a',", "'b',"),
+        ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+        assertEquals(listOf(1, 1, 1), listOf("incident_copy_revision", "remedy_search_copy", "remedy_approval").map { table ->
+            PostgresSupport.queryOne("SELECT count(*) FROM mission.$table") { it.getInt(1) }
+        })
     }
 
     @Test

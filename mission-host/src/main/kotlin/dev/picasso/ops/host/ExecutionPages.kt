@@ -126,6 +126,7 @@ data class SettledPageView(
  * @param states `PhysicalState` 이름마다 남은 실행 가운데 그 상태인 수. 이름 열한 개가 0 이어도 다 든다
  * @param journalBlockedExecutionIds 일지에 막힌 실행 id. `GET /host/executions` 의 같은 칸과 같다
  * @param fleet 이 호스트의 플릿 연결(`host.fleet.url`). 없으면 `connected` 가 거짓이다
+ * @param ledgerCopy 두 대장의 사본 확인 상태(picasso §15.327). 확인 대기·상한 초과·확인 전 내림
  */
 data class ExecutionSummaryView(
     val instanceId: String,
@@ -134,6 +135,7 @@ data class ExecutionSummaryView(
     val states: Map<String, Int>,
     val journalBlockedExecutionIds: List<String>,
     val fleet: FleetLinkView = FleetLinkView(false, null),
+    val ledgerCopy: LedgerCopyView = LedgerCopyView.UNREAD,
 )
 
 /**
