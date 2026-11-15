@@ -20,6 +20,8 @@ import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.ExecutionUnit
 import dev.picasso.middleware.ForgetOutcome
+import dev.picasso.middleware.ForgottenOrdersState
+import dev.picasso.middleware.ForgottenOverflow
 import dev.picasso.middleware.IncidentBundle
 import dev.picasso.middleware.IncidentDecision
 import dev.picasso.middleware.InspectAsset
@@ -35,6 +37,8 @@ import dev.picasso.middleware.RemedyOutcome
 import dev.picasso.middleware.RemedySearchRecord
 import dev.picasso.middleware.Route
 import dev.picasso.middleware.ResolveOutcome
+import dev.picasso.middleware.Retention
+import dev.picasso.middleware.RetentionEvictions
 import dev.picasso.middleware.RetirementPort
 import dev.picasso.middleware.RobotPort
 import dev.picasso.middleware.SiteTimingsSource
@@ -499,6 +503,13 @@ data class HostFootprint(
  * 아웃박스는 활성 실행과 두는 실행만큼만 남는다. 놓은 실행은 인자 없는 목록과 좁힌 목록이 정착 이벤트의 본문으로 싣는다([executions]).
  * 재기동 뒤에는 picasso 가 놓은 작업 지시를 모르므로 실행 일지가 같은 작업 지시 id 의 새 실행을 막는다([submit]).
  *
+ * 놓은 작업 지시 표시가 상한(`Retention.forgottenOrders`, picasso 기본 100,000)에 차면 오래된 표시부터 내리라고 선언한다
+ * ([RETENTION], `ForgottenOverflow.EVICT`, picasso §15.324). 선언하지 않으면 picasso 기본(`REFUSE`)이 그 뒤의 놓기를 모두 거부해
+ * [forgetSettled] 가 pump 마다 거절 경고를 쌓고 picasso 실행 표와 호스트 쪽 맵이 상한을 넘어 계속 는다. 이 선언은 약속이다 — 내린 표시의
+ * 작업 지시 id 는 picasso 가 더는 거부하지 않으므로, 같은 id 의 접수([submit])와 값 없는 승인([attemptApproval])을 picasso 를 부르기 전에
+ * 실행 일지([journalRefusal])가 막는다(재기동 전후 같은 확인). 다른 상한은 picasso 기본 그대로다.
+ * picasso `Middleware.releaseForgotten` 은 부르지 않는다 — 남은 최근 표시가 일지 다음의 둘째 방어선이라 놓기마다 지우면 그 방어선을 버린다.
+ *
  * ## 판단 기록(picasso 한계 §15.221 · 판단 기록 영속)
  *
  * 미들웨어의 판단 기록(`Middleware.judgmentRecord`)을 `mission.execution_judgment_record` 에 덧붙인다. 받는 때는 수락 직후, pump 뒤
@@ -522,6 +533,8 @@ data class HostFootprint(
  *   모의 실행의 별도 미들웨어에는 주지 않는다(T10).
  * @param revisableRetention `FAILED`·`UNVERIFIED` 로 정착한 실행을 정착 기록 뒤 picasso 메모리에 두는 폭(호스트 시계,
  *   `host.settled.revisable-retention`). 그 안에서는 같은 작업 지시 id 의 개정판을 받는다. 지나면 놓고 그 작업 지시는 다시 받지 않는다
+ * @param retention 미들웨어에 넘기는 보존 상한(picasso `Retention`). 기본은 [RETENTION] 이다. 운영 설정으로 열지 않는다 — 시험이 작은
+ *   상한을 넣는 칸이다([MissionHostApplication.builder]). 넘침 선언을 바꾸면 위 «놓기» 의 약속이 깨진다.
  *
  * ## 미적용(S3c 스펙 T8)
  *
@@ -572,6 +585,7 @@ class MissionHost(
     private val retirements: RetirementPort? = null,
     private val entitlements: Entitlements = Entitlements.None,
     export: Path? = null,
+    retention: Retention = RETENTION,
 ) : AutoCloseable {
     init {
         require(!revisableRetention.isNegative) { "개정판을 받을 실행을 두는 폭은 음수가 아니어야 한다: $revisableRetention" }
@@ -587,7 +601,7 @@ class MissionHost(
      */
     private val middleware = Middleware(
         robots = robots, cell = signals, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
-        retirements = retirements, entitlements = entitlements,
+        retirements = retirements, entitlements = entitlements, retention = retention,
     )
 
     /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
@@ -1963,6 +1977,15 @@ class MissionHost(
         )
     }
 
+    /** picasso 보존 상한으로 내린 수(`Middleware.retentionEvictions`, 인스턴스 수명). 시험이 놓은 작업 지시 표시가 실제로 내려갔는지 본다. */
+    internal fun retentionEvictions(): RetentionEvictions = lock.withLock { middleware.retentionEvictions() }
+
+    /** 놓은 작업 지시 표시의 지금 상태(`Middleware.forgottenOrders`, picasso §15.324). [RETENTION] 아래에서 `refusedForgets` 는 늘 0 이다. */
+    internal fun forgottenOrders(): ForgottenOrdersState = lock.withLock { middleware.forgottenOrders() }
+
+    /** 이 (기체, 작업 지시)에 서 있는 제안의 대상(`Middleware.proposalTarget`). 시험이 승인 전에 제안이 아직 서 있음을 고정하려고 읽는다. */
+    internal fun proposalTarget(robotId: String, jobOrderId: String): ProposalTarget? = lock.withLock { middleware.proposalTarget(robotId, jobOrderId) }
+
     /** 미해소 잔여 파지 표시(P0-b2). 적은 순서다. */
     fun residualHolds(): ResidualHoldsView = lock.withLock { ResidualHoldsView(openHolds.map(ResidualHoldView::of)) }
 
@@ -2599,6 +2622,12 @@ class MissionHost(
          * 의 개정판을 받는다. 운영 서비스는 작업 지시 id 를 다시 쓰지 않으므로 개정판은 호스트 REST 를 직접 부르는 쪽만 낸다.
          */
         val DEFAULT_REVISABLE_RETENTION: Duration = Duration.ofMinutes(5)
+
+        /**
+         * 미들웨어에 넘기는 보존 상한(picasso `Retention`). 상한은 모두 picasso 기본이고 놓은 작업 지시 표시의 넘침만 `EVICT` 로 선언한다
+         * (picasso §15.324) — 실행 일지가 같은 작업 지시 id 의 접수와 승인을 picasso 를 부르기 전에 거부하므로([journalRefusal]) 그 약속을 진다.
+         */
+        val RETENTION: Retention = Retention(forgottenOverflow = ForgottenOverflow.EVICT)
 
         /**
          * 받은 재작업 시도를 처음 내기 직전에 다시 읽은 손·자리가 물리 관문을 못 지나 태스크 없이 `FAILED` 로 닫힌 시도의 실패 분류(picasso §15.323

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
 import dev.picasso.client.PicassoClient
 import dev.picasso.middleware.ClientRobotPort
+import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.middleware.RobotSnapshot
 import dev.picasso.mimic.cli.MimicCli
@@ -50,6 +51,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  *   않는다. 기본 설정의 `REGISTRY_PORT` 는 이 기계에 뜬 실제 registry 일 수 있다.
  * @param retirementInterval 주면 퇴역 읽기 주기를 이것으로 덮는다(`host.retirement.read-interval`).
  * @param incidentLoop 인시던트 고리 설정(`host.incident-loop.<키>`). 키는 `entitlements`·`approval-port`·`export` 다.
+ * @param retention 주면 호스트가 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(운영 설정이 아니라 [MissionHostApplication.builder] 로 넣는다).
  */
 class HostBench(
     private val mockVirtualLimit: Duration? = null,
@@ -61,6 +63,7 @@ class HostBench(
     private val registryUrl: String? = null,
     private val retirementInterval: Duration? = null,
     private val incidentLoop: Map<String, String> = emptyMap(),
+    private val retention: Retention? = null,
 ) : AutoCloseable {
 
     /** [gated] 일 때 스냅숏을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
@@ -227,7 +230,7 @@ class HostBench(
     fun <T : Any> bean(type: Class<T>): T = context.getBean(type)
 
     /** 이 세트와 같은 인자로 호스트를 하나 띄운다. 기동이 실패하면 예외가 그대로 나간다. */
-    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, if (gated) gatedPort() else null).run(
+    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, if (gated) gatedPort() else null, retention).run(
         *buildList {
             add("--server.port=0")
             add("--host.mimic.port=${mimic.server.port}")
