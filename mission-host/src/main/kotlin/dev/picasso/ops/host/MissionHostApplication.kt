@@ -7,6 +7,7 @@ import dev.picasso.middleware.ClientRobotPort
 import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.IssuingRobotPort
 import dev.picasso.middleware.PrefetchingRobotPort
+import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.ops.host.cell.CellBandClient
 import dev.picasso.ops.host.incident.ApprovalWindow
@@ -70,6 +71,14 @@ open class MissionHostApplication {
     @ConditionalOnMissingBean(RobotPort::class)
     open fun robotPort(channel: ManagedChannel, clock: HostClock): RobotPort =
         HostRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), clock)
+
+    /**
+     * 미들웨어 보존 상한([MissionHost.RETENTION], 놓은 작업 지시 표시는 `EVICT` 선언). 운영 설정으로 열지 않는다. 시험은 [builder] 로 작은 상한을
+     * 먼저 넣고, 그러면 이 빈은 만들어지지 않는다.
+     */
+    @Bean
+    @ConditionalOnMissingBean(Retention::class)
+    open fun hostRetention(): Retention = MissionHost.RETENTION
 
     @Bean
     open fun cellBand(@Value("\${host.cell.url}") url: String): CellBandClient = CellBandClient(url)
@@ -138,6 +147,8 @@ open class MissionHostApplication {
      * [revisableRetention] 은 `FAILED`·`UNVERIFIED` 로 정착한 실행을 picasso 메모리에서 놓기 전에 두는 폭이다(`host.settled.revisable-retention`,
      * [MissionHost.DEFAULT_REVISABLE_RETENTION]). 음수면 기동이 멈춘다.
      *
+     * [retention] 은 미들웨어 보존 상한이다([hostRetention], 기본 [MissionHost.RETENTION]).
+     *
      * [retirements] 는 registry 주소를 설정했을 때만 미들웨어에 넘긴다([RegistryRetirements.declared]).
      *
      * [entitlementsPath]·[exportDir] 는 인시던트 고리다(`host.incident-loop.entitlements`·`.export`, picasso 한계 §15.176). 비우면 선언 없음,
@@ -154,6 +165,7 @@ open class MissionHostApplication {
         store: MissionStore,
         json: ObjectMapper,
         retirements: RegistryRetirements,
+        retention: Retention,
         @Value("\${host.work-permit.mapping}") permitMapping: String,
         @Value("\${host.instance.heartbeat-period}") heartbeatPeriod: Duration,
         @Value("\${host.instance.heartbeat-expiry}") heartbeatExpiry: Duration,
@@ -164,7 +176,7 @@ open class MissionHostApplication {
         robots, cellBand, clock, catalog, timings, records, store, json, workPermits(permitMapping, clock),
         HostHeartbeat(heartbeatPeriod, heartbeatExpiry), revisableRetention,
         retirements.takeIf { it.declared },
-        entitlements(entitlementsPath), path(exportDir),
+        entitlements(entitlementsPath), path(exportDir), retention,
     ).start()
 
     /**
@@ -224,15 +236,17 @@ open class MissionHostApplication {
          *
          * @param clock 주면 기본 시계 대신 이것을 쓴다(통합 시험이 현장 시계를 넣는다).
          * @param robots 주면 기본 하위 포트 대신 이것을 쓴다(호스트 시험이 기체 스냅숏을 막는 포트를 넣는다).
+         * @param retention 주면 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(호스트 시험이 작은 놓은 작업 지시 표시 상한을 넣는다).
          */
-        fun builder(clock: HostClock? = null, robots: RobotPort? = null): SpringApplicationBuilder {
+        fun builder(clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null): SpringApplicationBuilder {
             val builder = SpringApplicationBuilder(MissionHostApplication::class.java)
                 .properties("spring.config.name=mission-host")
-            if (clock != null || robots != null) {
+            if (clock != null || robots != null || retention != null) {
                 builder.initializers(
                     ApplicationContextInitializer<ConfigurableApplicationContext> {
                         clock?.let { c -> it.beanFactory.registerSingleton("hostClock", c) }
                         robots?.let { r -> it.beanFactory.registerSingleton("testRobotPort", r) }
+                        retention?.let { r -> it.beanFactory.registerSingleton("hostRetention", r) }
                     },
                 )
             }
