@@ -441,7 +441,9 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 | SKILL_NOT_IN_CONTRACT | «계약에 없는 스킬» | SKILL_NOT_ON_SITE | «현장에 없는 스킬» |
 | SAFETY_SIGNAL_WAIT | «안전 신호 대기» | SOURCE_OBSERVATION_UNDECLARED | «출발 관측 선언 없음» |
 | SOURCE_OBSERVATION_UNUSED | «출발 관측 선언 미사용» | DESTINATION_OBSERVATION_UNDECLARED | «목적지 관측 선언 없음» |
-| DESTINATION_OBSERVATION_UNUSED | «목적지 관측 선언 미사용» | | |
+| DESTINATION_OBSERVATION_UNUSED | «목적지 관측 선언 미사용» | AFTER_INVALID | «선행 노드 오류» |
+| UNIT_ID_SHAPE_COLLISION | «단위 id 모양 겹침» | FLEET_UNIT_INVALID | «플릿 노드 모양 오류» |
+| WHEN_MISSING_INVALID | «입력 없음 처리 오류» | | |
 | MISSION_BAD_REQUEST | «임무 요청 오류» | REASON_REQUIRED | «사유 없음» |
 | DRAFT_NOT_FOUND | «없는 초안» | REQUEST_ID_REUSED | «요청 id 재사용» |
 | HOST_SILENT | «실행 호스트 불통» | SIGNAL_BAD_REQUEST | «신호 값 형식 오류» |
@@ -469,7 +471,7 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 | `TEST_REQUEST_LABEL` | NONE «요청 없음», WAITING «대기», RUNNING «실행 중», EXPIRED «만료», DONE «끝남» | `labels.ts` |
 | `SKILL_FIT_LABEL` | FIT «적합», MISSING «모자람», UNKNOWN «모름» | `labels.ts` |
 | `SUBMIT_RESULT_LABEL` | ACCEPTED «배정됨», IDEMPOTENT «같은 작업 지시의 기존 실행», REJECTED «거부됨», UNASSIGNED «미배정» | `labels.ts` |
-| `MOCK_RUN_FAILURE_LABEL` | DEFINITION «정의(같은 신호에 다른 기대 값)», SUBMISSION_REJECTED «표본 작업 지시 거부», NOT_SETTLED «종결하지 않음», WALL_CLOCK_LIMIT «실제 시간 상한 초과», EXECUTION_FAILED «실행 실패» | `labels.ts` |
+| `MOCK_RUN_FAILURE_LABEL` | DEFINITION «돌리기 전 정의 검사», SUBMISSION_REJECTED «표본 작업 지시 거부», NOT_SETTLED «종결하지 않음», WALL_CLOCK_LIMIT «실제 시간 상한 초과», EXECUTION_FAILED «실행 실패», FLEET_ROUTE «플릿 경로 노드(모의 실행 불가)» | `labels.ts` |
 | `mockRunVerdict` | «통과», «실패», «실패(${하위 범주})» | `labels.ts` |
 | `TEMPLATE_LABEL` | DATA_V1 «데이터 정의 템플릿», ARRIVAL_WAIT «랙 도착 대기 템플릿», ARRIVAL_WAIT_HOLD «운영자 보류 대기 템플릿» | `labels.ts` |
 | `FAULT_KIND_LABEL` | SKILL_EXECUTION_FAILED «스킬 실패», CONNECTION «연결 상태» | `labels.ts` |
@@ -1403,7 +1405,7 @@ fieldset의 항목은 다음과 같습니다.
 - «새 임무 ID» (처음 값 `ManufacturingInspection`)
 - «새 임무 이름» (처음 값 «공정 자산 점검»)
 - «임무 설명»
-- select «시작 템플릿» («대상 점검 · E0», «지정 위치 이동 · E0»)
+- select «시작 템플릿» («대상 점검 · E0», «지정 위치 이동 · E0», «대상마다 이동 뒤 점검 · E0»)
 
 접기 «입력 스키마·단계 연결·샘플 편집» 안에는 다음 항목이 있습니다.
 - 안내 «입력 스키마와 orderMapping은 등록 후 불변입니다. 변경하려면 새 임무 ID를 사용합니다. …»

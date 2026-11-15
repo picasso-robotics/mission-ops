@@ -1,0 +1,126 @@
+{
+  "workMasterId": "AssetVisitInspection",
+  "name": "대상마다 이동 뒤 점검",
+  "description": "대상마다 그 위치로 이동한 뒤 점검합니다.",
+  "requiredEvidence": "E0",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "targets": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "location": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "required": [
+            "id",
+            "location"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "targets"
+    ],
+    "additionalProperties": false
+  },
+  "orderMapping": {
+    "equipment": [
+      {
+        "input": "targets",
+        "equipmentUse": "mission_target",
+        "id": "id",
+        "properties": {
+          "location": "location"
+        }
+      }
+    ],
+    "materials": []
+  },
+  "sample": {
+    "targets": [
+      {
+        "id": "T1",
+        "location": "bay-7"
+      }
+    ]
+  },
+  "definition": {
+    "schemaVersion": 1,
+    "workMasterId": "AssetVisitInspection",
+    "maxEvidence": "E0",
+    "preferredOptionals": {},
+    "steps": [
+      {
+        "kind": "each",
+        "id": "visit",
+        "forEach": "mission_target",
+        "requires": [
+          {
+            "from": "ITEM_PROPERTY",
+            "property": "location"
+          }
+        ],
+        "whenMissing": {
+          "failureClass": "NO_LOCATION_FOR_TARGET",
+          "unit": "inspect",
+          "parameters": [
+            "target"
+          ]
+        },
+        "steps": [
+          {
+            "kind": "unit",
+            "id": "travel",
+            "skill": "navigate_to",
+            "unitId": {
+              "from": "ITEM_ID",
+              "suffix": ".travel"
+            },
+            "parameters": {
+              "location": {
+                "from": "ITEM_PROPERTY",
+                "property": "location"
+              }
+            },
+            "destination": {
+              "from": "ITEM_PROPERTY",
+              "property": "location"
+            }
+          },
+          {
+            "kind": "unit",
+            "id": "inspect",
+            "skill": "inspect",
+            "after": "travel",
+            "unitId": {
+              "from": "ITEM_ID"
+            },
+            "parameters": {
+              "target": {
+                "from": "ITEM_ID"
+              }
+            },
+            "destination": {
+              "from": "ITEM_PROPERTY",
+              "property": "location"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

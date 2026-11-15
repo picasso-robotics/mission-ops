@@ -76,6 +76,7 @@ export const KIND_LABEL: Record<string, string> = {
   // 임무 정의 거부 10종(S3b JSON 계약 §3.1). 호스트는 바닥 소유를 쥐지 않아 FLOOR_UNOWNED 를 내지 않지만 이름은 둔다.
   // SOURCE_OBSERVATION_UNUSED 는 picasso `b57964e` 가 더한 열한째 종류다. 서브모듈을 올리기 전에는 호스트가 내지 않는다.
   // DESTINATION_OBSERVATION_UNDECLARED·DESTINATION_OBSERVATION_UNUSED 는 picasso `786a0a2` 가 더한 열두째·열셋째 종류다.
+  // AFTER_INVALID·UNIT_ID_SHAPE_COLLISION·FLEET_UNIT_INVALID·WHEN_MISSING_INVALID 는 picasso `2edb29e`(§15.325)가 더한 열넷째~열일곱째 종류다.
   UNREADABLE: '읽을 수 없는 정의',
   DUPLICATE_NODE_ID: '노드 id 겹침',
   DEADLINE_INVALID: '대기 기한 오류',
@@ -90,6 +91,10 @@ export const KIND_LABEL: Record<string, string> = {
   SOURCE_OBSERVATION_UNUSED: '출발 관측 선언 미사용',
   DESTINATION_OBSERVATION_UNDECLARED: '목적지 관측 선언 없음',
   DESTINATION_OBSERVATION_UNUSED: '목적지 관측 선언 미사용',
+  AFTER_INVALID: '선행 노드 오류',
+  UNIT_ID_SHAPE_COLLISION: '단위 id 모양 겹침',
+  FLEET_UNIT_INVALID: '플릿 노드 모양 오류',
+  WHEN_MISSING_INVALID: '입력 없음 처리 오류',
   // 임무·신호 조작의 사전 거부와 호스트·현장의 4xx(S3b JSON 계약 §10).
   MISSION_BAD_REQUEST: '임무 요청 오류',
   REASON_REQUIRED: '사유 없음',
@@ -170,11 +175,12 @@ export const SUBMIT_RESULT_LABEL: Record<HostSubmitResult, string> = {
 
 /** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). */
 export const MOCK_RUN_FAILURE_LABEL: Record<MockRunFailure, string> = {
-  DEFINITION: '정의(같은 신호에 다른 기대 값)',
+  DEFINITION: '돌리기 전 정의 검사',
   SUBMISSION_REJECTED: '표본 작업 지시 거부',
   NOT_SETTLED: '종결하지 않음',
   WALL_CLOCK_LIMIT: '실제 시간 상한 초과',
   EXECUTION_FAILED: '실행 실패',
+  FLEET_ROUTE: '플릿 경로 노드(모의 실행 불가)',
 }
 
 /** 모의 실행의 통과 여부 한 줄. 실패면 하위 범주를 붙인다(S3b JSON 계약 §4.5). */

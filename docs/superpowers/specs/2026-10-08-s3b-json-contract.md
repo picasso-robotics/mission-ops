@@ -161,7 +161,7 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 
 | 칸 | 값 |
 |---|---|
-| `kind` | picasso `MissionRefusalKind` 13종: `UNREADABLE`·`DUPLICATE_NODE_ID`·`DEADLINE_INVALID`·`SIGNAL_NOT_IN_SPEC`·`SIGNAL_VALUE_INVALID`·`FLOOR_UNOWNED`·`SKILL_NOT_IN_CONTRACT`·`SKILL_NOT_ON_SITE`·`SAFETY_SIGNAL_WAIT`·`SOURCE_OBSERVATION_UNDECLARED`·`SOURCE_OBSERVATION_UNUSED`·`DESTINATION_OBSERVATION_UNDECLARED`·`DESTINATION_OBSERVATION_UNUSED`. 호스트에서 `FLOOR_UNOWNED` 는 나지 않는다(바닥 소유 `FloorOwnership.None`). 근거: `SourceObservationHostTest` 의 `출발 관측 선언 전에 활성화한 저장 버전은 OPTIONAL 로 되살아나고 새 정의는 선언 없이 활성화되지 않는다`. |
+| `kind` | picasso `MissionRefusalKind` 17종: `UNREADABLE`·`DUPLICATE_NODE_ID`·`DEADLINE_INVALID`·`SIGNAL_NOT_IN_SPEC`·`SIGNAL_VALUE_INVALID`·`FLOOR_UNOWNED`·`SKILL_NOT_IN_CONTRACT`·`SKILL_NOT_ON_SITE`·`SAFETY_SIGNAL_WAIT`·`SOURCE_OBSERVATION_UNDECLARED`·`SOURCE_OBSERVATION_UNUSED`·`DESTINATION_OBSERVATION_UNDECLARED`·`DESTINATION_OBSERVATION_UNUSED`·`AFTER_INVALID`·`UNIT_ID_SHAPE_COLLISION`·`FLEET_UNIT_INVALID`·`WHEN_MISSING_INVALID`(뒤 넷은 picasso `2edb29e`, §15.325). 호스트에서 `FLOOR_UNOWNED` 는 나지 않는다(바닥 소유 `FloorOwnership.None`). 근거: `SourceObservationHostTest` 의 `출발 관측 선언 전에 활성화한 저장 버전은 OPTIONAL 로 되살아나고 새 정의는 선언 없이 활성화되지 않는다`. |
 | `nodeId` | 막힌 노드 id. 문서 전체의 문제(`UNREADABLE`)는 null |
 | `observed` | 지금 값. `UNREADABLE` 이면 JSON 경로로 시작하는 문제 문자열(`$.steps[0].skill: 빠졌다`, `$.maxEvidence: 문자열이어야 한다(수 2.0)`). 문법 오류는 첫 자리에서 멈춘다 |
 | `expected` | 통과에 필요한 값. 파서 문제의 `UNREADABLE` 은 `임무 정의 문서 버전 1 의 모양` |
@@ -187,6 +187,10 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 | `SOURCE_OBSERVATION_UNUSED` | ENGINEER | 출발 관측 선언을 지우거나 출발 자리와 기대 식별 정보를 함께 적는다 |
 | `DESTINATION_OBSERVATION_UNDECLARED` | ENGINEER | 단위 노드에 목적지 관측을 REQUIRED 나 OPTIONAL 로 적는다 |
 | `DESTINATION_OBSERVATION_UNUSED` | ENGINEER | 목적지 관측 선언을 지우거나 목적지와 기대 식별 정보를 함께 적는다 |
+| `AFTER_INVALID` | ENGINEER | after 를 같은 그룹의 앞 단위 노드 id 로 고치거나 지운다 |
+| `UNIT_ID_SHAPE_COLLISION` | ENGINEER | 한쪽 단위 id 에 다른 접미사를 붙인다 |
+| `FLEET_UNIT_INVALID` | ENGINEER | 플릿 노드를 transport 와 출발·목적지·기대 식별 정보로 적고 관측 선언을 지운다 |
+| `WHEN_MISSING_INVALID` | ENGINEER | whenMissing 의 unit 과 parameters 를 그 그룹의 노드와 파라미터 이름으로 고친다 |
 
 **정의의 WorkMaster 가 경로와 다름**(T6): `kind: UNREADABLE`, `nodeId: null`, `observed: "$.workMasterId: 초안의 WorkMaster 와 다르다(InspectAsset)"`, `expected: "PrepareSequencedRack"`.
 
@@ -392,11 +396,11 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 
 | 칸 | 값 |
 |---|---|
-| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(같은 신호를 기대 값이 다른 대기 노드 둘이 씀, 돌지 않음) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님) |
+| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(돌리기 전 검사에서 걸림, 돌지 않음: 표본으로 세운 계획이 비었거나 단위 id 가 겹침, 표본 작업 지시에 없는 반복 대상(최상위 단위 노드·반복 그룹의 `forEach`), 같은 신호를 기대 값이 다른 대기 노드 둘이 씀. 어느 것인지는 `detail` 이 말함) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님) · `FLEET_ROUTE`(플릿 경로 노드가 있음, 모의 실행 하네스에 플릿 포트가 없어 돌지 않음, `detail` 은 «플릿 경로 노드는 모의 실행할 수 없음(…)»: 노드 id) |
 | `detail` | 실패의 화면용 한국어. 통과면 null |
 | `robotId` | 모의 실행 기체 id `mock-01`(현장 기체와 겹치지 않음) |
 | `sample` | 표본 작업 지시: 마지막 셀 스냅숏의 슬롯 앞 둘, 자재를 든 첫 제시 자리, 자재 수 = 슬롯 수, 요구 근거 E2. id 는 `MOCK-<draftId>` |
-| `physicalState` | 실행의 마지막 물리 상태. 실행이 서지 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`) null |
+| `physicalState` | 실행의 마지막 물리 상태. 실행이 서지 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`·`FLEET_ROUTE`) null |
 | `units` | 단위별 상태와 근거 등급. 실행이 서지 않았으면 `[]`. `route` 는 `ROBOT`·`SIGNAL`(대기 단위, `skillType` 은 `equipment_wait`), `state`·`reached` 는 S3a §5 의 단위 칸과 같은 이름이다 |
 | `virtualElapsedSeconds` | 표본 작업 지시 뒤 흐른 가상 시간(정수 초) |
 | `wallElapsedMillis` | 실제로 걸린 시간 |
