@@ -12,11 +12,15 @@ import dev.picasso.middleware.Middleware
 import dev.picasso.middleware.MissionCatalog
 import dev.picasso.middleware.NamedSignal
 import dev.picasso.middleware.PhysicalState
+import dev.picasso.middleware.Route
 import dev.picasso.middleware.SlotSignal
 import dev.picasso.middleware.UnitState
 import dev.picasso.middleware.Unassigned
 import dev.picasso.middleware.mission.DefinedCapability
+import dev.picasso.middleware.mission.EachStep
 import dev.picasso.middleware.mission.MissionDefinition
+import dev.picasso.middleware.mission.MissionValidator
+import dev.picasso.middleware.mission.UnitStep
 import dev.picasso.middleware.mission.WaitStep
 import dev.picasso.ops.host.cell.CellSnapshot
 import java.nio.file.Files
@@ -27,7 +31,11 @@ import java.time.Duration
  * 모의 실행 실패의 하위 범주(S3b 스펙 §6.4). 화면이 이유를 이 이름으로 가른다.
  */
 enum class MockRunFailure {
-    /** 정의: 같은 신호를 기대 값이 다른 대기 노드 둘이 쓴다. 이상적 현장의 신호 값을 하나로 정할 수 없다. */
+    /**
+     * 정의: 돌리기 전 검사에서 걸렸다. 표본으로 세운 계획이 비었거나 단위 id 가 겹친다, 표본 작업 지시에 없는 반복 대상(최상위 단위
+     * 노드·반복 그룹의 `forEach`)이 있다, 같은 신호를 기대 값이 다른 대기 노드 둘이 써 이상적 현장의 신호 값을 하나로 정할 수 없다.
+     * 어느 것인지는 [MockRunResult.detail] 이 말한다.
+     */
     DEFINITION,
 
     /** 표본 작업 지시를 미들웨어가 받지 않았다(근거 등급 초과, 게이트 거부). 실행이 서지 않았다. */
@@ -41,6 +49,13 @@ enum class MockRunFailure {
 
     /** 실행이 정착했으나 모든 단위 완료가 아니다(단위가 실패, 중단, 미확인으로 정착). */
     EXECUTION_FAILED,
+
+    /**
+     * 정의: 플릿 경로(`route: FLEET`) 노드가 있다. 모의 실행 하네스에는 플릿 포트가 없어(picasso 의 플릿 미믹은 시험 소스에만 있다)
+     * 그 노드는 돌 곳이 없으므로 돌리지 않는다. 실패라서 활성화는 그 초안을 받지 않는다(`MOCK_RUN_REQUIRED`) — 실행 호스트의
+     * 미들웨어에도 플릿 포트가 없어(`AmrFleetPort.None`) 활성화해도 운반이 맡겨지지 않는다(picasso §15.325).
+     */
+    FLEET_ROUTE,
 }
 
 /** 모의 실행의 단위 하나. [reached] 는 근거 등급이고 [failureClass] 는 실패면 그 분류다. */
@@ -123,9 +138,18 @@ class MockRunner(
         val wallStart = System.nanoTime()
         fun wall(): Duration = Duration.ofNanos(System.nanoTime() - wallStart)
 
+        val fleet = MissionValidator.unitNodes(definition).filter { it.route == Route.FLEET }
+        if (fleet.isNotEmpty()) {
+            return MockRunResult(
+                passed = false, failure = MockRunFailure.FLEET_ROUTE, detail = "$FLEET_ROUTE_DETAIL: ${fleet.joinToString(", ") { it.id }}",
+                robotId = ROBOT_ID, sample = sample, physicalState = null, units = emptyList(), virtualElapsedSeconds = 0,
+                wallElapsedMillis = wall().toMillis(),
+            )
+        }
         val planned=DefinedCapability(definition).plan(order)
-        if(planned.isEmpty() || planned.map{it.unitId}.distinct().size!=planned.size || definition.steps.filterIsInstance<dev.picasso.middleware.mission.UnitStep>().any{step -> order.equipmentRequirements.none{it.equipmentUse==step.forEach}})
-            return MockRunResult(false,MockRunFailure.DEFINITION,"샘플 입력에서 실행 단계가 비거나 단위 ID가 겹칩니다",ROBOT_ID,sample,null,emptyList(),0,wall().toMillis())
+        val missing = repeatedUses(definition).filter { use -> order.equipmentRequirements.none { it.equipmentUse == use } }
+        if(planned.isEmpty() || planned.map{it.unitId}.distinct().size!=planned.size || missing.isNotEmpty())
+            return MockRunResult(false,MockRunFailure.DEFINITION,"샘플 입력에서 실행 단계가 비거나 단위 ID가 겹칩니다"+(if(missing.isEmpty()) "" else ": 표본에 없는 반복 대상 ${missing.joinToString(", ")}"),ROBOT_ID,sample,null,emptyList(),0,wall().toMillis())
         val ideal = idealSignals(definition)
             ?: return MockRunResult(
                 passed = false, failure = MockRunFailure.DEFINITION, detail = conflict(definition), robotId = ROBOT_ID,
@@ -191,6 +215,14 @@ class MockRunner(
     }
 
     /**
+     * 표본 작업 지시에 있어야 하는 반복 대상(설비 쓰임). 최상위 단위 노드의 `forEach` 와 반복 그룹(`EachStep`)의 `forEach` 다.
+     * `once` 노드와 그룹 안쪽 노드는 `forEach` 가 없어(널) 빠진다(picasso §15.325, `MissionValidator.unitNodes`).
+     */
+    private fun repeatedUses(definition: MissionDefinition): List<String> =
+        (MissionValidator.unitNodes(definition).filter { !it.once }.mapNotNull(UnitStep::forEach) +
+            definition.steps.filterIsInstance<EachStep>().map { it.forEach }).distinct()
+
+    /**
      * 신호마다 이상적 값. 같은 신호를 기대 값이 다른 대기 노드가 쓰면 하나로 정할 수 없어 `null` 이다.
      */
     private fun idealSignals(definition: MissionDefinition): Map<String, String>? {
@@ -251,6 +283,9 @@ class MockRunner(
     companion object {
         /** 모의 실행의 기체 id. 현장 기체 id 와 겹치지 않게 둔다. */
         const val ROBOT_ID = "mock-01"
+
+        /** 플릿 경로 노드를 든 정의의 소견([MockRunFailure.FLEET_ROUTE]). 뒤에 그 노드 id 가 붙는다. */
+        const val FLEET_ROUTE_DETAIL = "플릿 경로 노드는 모의 실행할 수 없음(모의 실행 하네스에 플릿 포트가 없다)"
 
         /** 하네스 mimic 에 싣는 클라이언트 id. */
         const val CLIENT_ID = "mission-host-mock-run"

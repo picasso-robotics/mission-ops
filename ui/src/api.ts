@@ -872,11 +872,11 @@ export interface MockRunUnit {
 }
 
 /** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). 통과면 null 이다. */
-export type MockRunFailure = 'DEFINITION' | 'SUBMISSION_REJECTED' | 'NOT_SETTLED' | 'WALL_CLOCK_LIMIT' | 'EXECUTION_FAILED'
+export type MockRunFailure = 'DEFINITION' | 'SUBMISSION_REJECTED' | 'NOT_SETTLED' | 'WALL_CLOCK_LIMIT' | 'EXECUTION_FAILED' | 'FLEET_ROUTE'
 
 /**
  * 모의 실행 결과(S3b JSON 계약 §4.5). 가상 기체 하나와 이상적 현장으로 표본 작업 지시 하나를 끝까지 돌린 것이다. 실행이 서지
- * 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`) `physicalState` 가 null 이고 `units` 가 비었다.
+ * 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`·`FLEET_ROUTE`) `physicalState` 가 null 이고 `units` 가 비었다.
  */
 export interface MockRunResult {
   passed: boolean

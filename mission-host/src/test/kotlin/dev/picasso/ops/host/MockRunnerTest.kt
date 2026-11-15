@@ -1,8 +1,10 @@
 package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.node.ObjectNode
+import dev.picasso.middleware.EquipmentRequirement
 import dev.picasso.middleware.EquipmentUse
 import dev.picasso.middleware.Evidence
+import dev.picasso.middleware.InspectAsset
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.PrepareSequencedRack
 import dev.picasso.middleware.mission.DefinedCapability
@@ -147,6 +149,82 @@ class MockRunnerTest {
         assertEquals(coded.map { it.expectedIdentity }, defined.map { it.expectedIdentity })
         assertEquals(coded.map { it.source }, defined.map { it.source })
         assertEquals(coded.map { it.destination }, defined.map { it.destination })
+    }
+
+    /**
+     * 반복 그룹 정의(picasso §15.325, `MissionFixtures.INSPECT_ASSET` 모양) — 화면 «대상마다 이동 뒤 점검» 템플릿과 같은 글자의
+     * 시험 자원 `mission-profile-visit.json` 의 정의다. [use] 로 반복 대상(설비 쓰임)을 바꾼다.
+     */
+    private fun visit(use: String = "mission_target"): String {
+        val profile = HostBench.JSON.readTree(javaClass.getResourceAsStream("/mission-profile-visit.json"))
+        return profile["definition"].toString().replace("\"forEach\":\"mission_target\"", "\"forEach\":\"$use\"")
+            .also { check(use == "mission_target" || it.contains(use)) { "반복 대상을 바꾸지 못했다" } }
+    }
+
+    /** 그룹 정의 끝에 작업 지시마다 한 번 도는 노드(`once`)를 더한다. 단위 id 는 작업 지시 id, 첫 대상의 위치로 간다. */
+    private fun withOnce(definition: String): String = definition.removeSuffix("]}") +
+        """,{"kind":"unit","id":"park","once":true,"skill":"navigate_to","unitId":{"from":"ORDER_ID"},""" +
+        """"parameters":{"location":{"from":"FIRST_PROPERTY","equipmentUse":"mission_target","property":"location"}},""" +
+        """"destination":{"from":"FIRST_PROPERTY","equipmentUse":"mission_target","property":"location"}}]}"""
+
+    private fun targets(use: String = "mission_target") = JobOrder(
+        jobOrderId = "MOCK-9", workMasterId = "AssetVisitInspection", version = 1, requiredEvidence = Evidence.E0,
+        equipmentRequirements = listOf(
+            EquipmentRequirement("T1", use, mapOf("location" to "bay-7")),
+            EquipmentRequirement("T2", use, mapOf("location" to "dock-3")),
+        ),
+    )
+
+    @Test
+    fun `반복 그룹 정의는 대상마다 이동 뒤 점검을 차례로 돌려 통과하고 코드 InspectAsset 과 같은 단위를 계획한다`() {
+        val result = runner().run(parsed(visit()), targets())
+        assertTrue(result.passed, result.toString())
+        assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2"), result.units.map { it.unitId })
+        assertEquals(listOf("navigate_to", "inspect", "navigate_to", "inspect"), result.units.map { it.skillType })
+        assertTrue(result.units.all { it.state == "DONE" }, result.units.toString())
+
+        // 반복 대상을 코드 InspectAsset 의 쓰임으로 바꾸면 계획이 칸마다 같다(선행 after 는 picasso 내부 칸이라 picasso 시험이 댄다).
+        val order = targets(EquipmentUse.INSPECTION_TARGET)
+        val defined = DefinedCapability(parsed(visit(EquipmentUse.INSPECTION_TARGET))).plan(order)
+        val coded = InspectAsset().plan(order)
+        assertEquals(coded.map { it.unitId }, defined.map { it.unitId })
+        assertEquals(coded.map { it.skillType }, defined.map { it.skillType })
+        assertEquals(coded.map { it.parameters }, defined.map { it.parameters })
+        assertEquals(coded.map { it.destination }, defined.map { it.destination })
+    }
+
+    @Test
+    fun `once 노드는 표본 검사에서 빠져 통과하고 그룹의 반복 대상이 표본에 없으면 돌리지 않고 정의 실패다`() {
+        val once = runner().run(parsed(withOnce(visit())), targets())
+        assertTrue(once.passed, once.toString())
+        assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2", "MOCK-9"), once.units.map { it.unitId })
+
+        // 그룹의 반복 대상이 표본에 없으면 once 단위 하나만 계획되지만 정의 실패다.
+        val absent = runner().run(parsed(withOnce(visit("absent_target"))), targets())
+        assertEquals(MockRunFailure.DEFINITION, absent.failure, absent.toString())
+        assertTrue("absent_target" in absent.detail!!, absent.detail)
+        assertNull(absent.physicalState)
+        assertTrue(absent.units.isEmpty())
+    }
+
+    @Test
+    fun `플릿 경로 노드를 든 정의는 돌리지 않고 플릿 경로 실패와 그 노드 id 를 소견으로 낸다`() {
+        val first = """{"from":"FIRST_ID","equipmentUse":"source"}"""
+        val destination = """{"from":"FIRST_ID","equipmentUse":"destination"}"""
+        val container = """{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material"}"""
+        val fleet = """{"schemaVersion":1,"workMasterId":"PrepareSequencedRack","maxEvidence":"E2","preferredOptionals":{},"steps":[""" +
+            """{"kind":"unit","id":"deliver","once":true,"route":"FLEET","skill":"transport","requires":[$first,$destination,$container],""" +
+            """"whenMissing":{"failureClass":"INCOMPLETE_ORDER","parameters":[]},""" +
+            """"unitId":{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material","else":{"from":"ORDER_ID"}},""" +
+            """"parameters":{"container":$container,"source":$first,"destination":$destination},""" +
+            """"expectedIdentity":$container,"source":$first,"destination":$destination}]}"""
+        val result = runner().run(parsed(fleet), order())
+        assertEquals(false, result.passed)
+        assertEquals(MockRunFailure.FLEET_ROUTE, result.failure, result.toString())
+        assertEquals("${MockRunner.FLEET_ROUTE_DETAIL}: deliver", result.detail)
+        assertNull(result.physicalState)
+        assertTrue(result.units.isEmpty())
+        assertEquals(0, result.virtualElapsedSeconds)
     }
 
     @Test
