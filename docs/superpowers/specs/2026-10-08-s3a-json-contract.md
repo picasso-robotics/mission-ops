@@ -466,7 +466,7 @@ InspectAsset 예:
 
 `GET /host/executions?before=<settleSeq>[&limit=M]`. `before`는 양의 정수, M은 1~200 정수이며 기본값은 20이다. 본문은 `{settled, nextBefore, olderTotal}`이다. `settleSeq`가 `before`보다 작은 이력 행을 최신 순으로 최대 M개 담는다. 칸의 뜻은 위와 같다.
 
-`GET /host/executions/summary`. 본문은 `{instanceId, pumpedAt, live, states, journalBlockedExecutionIds, fleet}`다. `fleet` 은 플릿 연결 `{connected, url}`(`host.fleet.url` 이 비면 `{false, null}`, 주소가 있으면 `{true, "<주소>"}`, 주소 없는 시험 주입 포트면 `url` null)이고 연결은 설정의 뜻이지 현장이 지금 답한다는 뜻이 아니다. `live`는 남은 실행 수다. `states`는 열한 가지 `PhysicalState` 이름을 모두 담고(0 포함) 남은 실행만 센다. 늘 200이다.
+`GET /host/executions/summary`. 본문은 `{instanceId, pumpedAt, live, states, journalBlockedExecutionIds, fleet, ledgerCopy}`다. `ledgerCopy` 는 두 대장의 사본 확인 상태(S4b JSON 계약 H10)다. `fleet` 은 플릿 연결 `{connected, url}`(`host.fleet.url` 이 비면 `{false, null}`, 주소가 있으면 `{true, "<주소>"}`, 주소 없는 시험 주입 포트면 `url` null)이고 연결은 설정의 뜻이지 현장이 지금 답한다는 뜻이 아니다. `live`는 남은 실행 수다. `states`는 열한 가지 `PhysicalState` 이름을 모두 담고(0 포함) 남은 실행만 센다. 늘 200이다.
 
 읽기 순서는 메모리가 먼저이고(호스트 잠금 아래) DB가 나중이다(잠금 밖). 남은 실행이 아닌 실행은 이미 종결 기록이 커밋되었으므로 빠뜨리지 않는다. 그 사이에 종결 기록이 쓰인 실행은 양쪽에 모두 나타날 수 있으며, 화면은 (인스턴스, 실행 id) 기준 남은 실행 쪽에 한 번만 표시한다. 호스트는 호스트 잠금 아래 단일 트랜잭션 안에서만 종결 기록을 쓰므로 `event_id` 할당 순서는 커밋 순서와 같다(단일 호스트 전제).
 

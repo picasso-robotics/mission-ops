@@ -39,6 +39,29 @@ class IncidentController(
     }
 
     /**
+     * 조치 탐색 대장 — 지금 인스턴스(메모리)와 이전 인스턴스(사본 표, V17). 최신부터 많아야 [limit] 개. 정수가 아니거나 1~[MAX_LIMIT] 밖이면 400
+     * `BAD_REQUEST` 다. 줄은 picasso 글자 그대로다(`WITHHELD` 줄에 `steps` 없음).
+     */
+    @GetMapping("/host/remedy-searches")
+    fun remedySearches(@RequestParam(required = false) limit: String?): ResponseEntity<Any> {
+        val count = if (limit == null) DEFAULT_LIMIT else limit.toIntOrNull()?.takeIf { it in 1..MAX_LIMIT }
+            ?: return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(HostRejection(HostRequests.BAD_REQUEST, "limit 은 1~$MAX_LIMIT 의 정수다: $limit"))
+        return ResponseEntity.ok(host.remedySearches(count))
+    }
+
+    /**
+     * 같은 조치가 [atLeast] 번(기본 2) 이상 승인된 것 — 승인 사실 표의 합산(인스턴스를 넘어, V17). 1 보다 작은 정수가 아니면 400 `BAD_REQUEST` 다.
+     */
+    @GetMapping("/host/repeated-remedies")
+    fun repeatedRemedies(@RequestParam(required = false) atLeast: String?): ResponseEntity<Any> {
+        val count = if (atLeast == null) 2 else atLeast.toIntOrNull()?.takeIf { it >= 1 }
+            ?: return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(HostRejection(HostRequests.BAD_REQUEST, "atLeast 는 1 이상의 정수다: $atLeast"))
+        return ResponseEntity.ok(host.repeatedRemedies(count))
+    }
+
+    /**
      * 인시던트 하나의 상세. 없으면 404 `INCIDENT_NOT_FOUND` 다. 질의 [instanceId] 가 없거나 지금 인스턴스면 지금 인스턴스의 것이고,
      * 이전 인스턴스면 그 인스턴스의 사본이다(S4b 스펙 T7). 빈 문자열이면 400 `BAD_REQUEST` 다.
      */

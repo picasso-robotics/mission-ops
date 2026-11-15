@@ -35,8 +35,9 @@ class TombstoneOverflowHostTest {
     private val settledStates = setOf("PHYSICALLY_DONE", "FAILED", "UNVERIFIED", "ABORTED", "PARTIAL")
 
     @Test
-    fun `호스트는 놓은 작업 지시 표시의 넘침을 EVICT 로 선언하고 다른 상한은 picasso 기본 그대로 넘긴다`() {
-        assertEquals(Retention(forgottenOverflow = ForgottenOverflow.EVICT), MissionHost.RETENTION)
+    fun `호스트는 놓은 작업 지시 표시의 넘침을 EVICT 로 선언하고 두 대장의 사본을 선언하며 다른 상한은 picasso 기본 그대로 넘긴다`() {
+        // 사본 선언(picasso §15.327)은 확인 대기 한도도 picasso 기본(대장 상한과 같음)이다.
+        assertEquals(Retention(forgottenOverflow = ForgottenOverflow.EVICT, copyAck = dev.picasso.middleware.CopyAck()), MissionHost.RETENTION)
         HostBench().use { bench ->
             assertEquals(ForgottenOrdersState(0, Retention().forgottenOrders, ForgottenOverflow.EVICT, 0, 0), bench.host.forgottenOrders())
         }

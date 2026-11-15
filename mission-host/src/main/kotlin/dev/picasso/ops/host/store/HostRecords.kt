@@ -136,6 +136,59 @@ data class IncidentCopyRow(
     val resolution: CopyResolutionRow?,
 )
 
+/**
+ * 인시던트 사본의 줄 하나(V17, picasso §15.327). [revision] 1 은 `incident_copy.line`, 2 부터는 `incident_copy_revision` 이다. [line] 은 picasso
+ * `LedgerExport.incidentLine` 의 글자 그대로이고 [wireVersion] 은 그때의 `LINE_SCHEMA_VERSION` 이다.
+ */
+data class IncidentLineRow(
+    val instanceId: String,
+    val incidentId: String,
+    val revision: Int,
+    val wireVersion: String,
+    val line: String,
+    val recordedAt: Instant,
+)
+
+/** 적을 인시던트 줄 개정 하나(2 부터). */
+data class IncidentRevisionWrite(val incidentId: String, val revision: Int, val line: String)
+
+/** 적을 탐색 사본 하나. [outcome] 은 줄의 `outcome` 이다(줄에서 읽은 것). */
+data class SearchCopyWrite(val searchId: String, val jobOrderId: String, val robotId: String, val outcome: String, val line: String)
+
+/**
+ * 조치 탐색 사본 한 행(V17). [line] 은 picasso `LedgerExport.remedySearchLine` 의 글자 그대로다 — `WITHHELD` 줄에는 `steps` 키가 없다.
+ * 실행 일지와 무관하다(거절은 실행이 없다).
+ */
+data class SearchCopyRow(
+    val copyId: Long,
+    val instanceId: String,
+    val searchId: String,
+    val jobOrderId: String,
+    val robotId: String,
+    val outcome: String,
+    val wireVersion: String,
+    val line: String,
+    val recordedAt: Instant,
+)
+
+/**
+ * 같은 조치 승인 사실 하나(V17). 승인으로 선 실행의 판단 기록 승인 칸(`RecordedApproval`)에서 읽는다. [remedyTypes] 는 승인된 걸음의 조치 유형을
+ * 순서대로 든 것이고 (기체, 이것)이 서명이다. 열쇠는 승인 자체(작업 지시, 기체, 승인자, 두 시각)다.
+ */
+data class ApprovalFactWrite(
+    val executionId: String,
+    val jobOrderId: String,
+    val robotId: String,
+    val remedyTypes: List<String>,
+    val approverId: String,
+    val approverKind: String,
+    val approvedAt: Instant,
+    val wallClockAt: Instant,
+)
+
+/** 같은 조치의 승인 횟수(합산, 인스턴스를 넘어). [instances] 는 그 승인이 선 인스턴스의 수다. */
+data class RepeatedRemedyRow(val robotId: String, val remedyTypes: List<String>, val approvals: Int, val instances: Int)
+
 /** 운영자 실행 취소 한 행(P0-b2, V5). [physicalState] 는 취소를 건 때의 물리 상태다. */
 data class CancelRow(
     val cancelId: Long,
@@ -630,11 +683,25 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
 
     // ── 인시던트 사본
 
-    fun copyIncident(instanceId: String, incidentId: String, executionId: String, jobOrderId: String, unitId: String, detail: String) {
+    /**
+     * 인시던트 사본 한 행과 그 첫 줄(개정 1, V17). [line] 은 picasso `LedgerExport.incidentLine` 의 글자, [wireVersion] 은 `LINE_SCHEMA_VERSION` 이다.
+     * 같은 (인스턴스, 인시던트 id)가 이미 있으면 아무것도 하지 않는다(유일 열쇠로 멱등 — 커밋 뒤 확인 전에 죽거나 다시 적어도 한 행이다).
+     */
+    fun copyIncident(
+        instanceId: String,
+        incidentId: String,
+        executionId: String,
+        jobOrderId: String,
+        unitId: String,
+        detail: String,
+        wireVersion: String,
+        line: String,
+    ) {
         jdbc.sql(
             """
-            INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail)
-            VALUES (:instanceId, :incidentId, :executionId, :jobOrderId, :unitId, CAST(:detail AS json))
+            INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail, wire_version, line)
+            VALUES (:instanceId, :incidentId, :executionId, :jobOrderId, :unitId, CAST(:detail AS json), :wireVersion, :line)
+            ON CONFLICT (instance_id, incident_id) DO NOTHING
             """.trimIndent(),
         )
             .param("instanceId", instanceId)
@@ -643,8 +710,154 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .param("jobOrderId", jobOrderId)
             .param("unitId", unitId)
             .param("detail", detail)
+            .param("wireVersion", wireVersion)
+            .param("line", line)
             .update()
     }
+
+    /** 인시던트 줄의 개정들(2 부터, V17). 같은 (인스턴스, 인시던트 id, 개정)이 이미 있으면 그 행은 건너뛴다(멱등). */
+    fun copyIncidentRevisions(instanceId: String, wireVersion: String, rows: List<IncidentRevisionWrite>) {
+        if (rows.isEmpty()) return
+        jdbc.sql(
+            """
+            INSERT INTO mission.incident_copy_revision (instance_id, incident_id, revision, wire_version, line)
+            SELECT :instanceId, x.incident_id, x.revision, :wireVersion, x.line
+            FROM ROWS FROM (jsonb_to_recordset(CAST(:rows AS jsonb)) AS (incident_id text, revision int, line text))
+                WITH ORDINALITY AS x(incident_id, revision, line, ord)
+            ORDER BY x.ord
+            ON CONFLICT (instance_id, incident_id, revision) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("wireVersion", wireVersion)
+            .param("rows", json.writeValueAsString(rows.map { mapOf("incident_id" to it.incidentId, "revision" to it.revision, "line" to it.line) }))
+            .update()
+    }
+
+    /**
+     * 그 인스턴스의 인시던트 줄(V17) — 인시던트마다 가장 큰 개정 하나, 적은 순서(첫 줄의 copy_id)대로. 줄 칸이 생기기 전에 적은 사본은 빠진다.
+     * [incidentId] 를 주면 그 인시던트의 개정 전부(개정 순)다.
+     */
+    fun incidentLines(instanceId: String, incidentId: String? = null): List<IncidentLineRow> {
+        val all = jdbc.sql(
+            """
+            SELECT c.instance_id, c.incident_id, 1 AS revision, c.wire_version, c.line, c.recorded_at, c.copy_id AS ord
+            FROM mission.incident_copy c
+            WHERE c.instance_id = :instanceId AND c.line IS NOT NULL AND (CAST(:incidentId AS text) IS NULL OR c.incident_id = :incidentId)
+            UNION ALL
+            SELECT r.instance_id, r.incident_id, r.revision, r.wire_version, r.line, r.recorded_at, c.copy_id AS ord
+            FROM mission.incident_copy_revision r
+            JOIN mission.incident_copy c ON c.instance_id = r.instance_id AND c.incident_id = r.incident_id
+            WHERE r.instance_id = :instanceId AND (CAST(:incidentId AS text) IS NULL OR r.incident_id = :incidentId)
+            ORDER BY ord, revision
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("incidentId", incidentId)
+            .query { rs, _ ->
+                IncidentLineRow(
+                    rs.getString("instance_id"), rs.getString("incident_id"), rs.getInt("revision"), rs.getString("wire_version"),
+                    rs.getString("line"), instant(rs, "recorded_at"),
+                )
+            }
+            .list()
+        return if (incidentId != null) all else all.groupBy { it.incidentId }.values.map { it.last() }
+    }
+
+    // ── 조치 탐색 사본(V17)
+
+    /** 탐색 사본들. 같은 (인스턴스, 탐색 id)가 이미 있으면 그 행은 건너뛴다(멱등). 줄은 picasso 글자 그대로다 — 여기서 고치지 않는다. */
+    fun copySearches(instanceId: String, wireVersion: String, rows: List<SearchCopyWrite>) {
+        if (rows.isEmpty()) return
+        jdbc.sql(
+            """
+            INSERT INTO mission.remedy_search_copy (instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line)
+            SELECT :instanceId, x.search_id, x.job_order_id, x.robot_id, x.outcome, :wireVersion, x.line
+            FROM ROWS FROM (jsonb_to_recordset(CAST(:rows AS jsonb)) AS (search_id text, job_order_id text, robot_id text, outcome text, line text))
+                WITH ORDINALITY AS x(search_id, job_order_id, robot_id, outcome, line, ord)
+            ORDER BY x.ord
+            ON CONFLICT (instance_id, search_id) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("wireVersion", wireVersion)
+            .param(
+                "rows",
+                json.writeValueAsString(
+                    rows.map {
+                        mapOf("search_id" to it.searchId, "job_order_id" to it.jobOrderId, "robot_id" to it.robotId, "outcome" to it.outcome, "line" to it.line)
+                    },
+                ),
+            )
+            .update()
+    }
+
+    /** [instanceId] 가 아닌 인스턴스의 탐색 사본. 최근에 적은 것부터 많아야 [limit] 개다. */
+    fun earlierSearches(instanceId: String, limit: Int): List<SearchCopyRow> =
+        jdbc.sql("SELECT $SEARCH_COLUMNS FROM mission.remedy_search_copy WHERE instance_id <> :instanceId ORDER BY copy_id DESC LIMIT :limit")
+            .param("instanceId", instanceId)
+            .param("limit", limit)
+            .query { rs, _ -> searchRow(rs) }
+            .list()
+
+    fun earlierSearchCount(instanceId: String): Int =
+        jdbc.sql("SELECT count(*) FROM mission.remedy_search_copy WHERE instance_id <> :instanceId")
+            .param("instanceId", instanceId)
+            .query(Int::class.java)
+            .single()
+
+    /** 그 인스턴스의 탐색 사본 전부. 적은 순서다. */
+    fun searchCopies(instanceId: String): List<SearchCopyRow> =
+        jdbc.sql("SELECT $SEARCH_COLUMNS FROM mission.remedy_search_copy WHERE instance_id = :instanceId ORDER BY copy_id")
+            .param("instanceId", instanceId)
+            .query { rs, _ -> searchRow(rs) }
+            .list()
+
+    // ── 같은 조치 승인 사실(V17)
+
+    /**
+     * 승인 사실 하나. 승인을 적는 트랜잭션(실행 일지·판단 기록) 안에서 부른다. 같은 승인(작업 지시, 기체, 승인자, 두 시각)이 이미 있으면 아무것도 하지
+     * 않는다 — 재시도와 실행 복원이 두 번 세지 않는다. 새로 적었으면 참이다.
+     */
+    fun approvalFact(instanceId: String, fact: ApprovalFactWrite): Boolean =
+        jdbc.sql(
+            """
+            INSERT INTO mission.remedy_approval
+                (instance_id, execution_id, job_order_id, robot_id, remedy_types, approver_id, approver_kind, approved_at, wall_clock_at)
+            VALUES (:instanceId, :executionId, :jobOrderId, :robotId, CAST(:types AS jsonb), :approverId, :approverKind, :at, :wallClockAt)
+            ON CONFLICT (job_order_id, robot_id, approver_id, approved_at, wall_clock_at) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("executionId", fact.executionId)
+            .param("jobOrderId", fact.jobOrderId)
+            .param("robotId", fact.robotId)
+            .param("types", json.writeValueAsString(fact.remedyTypes))
+            .param("approverId", fact.approverId)
+            .param("approverKind", fact.approverKind)
+            .param("at", OffsetDateTime.ofInstant(fact.approvedAt, ZoneOffset.UTC))
+            .param("wallClockAt", OffsetDateTime.ofInstant(fact.wallClockAt, ZoneOffset.UTC))
+            .update() == 1
+
+    /**
+     * 같은 조치의 승인 횟수 — 승인 사실의 합산이다(인스턴스를 넘어, 승인자 종류 합침). [atLeast] 번 이상인 서명만, 많은 것부터(같으면 기체·조치 유형 순).
+     * picasso `Middleware.repeatedRemedies` 는 그 인스턴스 안의 수라 재기동마다 0 부터다 — 정본은 이것이다.
+     */
+    fun repeatedRemedies(atLeast: Int): List<RepeatedRemedyRow> =
+        jdbc.sql(
+            """
+            SELECT robot_id, remedy_types::text AS remedy_types, count(*) AS approvals, count(DISTINCT instance_id) AS instances
+            FROM mission.remedy_approval
+            GROUP BY robot_id, remedy_types
+            HAVING count(*) >= :atLeast
+            ORDER BY approvals DESC, robot_id, remedy_types::text
+            """.trimIndent(),
+        )
+            .param("atLeast", atLeast)
+            .query { rs, _ ->
+                RepeatedRemedyRow(rs.getString("robot_id"), json.readValue<List<String>>(rs.getString("remedy_types")), rs.getInt("approvals"), rs.getInt("instances"))
+            }
+            .list()
 
     fun copyResolution(instanceId: String, incidentId: String, resolution: CopyResolutionRow) {
         jdbc.sql(
@@ -1316,6 +1529,18 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         recordedAt = instant(rs, "recorded_at"),
     )
 
+    private fun searchRow(rs: ResultSet) = SearchCopyRow(
+        copyId = rs.getLong("copy_id"),
+        instanceId = rs.getString("instance_id"),
+        searchId = rs.getString("search_id"),
+        jobOrderId = rs.getString("job_order_id"),
+        robotId = rs.getString("robot_id"),
+        outcome = rs.getString("outcome"),
+        wireVersion = rs.getString("wire_version"),
+        line = rs.getString("line"),
+        recordedAt = instant(rs, "recorded_at"),
+    )
+
     private fun copyRow(rs: ResultSet) = IncidentCopyRow(
         copyId = rs.getLong("copy_id"),
         instanceId = rs.getString("instance_id"),
@@ -1361,6 +1586,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             "conflict_request_id, acknowledged_mismatch"
         const val CONFLICT_COLUMNS = "request_id, marker_id, approver_id, approver_kind, reason, $OBSERVATION_COLUMNS, refused_at"
         const val RECORD_COLUMNS = "record_id, job_order_id, instance_id, execution_id, wire_version, record, recorded_at"
+        const val SEARCH_COLUMNS = "copy_id, instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line, recorded_at"
         const val COPY_SELECT =
             "SELECT c.copy_id, c.instance_id, c.incident_id, c.detail, r.decision, r.decided_at, r.wall_clock_at, r.decided_by_id, r.decided_by_kind " +
                 "FROM mission.incident_copy c LEFT JOIN mission.incident_copy_resolution r " +
