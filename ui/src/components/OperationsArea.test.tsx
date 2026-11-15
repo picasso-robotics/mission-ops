@@ -339,7 +339,10 @@ describe('운영 영역', () => {
           workMasterId: 'PrepareSequencedRack',
           missionVersion: 3,
           physicalState: 'RUNNING',
-          units: [{ unitId: 'RACK-204.S01', skillType: 'pick_place', state: 'RUNNING', reached: 'E0' }],
+          units: [
+            { unitId: 'RACK-204.S01', skillType: 'pick_place', state: 'RUNNING', reached: 'E0', route: 'ROBOT' },
+            { unitId: 'HU-1042', skillType: 'transport', state: 'PENDING', reached: 'E0', route: 'FLEET' },
+          ],
           jobResponse: null,
         }),
       ],
@@ -356,7 +359,8 @@ describe('운영 영역', () => {
       '버전 3',
       'humanoid-01',
       'RUNNING',
-      'RACK-204.S01 pick_place: RUNNING, 근거 E0',
+      // 플릿 운반 단위를 «기체» 로 찍지 않는다.
+      'RACK-204.S01 pick_place: RUNNING, 근거 E0, 경로 기체HU-1042 transport: PENDING, 근거 E0, 경로 플릿 운반',
       '없음',
     ])
     expect(cells(rows[1])).toEqual([
@@ -366,9 +370,29 @@ describe('운영 영역', () => {
       '코드 정의',
       'humanoid-01',
       'PHYSICALLY_DONE',
-      'T1.travel navigate_to: DONE, 근거 E0T1 inspect: DONE, 근거 E0',
+      // 경로 칸이 생기기 전의 본문은 «기록 없음» 이다(추정하지 않는다).
+      'T1.travel navigate_to: DONE, 근거 E0, 경로 기록 없음T1 inspect: DONE, 근거 E0, 경로 기록 없음',
       'resp-1: PHYSICALLY_DONE, 근거 E0(요구 E0)',
     ])
+  })
+
+  it('실행 호스트가 판정을 FLEET_PORT_ABSENT 로 거부하면 판정 화면과 제출 결과에 그 사유를 이름표로 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    const detail = '이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1'
+    fake.eligibility = eligibilityView({
+      host: 'HOST_REFUSED',
+      hostRefusal: { error: 'FLEET_PORT_ABSENT', detail },
+      robots: [robotRow('humanoid-01', { host: null, eligible: false, reasons: [`실행 호스트가 거부했다(FLEET_PORT_ABSENT): ${detail}`] })],
+    })
+    fake.answer = { status: 400, body: { error: 'FLEET_PORT_ABSENT', detail } }
+    open()
+    await fillTarget(1, 'T1', 'bay-7')
+    const alert = await screen.findByText(/실행 호스트가 거부함\(/)
+    expect(alert).toHaveTextContent(`실행 호스트가 거부함(플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음)): ${detail}`)
+    const notice = await submit()
+    expect(notice).toHaveTextContent('InspectAsset 작업 지시: 막힘(플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음))')
+    expect(notice).toHaveTextContent(detail)
+    expect(notice).not.toHaveTextContent('배정 가능한 기체 없음')
   })
 
   it('배정 가능 표는 못 물어본 칸을 모름으로 보이고 배정 불가로 둔다', async () => {

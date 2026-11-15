@@ -29,6 +29,12 @@ import kotlin.test.assertTrue
  */
 class MockRunnerTest {
 
+    private companion object {
+        const val CONTAINER = "HU-1042"
+        const val OUT = "OUT-07"
+        const val SEQ_IN = "SEQ-IN-02"
+    }
+
     private val cell = CellBandClient.parse(HostBench.JSON.readTree(HostBench.STANDARD_CELL))
 
     private fun runner(virtualLimit: Duration = Duration.ofMinutes(10), wallLimit: Duration = MockRunner.WALL_LIMIT) =
@@ -207,24 +213,113 @@ class MockRunnerTest {
         assertTrue(absent.units.isEmpty())
     }
 
-    @Test
-    fun `플릿 경로 노드를 든 정의는 돌리지 않고 플릿 경로 실패와 그 노드 id 를 소견으로 낸다`() {
+    /**
+     * picasso `MissionFixtures.DELIVER_CONTAINER` 모양의 플릿 once 노드 — 첫 출발 설비의 [property] 속성이 용기이고 첫 목적지로 운반한다.
+     * picasso 시험 소스는 이 저장소가 쓸 수 없어 같은 칸을 옮겨 적는다.
+     */
+    private fun deliverNode(property: String = EquipmentUse.PROP_CONTAINER): String {
         val first = """{"from":"FIRST_ID","equipmentUse":"source"}"""
         val destination = """{"from":"FIRST_ID","equipmentUse":"destination"}"""
-        val container = """{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material"}"""
-        val fleet = """{"schemaVersion":1,"workMasterId":"PrepareSequencedRack","maxEvidence":"E2","preferredOptionals":{},"steps":[""" +
-            """{"kind":"unit","id":"deliver","once":true,"route":"FLEET","skill":"transport","requires":[$first,$destination,$container],""" +
+        val container = """{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"$property"}"""
+        return """{"kind":"unit","id":"deliver","once":true,"route":"FLEET","skill":"transport","requires":[$first,$destination,$container],""" +
             """"whenMissing":{"failureClass":"INCOMPLETE_ORDER","parameters":[]},""" +
-            """"unitId":{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material","else":{"from":"ORDER_ID"}},""" +
+            """"unitId":{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"$property","else":{"from":"ORDER_ID"}},""" +
             """"parameters":{"container":$container,"source":$first,"destination":$destination},""" +
-            """"expectedIdentity":$container,"source":$first,"destination":$destination}]}"""
-        val result = runner().run(parsed(fleet), order())
+            """"expectedIdentity":$container,"source":$first,"destination":$destination}"""
+    }
+
+    private fun deliver(workMaster: String = "ContainerSupply"): String =
+        """{"schemaVersion":1,"workMasterId":"$workMaster","maxEvidence":"E2","preferredOptionals":{},"steps":[${deliverNode()}]}"""
+
+    /** 시나리오 ① 의 작업 지시 모양 — 출발 인계점의 `container` 가 할당된 용기다. [container] 가 널이면 그 속성을 싣지 않는다. */
+    private fun supply(container: String? = CONTAINER, required: Evidence = Evidence.E2) = JobOrder(
+        jobOrderId = "MOCK-11", workMasterId = "ContainerSupply", version = 1, requiredEvidence = required,
+        equipmentRequirements = listOf(
+            EquipmentRequirement(OUT, EquipmentUse.SOURCE, container?.let { mapOf(EquipmentUse.PROP_CONTAINER to it) }.orEmpty()),
+            EquipmentRequirement(SEQ_IN, EquipmentUse.DESTINATION),
+        ),
+    )
+
+    @Test
+    fun `플릿 정의는 인프로세스 플릿 미믹이 출발지의 용기를 목적지로 옮기고 이상적 현장이 그 도착을 보아 E2 로 통과한다`() {
+        val result = runner().run(parsed(deliver()), supply())
+        assertTrue(result.passed, result.toString())
+        assertNull(result.failure)
+        assertEquals("PHYSICALLY_DONE", result.physicalState)
+        val unit = result.units.single()
+        assertEquals(listOf(CONTAINER, "FLEET", "transport", "DONE", "E2"), listOf(unit.unitId, unit.route, unit.skillType, unit.state, unit.reached))
+        assertNull(unit.failureClass)
+        // 접수 → 인수 → 이동 → 인계가 진행 루프의 걸음마다 한 단계다(STEP 5초 × 셋 안팎).
+        assertTrue(result.virtualElapsedSeconds in 10..60, result.toString())
+    }
+
+    @Test
+    fun `요구 근거가 E1 인 플릿 정의는 플릿의 완료로 통과한다`() {
+        val result = runner().run(parsed(deliver()), supply(required = Evidence.E1))
+        assertTrue(result.passed, result.toString())
+        assertEquals("E1", result.units.single().reached)
+    }
+
+    @Test
+    fun `로봇 반복 그룹과 플릿 once 를 섞은 정의는 대상마다 이동 뒤 점검과 운반 하나를 함께 돌려 통과한다`() {
+        val mixed = visit().replace("\"workMasterId\":\"AssetVisitInspection\"", "\"workMasterId\":\"ContainerSupply\"")
+            .removeSuffix("]}") + ",${deliverNode()}]}"
+        val definition = parsed(mixed)
+        val order = targets().copy(
+            workMasterId = "ContainerSupply",
+            equipmentRequirements = targets().equipmentRequirements + supply().equipmentRequirements,
+        )
+        val result = runner().run(definition, order)
+        assertTrue(result.passed, result.toString())
+        assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2", CONTAINER), result.units.map { it.unitId })
+        assertEquals(listOf("ROBOT", "ROBOT", "ROBOT", "ROBOT", "FLEET"), result.units.map { it.route })
+        assertTrue(result.units.all { it.state == "DONE" }, result.units.toString())
+    }
+
+    /**
+     * 로봇 집기·놓기(버전 1 템플릿, 슬롯마다 pick_place)와 플릿 once 가 자리를 나눈다 — 셀 대역 표본에서 플릿의 첫 출발지는 로봇이 집는 제시
+     * 자리이고 첫 목적지는 로봇이 놓는 첫 슬롯이다. 이상적 현장은 로봇의 출발 자리에 로봇 규칙을, 플릿이 인계하기 전의 공유 슬롯에 로봇 규칙을,
+     * 인계 뒤에는 그 용기를 답한다(플릿 노드가 로봇 노드 뒤라 로봇이 먼저 놓고 근거를 세운다).
+     */
+    @Test
+    fun `로봇 pick_place 와 플릿 once 가 자리를 나누는 정의는 셀 대역 표본으로 모든 단위가 E2 로 통과한다`() {
+        val template = HostBench.JSON.readTree(template(MissionTemplates.DATA_V1)) as ObjectNode
+        (template["steps"] as com.fasterxml.jackson.databind.node.ArrayNode).add(HostBench.JSON.readTree(deliverNode()))
+        val definition = parsed(template.toString())
+        val order = checkNotNull(MockRunner.sampleOrder(PrepareSequencedRack.WORK_MASTER, 7, cell, fleet = MockRunner.hasFleet(definition)))
+        val result = runner().run(definition, order)
+        assertTrue(result.passed, result.toString())
+        assertEquals(listOf("RACK-204.S01", "RACK-204.S02", "${MockRunner.SAMPLE_CONTAINER_PREFIX}7"), result.units.map { it.unitId })
+        assertEquals(listOf("ROBOT", "ROBOT", "FLEET"), result.units.map { it.route })
+        assertTrue(result.units.all { it.state == "DONE" && it.reached == "E2" }, result.units.toString())
+    }
+
+    @Test
+    fun `표본의 출발 설비에 용기가 없으면 플릿 정의를 돌리지 않고 그 단위와 빈 칸을 소견으로 낸 정의 실패다`() {
+        val result = runner().run(parsed(deliver()), supply(container = null))
         assertEquals(false, result.passed)
-        assertEquals(MockRunFailure.FLEET_ROUTE, result.failure, result.toString())
-        assertEquals("${MockRunner.FLEET_ROUTE_DETAIL}: deliver", result.detail)
+        assertEquals(MockRunFailure.DEFINITION, result.failure, result.toString())
+        // 용기가 없으면 단위 id 는 작업 지시 id 로 떨어지고(else) 용기가 비었다.
+        assertEquals("${MockRunner.FLEET_SAMPLE_DETAIL}: MOCK-11(용기 없음)", result.detail)
         assertNull(result.physicalState)
         assertTrue(result.units.isEmpty())
         assertEquals(0, result.virtualElapsedSeconds)
+    }
+
+    @Test
+    fun `플릿 정의의 표본은 출발 자리에 용기 속성을 싣고 자재 선언을 싣지 않는다`() {
+        val order = checkNotNull(MockRunner.sampleOrder("ContainerSupply", 7, cell, fleet = true))
+        val source = order.equipmentRequirements.single { it.equipmentUse == EquipmentUse.SOURCE }
+        assertEquals("${MockRunner.SAMPLE_CONTAINER_PREFIX}7", source.properties[EquipmentUse.PROP_CONTAINER])
+        assertEquals(HostBench.MATERIAL, source.properties[EquipmentUse.PROP_MATERIAL])
+        assertTrue(order.materialRequirements.isEmpty(), order.toString())
+        assertTrue(MockRunner.hasFleet(parsed(deliver())))
+        assertEquals(false, MockRunner.hasFleet(parsed(template(MissionTemplates.DATA_V1))))
+
+        // 그 표본으로 플릿 정의가 통과한다 — 용기를 제시 자리에서 첫 슬롯으로 옮긴다.
+        val result = runner().run(parsed(deliver()), order)
+        assertTrue(result.passed, result.toString())
+        assertEquals("${MockRunner.SAMPLE_CONTAINER_PREFIX}7", result.units.single().unitId)
     }
 
     @Test

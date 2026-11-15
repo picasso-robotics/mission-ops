@@ -52,7 +52,8 @@ S3a 설계 스펙(`docs/superpowers/specs/2026-10-08-s3a-execution-host-design.m
 
 | `error` | 언제 |
 |---|---|
-| `UNKNOWN_WORK_MASTER` | `jobOrder.workMasterId` 가 `InspectAsset`·`PrepareSequencedRack` 이 아님(`DeliverContainer` 포함) |
+| `UNKNOWN_WORK_MASTER` | `jobOrder.workMasterId` 가 WorkMaster 이름 모양(대문자로 시작하는 영숫자 64자 이하)이 아님(요청 파서), 또는 고정 버전 없이 낸 WorkMaster 가 코드 정의도 활성 버전도 없음(«활성화하지 않은 임무입니다»). `DeliverContainer` 는 여기 들지 않는다(mission-ops `feat/fleet-mock-run` 부터, 아래 `FLEET_PORT_ABSENT`) |
+| `FLEET_PORT_ABSENT` | 계획한 단위에 플릿 경로(`FLEET`) 단위가 있는데 실행 호스트에 플릿 포트가 없음. 코드 임무 `DeliverContainer` 는 늘 이것이다(용기가 빠진 주문 포함). `detail` 은 «이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: <WorkMaster> 의 플릿 운반 단위 <단위 id, …>». 판정과 새 접수는 고른 임무로, 이미 실행이 있는 작업 지시의 **개정**(높은 판)은 그 실행이 쥔 케이퍼빌리티로 계획해 거른다. 개정이 아닌 재전송(같은 판 `IDEMPOTENT`, 낮은 판·종료한 실행의 거부)은 계획을 새로 세우지 않아 거르지 않는다. 같은 검사가 값 없는 승인(`REFUSED_BY_GATE`, 사유 `FLEET_PORT_ABSENT: …`)과 기동 복원(`GAVE_UP`, 사유 `FLEET_PORT_ABSENT: …`)에도 걸린다 |
 | `BAD_REQUEST` | 본문이 JSON 객체가 아님, 칸 누락·형 틀림, `version < 1`, `requiredEvidence` 가 `E0`~`E3` 아님, 기체 목록 누락·빈 문자열 원소 |
 
 판정 순서: 본문 객체 → `jobOrder` 객체 → `workMasterId` → 나머지 칸 → 기체 목록. 그래서 WorkMaster 가 틀리면 기체 목록이 없어도 `UNKNOWN_WORK_MASTER` 다.
@@ -298,6 +299,7 @@ InspectAsset 예:
 | `units[].state` | `PENDING`·`IN_DOUBT`·`RUNNING`·`VERIFYING`·`OPERATOR_HOLD`·`DONE`·`UNVERIFIED`·`FAILED`·`ABORTED` |
 | `units[].reached` | 근거 등급 `E0`~`E3`. PrepareSequencedRack 이 셀 대역으로 확인되면 `E2` |
 | `units[].skillType` | `navigate_to`·`inspect`·`pick_place` |
+| `units[].route` | 단위의 경로 `ROBOT`·`FLEET`·`SIGNAL`(picasso `Route`). 이 칸이 생기기 전(mission-ops `feat/fleet-mock-run` 전)에 적은 정착 본문에는 없다. 화면은 «기록 없음» 으로 보이고 추정하지 않는다. 지금 실행 호스트에는 플릿 포트가 없어 `FLEET` 단위가 든 실행이 서지 않는다 |
 | `units[].attempt` | 정수. 단위의 지금 시도(picasso `ExecutionUnit.attempt`). 재작업마다 하나 오른다. picasso `4d8b364` 반입 전에 적은 정착 본문에는 없다(null) |
 | `units[].decision` | 그 단위의 판단 기록 판단(picasso `RecordedDecision`, 가장 최근 하나) `{decision, approverId, approverKind, at, attempt}` 또는 null. `at` 은 호스트 시계, `attempt` 는 판단이 선 시도(재작업이면 단위의 `attempt` 보다 하나 작다). 재작업 묶음이면 묶음의 단위마다 서고 `DONE` 이던 이동에도 `REWORK` 가 선다. 운영 서비스의 판단 재조회가 대상·시도·판단으로 대조하는 자리다(S4a §5.4). 반입 전 본문에는 없다(null) |
 | `jobResponse` | 그 실행의 **마지막** 작업 응답. 없으면 null. 실행 하나에 작업 응답이 여러 번 날 수 있다(호스트는 기록 뒤 `ack` 한다) |
@@ -539,8 +541,8 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 
 | 엔드포인트 | 200 | 400 | 415 |
 |---|---|---|---|
-| `POST /host/eligibility` | 판정 | `UNKNOWN_WORK_MASTER`·`BAD_REQUEST` | JSON 아님 |
-| `POST /host/job-orders` | 결과 넷 전부 | `UNKNOWN_WORK_MASTER`·`BAD_REQUEST` | JSON 아님 |
+| `POST /host/eligibility` | 판정 | `UNKNOWN_WORK_MASTER`·`FLEET_PORT_ABSENT`·`BAD_REQUEST` | JSON 아님 |
+| `POST /host/job-orders` | 결과 넷 전부 | `UNKNOWN_WORK_MASTER`·`FLEET_PORT_ABSENT`·`BAD_REQUEST` | JSON 아님 |
 | `GET /host/executions` | 늘 | `BAD_REQUEST`(좁히는 인자의 빈 값이나 잘못된 페이지 인자, 5.7·5.8절 참조) | 없음 |
 | `GET /host/executions/summary` | 늘 | 없음 | 없음 |
 | `GET /host/cell` | 늘(`cell` null 가능) | 없음 | 없음 |
@@ -634,7 +636,8 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 |---|---|
 | `registry` | `OK`·`REGISTRY_SILENT`·`REGISTRY_UNAUTHORIZED`(`GET /api/robots` 의 것과 같다). `OK` 가 아니면 모든 행의 `commissioning`·`connection`·`settingsVersion` 이 null(«모름»). 직전 목록의 값을 대신 쓰지 않는다 |
 | `robotsAsOf` | 기체 목록을 registry 에서 읽은 시각. `checkedAt` 과 다르면 직전 목록이다. 한 번도 못 읽었으면 null |
-| `host` | `OK`·`HOST_SILENT`. `HOST_SILENT` 면 모든 행의 `host` 가 null(«모름») |
+| `host` | `OK`·`HOST_SILENT`·`HOST_REFUSED`. `HOST_SILENT` 면 모든 행의 `host` 가 null(«모름»). `HOST_REFUSED` 는 호스트가 4xx `{error, detail}` 로 판정을 거부한 것이고(예: `FLEET_PORT_ABSENT`) 모든 행의 `host` 가 null, 행마다 이유 «실행 호스트가 거부했다(<error>): <detail>», 그 본문이 `hostRefusal` 에 있다 |
+| `hostRefusal` | `host` 가 `HOST_REFUSED` 일 때 `{error, detail}`, 그 밖에는 null |
 | `robots` | 그 사이트의 기체 목록 전부(퇴역 포함, `GET /api/robots` 와 같은 순서). 목록을 한 번도 못 읽었으면 null(«모름»), 기체가 없으면 `[]`. 둘 다 호스트를 부르지 않는다 |
 | `robots[].commissioning` | `COMPLETE`·`INCOMPLETE`·`RETIRED`, 또는 null(모름) |
 | `robots[].connection` | `FRESH`·`STALE`·`NO_REPORT`, 또는 null(모름) |
@@ -669,6 +672,7 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 | 2 | 403 | `MODE_NOT_ALLOWED` | 엔지니어 모드. 본문이 깨져도 403 이 먼저다 |
 | 3 | 400 | `JOB_ORDER_BAD_REQUEST`·`UNKNOWN_WORK_MASTER`·`UNIT_ID_CONFLICT` | 9.1 |
 | 4 | 400 | `NO_ELIGIBLE_ROBOT` | 새 작업 지시 id 로 다시 판정해 `eligible` 인 기체가 없음. 호스트를 부르지 않는다. detail 은 `humanoid-01: 이유; 이유 / quadruped-01: 이유` 꼴. 기체 목록이 null 이면 `기체 목록을 아직 읽지 못했다`, 비었으면 `이 사이트에 기체가 없다` |
+| 4a | 400 | `FLEET_PORT_ABSENT` | 다시 판정에서 실행 호스트가 `FLEET_PORT_ABSENT` 로 거부함. 제출하지 않고 기록하지 않는다(접수는 `REJECTED`, 상세 «FLEET_PORT_ABSENT: <호스트 detail>»). detail 은 호스트의 것 그대로이고 «배정 가능한 기체 없음» 으로 접지 않는다 | 9.1 |
 | 5 | 200 | 아래 | 호스트에 제출함. 호스트가 무엇을 답했든 200 이다 |
 
 1~4 는 조작 기록에 남지 않는다. 5 만 남는다.
@@ -745,7 +749,7 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 | 엔드포인트 | 200 | 400 | 403 | 415 | 503 |
 |---|---|---|---|---|---|
 | `POST /api/job-orders/eligibility` | 판정(registry·호스트 불통도 200, 칸이 null) | 폼 셋 | 없음 | JSON 아님 | 없음 |
-| `POST /api/job-orders` | 제출함(결과는 본문) | `ACTOR_REQUIRED`·폼 셋·`NO_ELIGIBLE_ROBOT` | `MODE_NOT_ALLOWED` | JSON 아님 | 없음 |
+| `POST /api/job-orders` | 제출함(결과는 본문) | `ACTOR_REQUIRED`·폼 셋·`NO_ELIGIBLE_ROBOT`·`FLEET_PORT_ABSENT` | `MODE_NOT_ALLOWED` | JSON 아님 | 없음 |
 | `GET /api/executions` | 호스트 본문 | `EXECUTIONS_BAD_REQUEST`(페이지 인자) | 없음 | 없음 | `HOST_SILENT` |
 | `GET /api/executions/summary` | 호스트 본문 | 없음 | 없음 | 없음 | `HOST_SILENT` |
 | `GET /api/cell` | 호스트 본문 | 없음 | 없음 | 없음 | `HOST_SILENT` |

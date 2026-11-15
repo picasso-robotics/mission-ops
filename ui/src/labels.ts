@@ -10,6 +10,7 @@ import type {
   OpeningKind,
   HostSubmitResult,
   JobResponseDisposition,
+  LegacyMockRunFailure,
   MockRunFailure,
   MockRunView,
   Owner,
@@ -18,6 +19,7 @@ import type {
   SourceMissing,
   SourceUnobserved,
   TestRequestState,
+  UnitRoute,
   UnrestoredResult,
 } from './api'
 
@@ -69,6 +71,7 @@ export const KIND_LABEL: Record<string, string> = {
   SETTINGS_VERSION_CONFLICT: '현장 설정 버전 충돌',
   JOB_ORDER_BAD_REQUEST: '작업 지시 폼 오류',
   UNKNOWN_WORK_MASTER: '받지 않는 임무',
+  FLEET_PORT_ABSENT: '플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음)',
   UNIT_ID_CONFLICT: '단위 id 겹침',
   NO_ELIGIBLE_ROBOT: '배정 가능한 기체 없음',
   MODE_NOT_ALLOWED: '이 모드에서 할 수 없는 조작',
@@ -173,14 +176,33 @@ export const SUBMIT_RESULT_LABEL: Record<HostSubmitResult, string> = {
   UNASSIGNED: '미배정',
 }
 
-/** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). */
-export const MOCK_RUN_FAILURE_LABEL: Record<MockRunFailure, string> = {
+/** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). `FLEET_ROUTE` 는 옛 행에만 있다. */
+export const MOCK_RUN_FAILURE_LABEL: Record<MockRunFailure | LegacyMockRunFailure, string> = {
   DEFINITION: '돌리기 전 정의 검사',
   SUBMISSION_REJECTED: '표본 작업 지시 거부',
   NOT_SETTLED: '종결하지 않음',
   WALL_CLOCK_LIMIT: '실제 시간 상한 초과',
   EXECUTION_FAILED: '실행 실패',
-  FLEET_ROUTE: '플릿 경로 노드(모의 실행 불가)',
+  FLEET_ROUTE: '플릿 경로 노드(옛 기록, 그때는 모의 실행 불가)',
+}
+
+/** 단위 경로의 이름. 플릿 운반은 기체가 하지 않으므로 «기체» 로 찍지 않는다. */
+export const ROUTE_LABEL: Record<UnitRoute, string> = {
+  ROBOT: '기체',
+  FLEET: '플릿 운반',
+  SIGNAL: '설비 대기',
+}
+
+/** 단위 경로의 이름. 칸이 없는 옛 본문은 «기록 없음» 이고(추정하지 않는다) 모르는 값은 그대로 보인다. */
+export function routeLabel(route: string | null | undefined): string {
+  if (route == null) return '기록 없음'
+  return ROUTE_LABEL[route as UnitRoute] ?? route
+}
+
+/** 원문 경로에 이름표를 붙인다(인시던트 표·상세). 예: `FLEET(플릿 운반)`. 모르는 값은 원문 그대로다. */
+export function routeWithLabel(route: string): string {
+  const label = ROUTE_LABEL[route as UnitRoute]
+  return label === undefined ? route : `${route}(${label})`
 }
 
 /** 모의 실행의 통과 여부 한 줄. 실패면 하위 범주를 붙인다(S3b JSON 계약 §4.5). */

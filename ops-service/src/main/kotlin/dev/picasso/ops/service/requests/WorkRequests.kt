@@ -319,6 +319,8 @@ class WorkRequests(private val jdbc: JdbcClient, private val interfaces: Mission
   try {
    when(val sent=operations.submit(actor,draft,interfaceRef,interfaceInput,id,jobId,sourceConfirmations(id))) {
     is JobOrderSubmission.NoEligibleRobot -> finish(id,"UNASSIGNED",sent.detail,null,closeRound=true)
+    // The host refused the judgment itself (e.g. FLEET_PORT_ABSENT): nothing was submitted. The detail keeps the host code first.
+    is JobOrderSubmission.HostRefused -> finish(id,"REJECTED","${sent.error}: ${sent.detail}",null,closeRound=true)
     is JobOrderSubmission.Submitted -> {
      val value=sent.outcome
      val state=when {

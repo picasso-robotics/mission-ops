@@ -39,6 +39,11 @@ export function EligibilityTable({ read, formKey }: Props) {
       {read.error !== null && <p className="stale">직전 값입니다 ({read.error})</p>}
       {read.formKey !== formKey && <p className="stale">폼이 바뀌어 다시 판정하는 중입니다</p>}
       <p>판정 시각 {view.checkedAt}</p>
+      {view.hostRefusal != null && (
+        <p role="alert">
+          실행 호스트가 거부함({kindLabel(view.hostRefusal.error)}): {view.hostRefusal.detail}
+        </p>
+      )}
       {view.robots === null ? (
         <p>모름: 기체 목록을 아직 읽지 못했습니다</p>
       ) : view.robots.length === 0 ? (

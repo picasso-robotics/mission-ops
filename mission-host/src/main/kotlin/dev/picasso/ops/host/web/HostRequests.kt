@@ -65,6 +65,15 @@ object HostRequests {
     const val BAD_REQUEST = "BAD_REQUEST"
     const val UNKNOWN_WORK_MASTER = "UNKNOWN_WORK_MASTER"
 
+    /**
+     * 플릿 포트가 없는 실행 호스트가 플릿 경로 단위가 든 계획의 판정·새 접수를 거절한 것([MissionHost.hasFleetPort]). 코드 임무
+     * `DeliverContainer` 도 이 사유다 — 파서는 그것을 받고, 계획이 플릿 단위라 이 사유로 막힌다.
+     */
+    const val FLEET_PORT_ABSENT = "FLEET_PORT_ABSENT"
+
+    /** [FLEET_PORT_ABSENT] 의 문구. 뒤에 WorkMaster 와 플릿 운반 단위 id 가 붙는다. */
+    const val FLEET_PORT_ABSENT_DETAIL = "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다"
+
     /** 지목의 순번 문자열. 부호 있는 10진 정수다. */
     private val SEQUENCE = Regex("-?[0-9]{1,19}")
 
@@ -98,8 +107,9 @@ object HostRequests {
     fun jobOrder(node: JsonNode?): JobOrder {
         if (node == null || !node.isObject) throw BadRequest(BAD_REQUEST, "jobOrder 가 객체가 아니다")
         val workMasterId = text(node, "workMasterId")
-        if (workMasterId == "DeliverContainer" || !Regex("[A-Z][A-Za-z0-9]{0,63}").matches(workMasterId)) {
-            throw BadRequest(UNKNOWN_WORK_MASTER, "받지 않는 WorkMaster 다: $workMasterId (받는 것: ${MissionHost.WORK_MASTERS.sorted()})")
+        // 플릿 운반 코드 임무(`DeliverContainer`)도 여기서 거르지 않는다. 플릿 포트가 없는 호스트는 계획에서 [FLEET_PORT_ABSENT] 로 거절한다.
+        if (!Regex("[A-Z][A-Za-z0-9]{0,63}").matches(workMasterId)) {
+            throw BadRequest(UNKNOWN_WORK_MASTER, "WorkMaster 이름이 아니다(대문자로 시작하는 영숫자 64자 이하): $workMasterId")
         }
         val version = node.get("version")?.takeIf { it.isIntegralNumber && it.canConvertToInt() }?.asInt()
             ?: throw BadRequest(BAD_REQUEST, "version 이 정수가 아니다")

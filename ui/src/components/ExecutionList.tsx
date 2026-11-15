@@ -16,7 +16,7 @@ import type {
 } from '../api'
 import { appendOlder, catchUp, olderCount, olderCursor, sameExecution } from '../executionHistory'
 import type { ExecutionHistory } from '../executionHistory'
-import { EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, UNRESTORED_TEXT } from '../labels'
+import { EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, routeLabel, UNRESTORED_TEXT } from '../labels'
 import { CancelExecutionForm, CloseResultStatus, CloseUnrestoredForm, ReleaseFaultForm, ReworkSkippedForm } from './ExecutionControls'
 import { PermitBlockNotice } from './PermitBlockNotice'
 
@@ -214,7 +214,7 @@ function ExecutionRow({ execution, selected, settled, currentInstance }: RowProp
           <ul>
             {execution.units.map((unit) => (
               <li key={unit.unitId}>
-                {unit.unitId} {unit.skillType}: {unit.state}, 근거 {unit.reached}
+                {unit.unitId} {unit.skillType}: {unit.state}, 근거 {unit.reached}, 경로 {routeLabel(unit.route)}
               </li>
             ))}
           </ul>

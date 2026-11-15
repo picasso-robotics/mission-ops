@@ -10,6 +10,7 @@ import dev.picasso.ops.service.JobOrderBench.Companion.pass
 import dev.picasso.ops.service.JobOrderBench.Companion.robot
 import dev.picasso.ops.service.JobOrderBench.Companion.running
 import dev.picasso.ops.service.host.HostCall
+import dev.picasso.ops.service.host.HostJudgmentRefusal
 import dev.picasso.ops.service.joborders.EligibilityView
 import dev.picasso.ops.service.joborders.HostState
 import dev.picasso.ops.service.joborders.InspectAssetDraft
@@ -120,6 +121,18 @@ class JobOrderEligibilityTest {
         assertNull(humanoid.host)
         assertEquals(false, humanoid.eligible)
         assertEquals(listOf("실행 호스트가 답하지 않아 스킬 적합·진행 중인 실행을 모른다"), humanoid.reasons)
+    }
+
+    @Test
+    fun `호스트가 판정을 FLEET_PORT_ABSENT 로 거부하면 무응답으로 접지 않고 그 사유를 보이며 배정 가능이 아니다`() {
+        bench.judge = { HostCall.Silent("HTTP 400", refusal = HostJudgmentRefusal("FLEET_PORT_ABSENT", "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1")) }
+        val view = judge()
+        assertEquals(HostState.HOST_REFUSED, view.host)
+        assertEquals(HostJudgmentRefusal("FLEET_PORT_ABSENT", "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1"), view.hostRefusal)
+        val humanoid = view.row(HUMANOID)
+        assertEquals(false, humanoid.eligible)
+        assertEquals(listOf("실행 호스트가 거부했다(FLEET_PORT_ABSENT): " + "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1"), humanoid.reasons)
+        assertTrue(humanoid.reasons.none { "답하지 않아" in it }, humanoid.reasons.toString())
     }
 
     @Test

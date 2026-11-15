@@ -433,6 +433,7 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 | NO_ACTIVE_BINDING | «활성 바인딩 없음» | NOTHING_TO_REGISTER | «등록할 명칭 없음» |
 | UNCLASSIFIED | «분류되지 않은 거부» | SETTINGS_VERSION_CONFLICT | «현장 설정 버전 충돌» |
 | JOB_ORDER_BAD_REQUEST | «작업 지시 폼 오류» | UNKNOWN_WORK_MASTER | «받지 않는 임무» |
+| FLEET_PORT_ABSENT | «플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음)» | | |
 | UNIT_ID_CONFLICT | «단위 id 겹침» | NO_ELIGIBLE_ROBOT | «배정 가능한 기체 없음» |
 | MODE_NOT_ALLOWED | «이 모드에서 할 수 없는 조작» | ACTOR_REQUIRED | «행위자 없음» |
 | UNREADABLE | «읽을 수 없는 정의» | DUPLICATE_NODE_ID | «노드 id 겹침» |
@@ -471,7 +472,9 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 | `TEST_REQUEST_LABEL` | NONE «요청 없음», WAITING «대기», RUNNING «실행 중», EXPIRED «만료», DONE «끝남» | `labels.ts` |
 | `SKILL_FIT_LABEL` | FIT «적합», MISSING «모자람», UNKNOWN «모름» | `labels.ts` |
 | `SUBMIT_RESULT_LABEL` | ACCEPTED «배정됨», IDEMPOTENT «같은 작업 지시의 기존 실행», REJECTED «거부됨», UNASSIGNED «미배정» | `labels.ts` |
-| `MOCK_RUN_FAILURE_LABEL` | DEFINITION «돌리기 전 정의 검사», SUBMISSION_REJECTED «표본 작업 지시 거부», NOT_SETTLED «종결하지 않음», WALL_CLOCK_LIMIT «실제 시간 상한 초과», EXECUTION_FAILED «실행 실패», FLEET_ROUTE «플릿 경로 노드(모의 실행 불가)» | `labels.ts` |
+| `MOCK_RUN_FAILURE_LABEL` | DEFINITION «돌리기 전 정의 검사», SUBMISSION_REJECTED «표본 작업 지시 거부», NOT_SETTLED «종결하지 않음», WALL_CLOCK_LIMIT «실제 시간 상한 초과», EXECUTION_FAILED «실행 실패», 옛 행에만 남은 FLEET_ROUTE «플릿 경로 노드(옛 기록, 그때는 모의 실행 불가)» | `labels.ts` |
+| `ROUTE_LABEL`·`routeLabel` | ROBOT «기체», FLEET «플릿 운반», SIGNAL «설비 대기», 칸 없음 «기록 없음», 모르는 값은 그대로 | `labels.ts` |
+| `routeWithLabel` | «${원문}(${이름})», 예: «FLEET(플릿 운반)», 모르는 값은 원문 그대로 | `labels.ts` |
 | `mockRunVerdict` | «통과», «실패», «실패(${하위 범주})» | `labels.ts` |
 | `TEMPLATE_LABEL` | DATA_V1 «데이터 정의 템플릿», ARRIVAL_WAIT «랙 도착 대기 템플릿», ARRIVAL_WAIT_HOLD «운영자 보류 대기 템플릿» | `labels.ts` |
 | `FAULT_KIND_LABEL` | SKILL_EXECUTION_FAILED «스킬 실패», CONNECTION «연결 상태» | `labels.ts` |
@@ -501,7 +504,6 @@ mission-ops 는 상위 시스템(MES·WMS)의 외부 주문을 로봇 임무에 
 - 물리 상태(RUNNING, PHYSICALLY_DONE, PARTIAL 등)
 - 단위 상태
 - 신호 종류(BOOLEAN, TEXT)
-- 경로(SIGNAL, ROBOT)
 - 실패 종류(GRASP_FAILED, SIGNAL_DEADLINE)
 - 확인 결과
 - 이력 결과(SUCCEEDED 등)
@@ -910,6 +912,7 @@ region «배정 가능»(h2 «배정 가능», `EligibilityTable.tsx`)에서는 
 | 직전 값 | `p.stale` «직전 값입니다 (${error})» |
 | 폼이 바뀌어 다시 판정 중 | `p.stale` «폼이 바뀌어 다시 판정하는 중입니다» |
 | 판정 시각 | «판정 시각 ${checkedAt}» |
+| 실행 호스트가 판정을 거부함(`host = HOST_REFUSED`) | 판정 시각 아래 alert «실행 호스트가 거부함(${풀이}): ${detail}»(예 풀이 «플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음)»), 행마다 이유 «실행 호스트가 거부했다(FLEET_PORT_ABSENT): …» |
 | 기체 목록 모름 | «모름: 기체 목록을 아직 읽지 못했습니다» |
 | 기체 없음 | «이 사이트에 기체가 없습니다» |
 
@@ -965,7 +968,7 @@ region «배정 가능»(h2 «배정 가능», `EligibilityTable.tsx`)에서는 
 4. 임무 버전(«코드 정의», «버전 ${n}»)
 5. 기체
 6. 물리 상태(코드 값 뒤에, 이 인스턴스에서 건 운영자 취소가 있으면 회색 span(`.restored`) « (취소 요청: ${approverId}, ${reason})», title «${recordedAt}, 취소 때 ${physicalState}». 실행에 `permitBlock` 이 있으면 같은 칸 아래 region «작업 허가 대기»(`PermitBlockNotice.tsx`, `section.permit-block`, 연한 파랑 바탕과 파란 왼쪽 띠 `#2563eb`). 위에서 아래로 h4 «작업 허가 대기», 안내 «현장 안전 신호가 허가를 내지 않아 이 실행의 새 로봇 명령을 내지 않고 기다립니다. 실패나 운영자 보류가 아닙니다.», dl(«막힌 단위», «내지 않은 명령», «처음 막힌 시각»), 목록 `ul[aria-label=허가를 기다리는 기체]`(기체마다 굵게 «기체 ${robotId}: ${허가 글자}», 그 아래 판단마다 «까닭 ${까닭 글자} · 막는 주체 ${subject} · 풀릴 근거 ${resumeBasis}» 와 작은 글자 «(원천 ${source}, 관측 시각 ${observedAt})», 값이 null 이면 «없음»), 끝에 안내 둘(`PERMIT_BLOCK_TEXT.notOperator`, `notSafety`). 운영자 보류(`OPERATOR_HOLD`)·결함 차단 표시와 섞지 않고 버튼이 없음. 근거: `PermitBlockNotice.test.tsx` 의 `작업 허가로 막힌 실행은 막은 기체와 주체와 풀릴 근거를 운영자 보류와 다른 표시로 보이고 조작 버튼이 없다`, `모름(UNKNOWN)은 까닭과 원천 없음을 그대로 보인다`. 종결 이력 줄은 물리 상태 코드 뒤에 회색 span `.restored` 로 « (종결 ${settledAt})» 을 표시합니다. 그 뒤에 해당 줄의 실행에 작업 응답이 있으면 회색 span `.restored` 로 « (작업 지시 버전 ${jobResponse.version})» 을 표시합니다. 해당 줄이 `superseded` 이면 회색 span `.restored` 로 « (이후 다시 종결)» 을 표시합니다. 다시 종결한 작업 지시는 종결 이력 줄이 여러 개 생깁니다. 작업 응답이 없는 줄은 버전을 표시하지 않습니다. `blockedFaults` 가 비어 있지 않으면 코드 값 아래에 `strong.fault-blocked` «결함 차단 ${n}건»(주황 계열 글자, 작업 허가 대기 region 과 다른 표시)이 표시됩니다. `releases` 가 있으면 수용마다 회색 span(`.restored`) « (결함 수용: ${approverId}, ${reason})»(title «${recordedAt}, ${errorType 들}»)이 붙으며, `releases` 는 작업 지시 id 로 읽으므로 재기동 전 인스턴스의 수용도 보입니다.)
-7. 단위(«${unitId} ${skillType}: ${state}, 근거 ${reached}», 종결 기록에 본문이 없으면(본문이 기록되기 전에 종결) 단위 목록 대신 «종결 기록에 단위·작업 응답이 없습니다»)
+7. 단위(«${unitId} ${skillType}: ${state}, 근거 ${reached}, 경로 ${경로 이름}», 경로 이름은 «기체»·«플릿 운반»·«설비 대기» 이고 경로 칸이 생기기 전에 적은 본문이면 «기록 없음»(추정하지 않음), 종결 기록에 본문이 없으면(본문이 기록되기 전에 종결) 단위 목록 대신 «종결 기록에 단위·작업 응답이 없습니다»)
 8. 작업 응답(«없음» 또는 작업 응답 요약 목록, «운영자 개입 필요» 포함)
 
 방금 낸 작업 지시의 행은 `tr.selected` 입니다.
@@ -1041,7 +1044,7 @@ form «결함 수용» 아래에는 `ExecutionControls.tsx` 의 `ReworkSkippedFo
 5. 실행 id
 6. 단위
 7. 실패 종류(코드 값 또는 «-»)
-8. 경로(코드 값)
+8. 경로(코드 값에 이름표, «ROBOT(기체)»·«FLEET(플릿 운반)»·«SIGNAL(설비 대기)», 모르는 값은 원문 그대로)
 9. 현장 설정 버전(«버전 ${n}», «모름»)
 10. 임무 버전(«버전 ${n}», «코드 정의»)
 11. 판단(«판단됨(설비 근거 없이 완료 확인)», «판단됨», «미해결», «판단 대상 아님»)
@@ -1649,17 +1652,18 @@ region «임무 ${workMasterId}» 에는 h2 임무 id 가 표시됩니다. dl �
 | 저장 | «${what}: 초안 ${id} 저장됨» |
 | 검증 통과 | «${what}: 통과» |
 | 모의 실행 | «${what}: ${판정}» 과 모의 실행 보고 |
+| 플릿 포트 없는 호스트의 활성화(FLEET_PORT_ABSENT) | «${what}: 막힘. 이 실행 호스트에는 플릿 포트가 없어 플릿 운반 노드를 든 정의를 활성화하지 않습니다. 모의 실행 통과는 정의가 끝까지 돈다는 뜻이며 이 실행 호스트에서 돈다는 뜻이 아닙니다» 와, 마지막 모의 실행이 있으면 «마지막 모의 실행: ${판정}» |
 | 모의 실행 없이 활성화 | «${what}: 막힘. 이 초안에 통과한 모의 실행이 없습니다. 모의 실행을 먼저 하십시오» |
 | 활성화 | «${what}: 버전 ${n} 활성화됨. 다음 작업 지시부터 이 버전을 씁니다» |
 
-모의 실행 보고(`MockRunReport.tsx`)의 첫 줄은 «모의 실행 ${id}: ${판정}» 입니다. dl 에는 다음 항목이 표시됩니다:
+모의 실행 보고(`MockRunReport.tsx`)의 첫 줄은 «모의 실행 ${id}: ${판정}» 입니다. 단위에 플릿 운반 단위가 있으면 바로 아래 note «플릿 운반 단위는 모의 실행 안의 플릿 미믹으로 돌았습니다. 통과는 정의가 끝까지 돈다는 뜻이며 이 실행 호스트에서 돈다는 뜻이 아닙니다. 이 실행 호스트에는 플릿 포트가 없어 플릿 운반 정의는 활성화되지 않습니다» 가 붙습니다(`FLEET_MOCK_NOTE`). dl 에는 다음 항목이 표시됩니다:
 - «표본 작업 지시»(없으면 «없음», 설비를 쓰는 표본이면 설비 사용과 id 가 함께 보임)
 - «물리 상태»(없으면 «실행이 서지 않음»)
 - «가상 경과»(초)
 
 단위 표 «모의 실행 ${id} 단위» 가 제공되며 열은 다음과 같습니다:
 - 단위
-- 경로(«설비 대기» 또는 «기체»)
+- 경로(«기체»·«플릿 운반»·«설비 대기», 플릿 운반 단위를 «기체» 로 찍지 않음)
 - 스킬
 - 상태
 - 근거

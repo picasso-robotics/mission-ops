@@ -23,6 +23,7 @@ import {
   rejectionText,
   RESOLUTION_LABEL,
   REWORK_RECHECK_TEXT,
+  routeWithLabel,
 } from '../labels'
 import type { HostRead } from './ExecutionList'
 import { FaultCard } from './FaultCard'
@@ -300,7 +301,7 @@ function IncidentTable({
             <td>{row.executionId}</td>
             <td>{row.unitId}</td>
             <td>{row.failureClass ?? '-'}</td>
-            <td>{row.route}</td>
+            <td>{routeWithLabel(row.route)}</td>
             <td>{settingsVersion(row.siteSettingsVersion)}</td>
             <td>{missionVersion(row.missionVersion)}</td>
             <td>{judgement(row)}</td>
@@ -363,7 +364,7 @@ function Detail({ detail, related, onSelect, session, decidable, blockedNow, bus
             </>
           )}
           <dt>경로</dt>
-          <dd>{detail.route}</dd>
+          <dd>{routeWithLabel(detail.route)}</dd>
           <dt>현장 설정 버전</dt>
           <dd>{settingsVersion(intent.siteSettingsVersion)}</dd>
           <dt>시간값</dt>

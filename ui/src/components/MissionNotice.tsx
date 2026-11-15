@@ -23,7 +23,7 @@ export type MissionSent =
 /**
  * 임무 조작의 결과(S3b 스펙 §8, S3b JSON 계약 §10.1). 운영 서비스의 `REJECTED` 만 보고 거부 카드를 그리지 않고 호스트 본문의
  * `result` 로 보인다. 거부 카드는 `REFUSED` 뿐이고, `INPUT_UNKNOWN` 과 시운전 완료 기체를 모르는 503 은 모름, `MOCK_RUN_REQUIRED`
- * 는 따로 적는다. 응답 없음은 재조회로 확인되기 전에는 성공으로도 실패로도 보이지 않는다.
+ * 와 `FLEET_PORT_ABSENT`(플릿 포트 없는 실행 호스트) 는 따로 적는다. 응답 없음은 재조회로 확인되기 전에는 성공으로도 실패로도 보이지 않는다.
  */
 export function MissionNotice({ last }: { last: MissionSent }) {
   return (
@@ -69,6 +69,17 @@ function describe(last: MissionSent): ReactNode {
         operated(what, operation, (outcome, findings) => {
           const judgment = judged(what, outcome.result, outcome.unknown, findings)
           if (judgment !== null) return judgment
+          if (outcome.result === 'FLEET_PORT_ABSENT') {
+            return (
+              <>
+                <p>
+                  {what}: 막힘. 이 실행 호스트에는 플릿 포트가 없어 플릿 운반 노드를 든 정의를 활성화하지 않습니다. 모의 실행 통과는
+                  정의가 끝까지 돈다는 뜻이며 이 실행 호스트에서 돈다는 뜻이 아닙니다
+                </p>
+                {outcome.lastMockRun !== null && <p>마지막 모의 실행: {mockRunVerdict(outcome.lastMockRun)}</p>}
+              </>
+            )
+          }
           if (outcome.result === 'MOCK_RUN_REQUIRED') {
             return (
               <>

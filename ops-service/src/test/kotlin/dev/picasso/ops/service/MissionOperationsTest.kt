@@ -89,6 +89,7 @@ class MissionOperationsTest {
         val activations = mapOf(
             HostActivationResult.ACTIVATED to OperationResult.SUCCEEDED,
             HostActivationResult.REFUSED to OperationResult.REJECTED,
+            HostActivationResult.FLEET_PORT_ABSENT to OperationResult.REJECTED,
             HostActivationResult.MOCK_RUN_REQUIRED to OperationResult.REJECTED,
             HostActivationResult.INPUT_UNKNOWN to OperationResult.REJECTED,
         )
@@ -101,7 +102,7 @@ class MissionOperationsTest {
             assertEquals(hostResult.name, outcome.outcome!!["result"].asText())
             assertEquals(logged, log.list().first().result, "$hostResult")
         }
-        assertEquals(8, log.list().size)
+        assertEquals(mockRuns.size + activations.size, log.list().size)
     }
 
     @Test

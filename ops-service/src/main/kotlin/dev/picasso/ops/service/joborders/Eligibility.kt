@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode
 import dev.picasso.ops.service.host.HostCall
 import dev.picasso.ops.service.host.HostEligibility
 import dev.picasso.ops.service.host.HostReads
+import dev.picasso.ops.service.host.HostJudgmentRefusal
 import dev.picasso.ops.service.robots.CommissioningState
 import dev.picasso.ops.service.robots.Connection
 import dev.picasso.ops.service.robots.RegistryState
@@ -12,8 +13,11 @@ import dev.picasso.ops.service.robots.RobotView
 import java.time.Clock
 import java.time.Instant
 
-/** 실행 호스트에 닿았는가. 기체별이 아니라 판정 한 번 전체의 상태다. */
-enum class HostState { OK, HOST_SILENT }
+/**
+ * 실행 호스트에 닿았는가. 기체별이 아니라 판정 한 번 전체의 상태다. `HOST_REFUSED` 는 호스트가 답했으나 판정을 거부한 것이다(예:
+ * `FLEET_PORT_ABSENT`). 그 사유는 [EligibilityView.hostRefusal] 에 있고 «무응답» 과 섞지 않는다.
+ */
+enum class HostState { OK, HOST_SILENT, HOST_REFUSED }
 
 /**
  * 기체 하나의 배정 가능 판정(S3a 스펙 §8, T3). 네 칸 중 시운전·연결은 운영 서비스가, 스킬 적합·도는 실행은 호스트가 판정한다.
@@ -46,6 +50,7 @@ data class RobotEligibility(
  * @param robotsAsOf 기체 목록을 registry 에서 읽은 시각. [checkedAt] 과 다르면 직전 목록이다
  * @param host 호스트 상태. `HOST_SILENT` 면 호스트 칸이 모두 «모름» 이다
  * @param robots 널이면 기체 목록을 한 번도 읽지 못한 것(«모름»), 빈 목록은 기체가 없는 것이다
+ * @param hostRefusal [host] 가 `HOST_REFUSED` 일 때 호스트의 `{error, detail}`. 그 밖에는 널이다
  */
 data class EligibilityView(
     val checkedAt: Instant,
@@ -53,6 +58,7 @@ data class EligibilityView(
     val robotsAsOf: Instant?,
     val host: HostState,
     val robots: List<RobotEligibility>?,
+    val hostRefusal: HostJudgmentRefusal? = null,
 )
 
 /**
@@ -73,14 +79,20 @@ class JobOrderEligibility(
         val ids = list.robots.orEmpty().map { it.robot.robotId }
         val hostCall = if (ids.isEmpty()) HostCall.Ok(emptyList()) else host.eligibility(jobOrder, ids)
         val hostRows = (hostCall as? HostCall.Ok)?.value?.associateBy { it.robotId }
+        val refusal = (hostCall as? HostCall.Silent)?.refusal
         return EligibilityView(
             checkedAt = clock.instant(),
             registry = list.registry,
             robotsAsOf = list.robotsAsOf,
-            host = if (hostRows != null) HostState.OK else HostState.HOST_SILENT,
-            robots = list.robots?.map { view ->
-                row(view, list.registry, known, list.settingsVersion, list.connectionThresholdSeconds, hostRows)
+            host = when {
+                hostRows != null -> HostState.OK
+                refusal != null -> HostState.HOST_REFUSED
+                else -> HostState.HOST_SILENT
             },
+            robots = list.robots?.map { view ->
+                row(view, list.registry, known, list.settingsVersion, list.connectionThresholdSeconds, hostRows, refusal)
+            },
+            hostRefusal = refusal,
         )
     }
 
@@ -91,6 +103,7 @@ class JobOrderEligibility(
         settingsVersion: Long?,
         thresholdSeconds: Long?,
         hostRows: Map<String, HostEligibility>?,
+        refusal: HostJudgmentRefusal?,
     ): RobotEligibility {
         val commissioning = if (known) view.commissioning?.state else null
         val connection = if (known) view.connection else null
@@ -118,6 +131,7 @@ class JobOrderEligibility(
                 }
             }
             when {
+                refusal != null -> add("실행 호스트가 거부했다(${refusal.error}): ${refusal.detail}")
                 hostRows == null -> add("실행 호스트가 답하지 않아 스킬 적합·진행 중인 실행을 모른다")
                 hostRow == null -> add("실행 호스트가 이 기체를 판정하지 않았다")
                 hostRow.gateTrial -> Unit

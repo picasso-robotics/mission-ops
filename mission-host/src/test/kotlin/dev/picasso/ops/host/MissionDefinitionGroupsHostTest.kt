@@ -10,6 +10,7 @@ import dev.picasso.ops.host.HostBench.Companion.HUMANOID
 import dev.picasso.ops.host.HostBench.Companion.JSON
 import dev.picasso.ops.host.HostBench.Companion.QUADRUPED
 import dev.picasso.ops.host.HostBench.Companion.request
+import dev.picasso.ops.host.mission.MissionVersions
 import dev.picasso.ops.host.mission.MockRunner
 import java.time.Duration
 import java.util.UUID
@@ -86,6 +87,7 @@ class MissionDefinitionGroupsHostTest {
             val planned = bench.execution(executionId)!!
             assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2"), planned["units"].map { it["unitId"].asText() }, planned.toString())
             assertEquals(listOf("navigate_to", "inspect", "navigate_to", "inspect"), planned["units"].map { it["skillType"].asText() })
+            assertEquals(listOf("ROBOT", "ROBOT", "ROBOT", "ROBOT"), planned["units"].map { it["route"].asText() }, planned.toString())
 
             // 첫 이동에 로봇 수준 결함을 강제한다. 다음 단위(T1 점검) 시작 전에 실행이 운영자 보류에 선다.
             val running = bench.runningTask()
@@ -127,31 +129,45 @@ class MissionDefinitionGroupsHostTest {
     }
 
     @Test
-    fun `플릿 경로 노드를 든 정의는 검증을 지나도 모의 실행이 플릿 경로 실패라 활성화가 MOCK_RUN_REQUIRED 다`() {
+    fun `플릿 경로 노드를 든 정의는 모의 실행이 인프로세스 플릿 미믹으로 E2 통과해도 플릿 포트가 없는 호스트라 활성화가 FLEET_PORT_ABSENT 다`() {
         HostBench().use { bench ->
             bench.awaitPump()
+            // picasso `MissionFixtures.DELIVER_CONTAINER` 모양 — 첫 출발 설비의 container 속성이 용기다.
             val first = """{"from":"FIRST_ID","equipmentUse":"source"}"""
             val destination = """{"from":"FIRST_ID","equipmentUse":"destination"}"""
-            val container = """{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material"}"""
+            val container = """{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"container"}"""
             val fleet = """{"schemaVersion":1,"workMasterId":"${PrepareSequencedRack.WORK_MASTER}","maxEvidence":"E2","preferredOptionals":{},"steps":[""" +
                 """{"kind":"unit","id":"deliver","once":true,"route":"FLEET","skill":"transport","requires":[$first,$destination,$container],""" +
                 """"whenMissing":{"failureClass":"INCOMPLETE_ORDER","parameters":[]},""" +
-                """"unitId":{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"material","else":{"from":"ORDER_ID"}},""" +
+                """"unitId":{"from":"FIRST_PROPERTY","equipmentUse":"source","property":"container","else":{"from":"ORDER_ID"}},""" +
                 """"parameters":{"container":$container,"source":$first,"destination":$destination},""" +
                 """"expectedIdentity":$container,"source":$first,"destination":$destination}]}"""
             val draftId = bench.saveDraft(PrepareSequencedRack.WORK_MASTER, fleet, null)
             val validated = bench.step(draftId, "validate").body!!
             assertEquals("PASSED", validated["result"].asText(), validated.toString())
+            // 모의 실행 전에도 플릿 포트 없음이 앞선다(판정 순서: 다시 검증 → 플릿 포트 → 모의 실행).
+            val early = bench.activate(draftId)
+            assertEquals(MissionVersions.FLEET_PORT_ABSENT, early["result"].asText(), early.toString())
+            assertTrue(early["lastMockRun"].isNull, early.toString())
 
+            // 표본은 셀 대역 스냅숏으로 만들고 플릿 정의라 출발 자리에 용기 속성을 싣는다.
             val mock = bench.step(draftId, "mock-run").body!!
-            assertEquals("FAILED", mock["result"].asText(), mock.toString())
-            val result = mock["mockRun"]["result"]
-            assertEquals(listOf("FLEET_ROUTE", "${MockRunner.FLEET_ROUTE_DETAIL}: deliver"), listOf(result["failure"].asText(), result["detail"].asText()))
-            assertTrue(result["units"].isEmpty && result["physicalState"].isNull, result.toString())
+            assertEquals("PASSED", mock["result"].asText(), mock.toString())
+            val unit = mock["mockRun"]["result"]["units"].single()
+            assertEquals(
+                listOf("${MockRunner.SAMPLE_CONTAINER_PREFIX}$draftId", "FLEET", "DONE", "E2"),
+                listOf(unit["unitId"].asText(), unit["route"].asText(), unit["state"].asText(), unit["reached"].asText()),
+                mock.toString(),
+            )
 
             val activation = bench.activate(draftId)
-            assertEquals("MOCK_RUN_REQUIRED", activation["result"].asText(), activation.toString())
-            assertTrue(activation["version"].isNull, activation.toString())
+            assertEquals(MissionVersions.FLEET_PORT_ABSENT, activation["result"].asText(), activation.toString())
+            assertTrue(activation["version"].isNull && activation["activated"].isNull, activation.toString())
+            assertEquals(true, activation["lastMockRun"]["passed"].asBoolean(), activation.toString())
+            // 버전 행이 서지 않았고 카탈로그는 코드 정의 그대로다.
+            val overview = bench.get("/host/missions/${PrepareSequencedRack.WORK_MASTER}")
+            assertTrue(overview["versions"].isEmpty, overview.toString())
+            assertEquals(MissionVersions.SOURCE_CODE, overview["active"]["source"].asText(), overview.toString())
         }
     }
 }

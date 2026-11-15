@@ -14,7 +14,9 @@ import {
   versionRow,
 } from '../testing/fakeOps'
 import type { FakeOps } from '../testing/fakeOps'
+import { mockRunVerdict } from '../labels'
 import { MissionDefinitionEditor as MissionsArea } from './MissionDefinitionEditor'
+import { FLEET_MOCK_NOTE } from './MockRunReport'
 
 const engineer: Session = { mode: 'engineer', user: 'lee' }
 const operator: Session = { mode: 'operator', user: 'kim' }
@@ -366,6 +368,57 @@ describe('임무·정책 영역', () => {
     expect(shown).toHaveTextContent('마지막 모의 실행: 실패(종결하지 않음)')
     expect(shown).not.toHaveTextContent('거부')
     expect(shown).not.toHaveTextContent('활성화됨')
+  })
+
+  it('플릿 운반 단위가 든 모의 실행은 경로를 «플릿 운반» 으로 보이고 통과가 이 호스트에서 돈다는 뜻이 아님을 적는다', async () => {
+    const fake = installFakeOps(emptyList)
+    const fleet = mockRunRow({
+      mockRunId: 8,
+      result: {
+        ...mockRunRow().result,
+        units: [{ unitId: 'MOCK-CONTAINER-7', route: 'FLEET', skillType: 'transport', state: 'DONE', reached: 'E2', failureClass: null }],
+      },
+    })
+    fake.answers.set(draftPath(7, 'mock-run'), { status: 200, body: operation({ ...judgment('PASSED'), mockRun: fleet }) })
+    await openDraft(fake)
+    await click('모의 실행')
+    await waitFor(async () => expect(await notice()).toHaveTextContent('초안 7 모의 실행: 통과'))
+    const shown = await notice()
+    expect(cells(within(within(shown).getByRole('table', { name: '모의 실행 8 단위' })).getAllByRole('row')[1])).toEqual([
+      'MOCK-CONTAINER-7',
+      '플릿 운반',
+      'transport',
+      'DONE',
+      'E2',
+      '-',
+    ])
+    expect(within(shown).getByRole('note')).toHaveTextContent(FLEET_MOCK_NOTE)
+  })
+
+  it('플릿 포트 없는 실행 호스트의 활성화 막힘은 따로 적고 마지막 모의 실행의 통과를 붙인다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.answers.set(draftPath(7, 'activate'), {
+      status: 200,
+      body: operation(
+        { ...judgment('FLEET_PORT_ABSENT'), version: null, lastMockRun: mockRunRow(), activated: null },
+        { result: 'REJECTED' },
+      ),
+    })
+    await openDraft(fake)
+    await userEvent.type(screen.getByLabelText('활성화 사유'), '용기 공급 도입')
+    await click('활성화')
+    const shown = await notice()
+    expect(shown).toHaveTextContent(
+      '초안 7 활성화: 막힘. 이 실행 호스트에는 플릿 포트가 없어 플릿 운반 노드를 든 정의를 활성화하지 않습니다',
+    )
+    expect(shown).toHaveTextContent('마지막 모의 실행: 통과')
+    expect(shown).not.toHaveTextContent('통과한 모의 실행이 없습니다')
+    expect(shown).not.toHaveTextContent('활성화됨')
+  })
+
+  it('옛 모의 실행 행의 FLEET_ROUTE 실패는 옛 기록 이름표로 보인다', async () => {
+    const legacy = mockRunRow({ passed: false, result: { ...mockRunRow().result, passed: false, failure: 'FLEET_ROUTE', units: [] } })
+    expect(mockRunVerdict(legacy)).toBe('실패(플릿 경로 노드(옛 기록, 그때는 모의 실행 불가))')
   })
 
   it('모의 실행 실패는 하위 범주와 이유를 보이고 초안 목록에 그 초안의 마지막 모의 실행으로 남는다', async () => {

@@ -9,13 +9,21 @@ import dev.picasso.middleware.Evidence
 import dev.picasso.middleware.EquipmentRequirement
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.Middleware
+import dev.picasso.middleware.PrepareSequencedRack
+import dev.picasso.middleware.mission.DefinedCapability
+import dev.picasso.middleware.mission.MissionDefinitionParser
+import dev.picasso.middleware.mission.MissionParse
+import dev.picasso.ops.host.HostBench.Companion.GHOST
 import dev.picasso.ops.host.HostBench.Companion.HUMANOID
 import dev.picasso.ops.host.HostBench.Companion.JSON
 import dev.picasso.ops.host.HostBench.Companion.QUADRUPED
 import dev.picasso.ops.host.HostBench.Companion.ROOT
 import dev.picasso.ops.host.HostBench.Companion.inspect
+import dev.picasso.ops.host.HostBench.Companion.rack
 import dev.picasso.ops.host.HostBench.Companion.request
 import dev.picasso.ops.host.incident.ApprovalWindow
+import dev.picasso.ops.host.mission.StoredMissionCatalog
+import dev.picasso.ops.host.web.HostRequests
 import dev.picasso.registry.PostgresSupport
 import java.net.URI
 import java.net.http.HttpClient
@@ -109,6 +117,32 @@ class IncidentLoopHostTest {
             bench.eventually("놓기") { bench.host.footprint() == empty }
             val next = bench.post("/host/job-orders", request(inspect("JO-B", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
             assertEquals("ACCEPTED", next["result"].asText(), next.toString())
+        }
+    }
+
+    /**
+     * 승인으로 설 계획에 플릿 단위가 있으면 미들웨어를 부르지 않는다. 플릿 계획은 접수에서 막혀 제안이 서지 않으므로, 로봇 계획으로 막힌
+     * 제출 뒤 활성 임무가 플릿 정의로 바뀐 장면(옛 호스트가 남긴 버전)을 카탈로그에 직접 실어 만든다.
+     */
+    @Test
+    fun `승인으로 설 계획에 플릿 단위가 있으면 미들웨어에 넘기지 않고 FLEET_PORT_ABSENT 사유의 REFUSED_BY_GATE 다`() {
+        HostBench(incidentLoop = loop()).use { bench ->
+            bench.awaitPump()
+            val unassigned = bench.post("/host/job-orders", request(rack("JO-F", "RACK-204.S01"), "candidates", GHOST)).body!!
+            assertEquals("UNASSIGNED", unassigned["result"].asText(), unassigned.toString())
+            val fleet = when (val p = MissionDefinitionParser.parse(FleetBlockHostTest.deliver(PrepareSequencedRack.WORK_MASTER))) {
+                is MissionParse.Parsed -> p.definition
+                is MissionParse.Unreadable -> error("정의를 못 읽었다: ${p.problems}")
+            }
+            bench.bean(StoredMissionCatalog::class.java).install(PrepareSequencedRack.WORK_MASTER, DefinedCapability(fleet), 9)
+            bench.host.approve = { _, attempt -> fail("미들웨어에 넘기지 않아야 한다: $attempt") }
+            val port = checkNotNull(bench.bean(ApprovalWindow::class.java).port)
+            val refused = approve(port, AGENT, "JO-F")
+            assertEquals(listOf("REFUSED", "REFUSED_BY_GATE"), listOf(refused.second["outcome"].asText(), refused.second["refusal"].asText()), refused.toString())
+            assertTrue(refused.second["reason"].asText().startsWith("${HostRequests.FLEET_PORT_ABSENT}: "), refused.toString())
+            assertTrue(bench.get("/host/executions")["executions"].isEmpty)
+            // 승인이 미리 계획해 볼 작업 지시의 상한은 미들웨어에 넘긴 picasso 제안 보존 상한과 같다.
+            assertEquals(MissionHost.RETENTION.proposals, bench.host.proposedOrdersLimit)
         }
     }
 

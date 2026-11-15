@@ -19,6 +19,9 @@ dependencies {
     // 모의 실행이 프로세스 안에 별도 mimic 과 가상 시계를 띄운다(S3b 스펙 §6.4). 하네스가 in-process 로 세우고 mimic 은 그 안에서 돈다.
     implementation("dev.picasso:harness")
     implementation("dev.picasso:mimic")
+    // 모의 실행이 플릿 경로(`route: FLEET`) 단위를 요청마다 새 인프로세스 플릿 미믹(`AmrFleetMimic`)으로 돌린다(picasso §15.326).
+    // 실행 호스트의 미들웨어에는 여전히 플릿 포트가 없다(`AmrFleetPort.None`).
+    implementation("dev.picasso:fleet-mimic")
     // 인시던트 고리(picasso H1). 승인 호스트·자격 선언 파일·번들 쓰기. 설정을 비우면 붙지 않는다(`host.incident-loop.*`).
     implementation("dev.picasso:host-kit")
 

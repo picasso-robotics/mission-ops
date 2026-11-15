@@ -31,8 +31,8 @@ enum class HostValidationResult { PASSED, REFUSED, INPUT_UNKNOWN }
 /** 호스트 모의 실행 결과의 이름(S3b JSON 계약 §4.5). */
 enum class HostMockRunResult { PASSED, FAILED, REFUSED, INPUT_UNKNOWN }
 
-/** 호스트 활성화 결과의 이름(S3b JSON 계약 §4.6). */
-enum class HostActivationResult { ACTIVATED, REFUSED, MOCK_RUN_REQUIRED, INPUT_UNKNOWN }
+/** 호스트 활성화 결과의 이름(S3b JSON 계약 §4.6). `FLEET_PORT_ABSENT` 는 플릿 경로 정의를 플릿 포트 없는 실행 호스트가 받지 않은 것이다. */
+enum class HostActivationResult { ACTIVATED, REFUSED, FLEET_PORT_ABSENT, MOCK_RUN_REQUIRED, INPUT_UNKNOWN }
 
 /**
  * 임무 조작(초안 저장, 모의 실행, 활성화)의 200 응답(S3b 스펙 §7). 작업 지시 제출의 응답과 같은 자리에 같은 칸을 둔다.
@@ -102,10 +102,10 @@ internal data class HostJudgment(val result: String, val refusals: List<HostMiss
  *
  * 응답 없음 뒤 재조회는 요청 id 로 한다(T9). 호스트가 그 요청 id 로 남긴 행이 있고 그 행이 이 조작의 것(초안 저장은
  * `draft`, 모의 실행은 `mockRun`, 활성화는 `version`)이면 반영됨, 호스트가 남은 행이 없다고 답하면 반영 안 됨이다.
- * 모의 실행의 거부·모름과 활성화의 거부·모의 실행 없음·모름은 행을 남기지 않아 재조회에서 반영 안 됨으로 보인다.
+ * 모의 실행의 거부·모름과 활성화의 거부·플릿 포트 없음·모의 실행 없음·모름은 행을 남기지 않아 재조회에서 반영 안 됨으로 보인다.
  *
  * 호스트 결과 → 조작 기록 결과(S3b JSON 계약 §9.6): 초안 저장 200 은 성공, 모의 실행 PASSED·FAILED 는 돌았으므로 성공,
- * REFUSED·INPUT_UNKNOWN 은 거부, 활성화 ACTIVATED 는 성공, 나머지 셋은 거부다.
+ * REFUSED·INPUT_UNKNOWN 은 거부, 활성화 ACTIVATED 는 성공, 나머지 넷(REFUSED·FLEET_PORT_ABSENT·MOCK_RUN_REQUIRED·INPUT_UNKNOWN)은 거부다.
  */
 class MissionOperations(
     private val robots: RobotListService,
@@ -201,7 +201,7 @@ class MissionOperations(
         null
     }
 
-    /** 거부만 거부 카드다. 모름(`INPUT_UNKNOWN`)과 모의 실행 없음은 거부 목록이 비어 있지만, 비어 있지 않아도 옮기지 않는다. */
+    /** 거부만 거부 카드다. 모름(`INPUT_UNKNOWN`)과 플릿 포트 없음·모의 실행 없음은 거부 목록이 비어 있지만, 비어 있지 않아도 옮기지 않는다. */
     private fun findings(judgment: HostJudgment): List<Finding> =
         if (judgment.result == REFUSED) judgment.refusals.map(MissionFindings::of) else emptyList()
 
@@ -230,7 +230,8 @@ class MissionOperations(
 
         fun activationResultOf(result: HostActivationResult): OperationResult = when (result) {
             HostActivationResult.ACTIVATED -> OperationResult.SUCCEEDED
-            HostActivationResult.REFUSED, HostActivationResult.MOCK_RUN_REQUIRED, HostActivationResult.INPUT_UNKNOWN ->
+            HostActivationResult.REFUSED, HostActivationResult.FLEET_PORT_ABSENT, HostActivationResult.MOCK_RUN_REQUIRED,
+            HostActivationResult.INPUT_UNKNOWN ->
                 OperationResult.REJECTED
         }
 
