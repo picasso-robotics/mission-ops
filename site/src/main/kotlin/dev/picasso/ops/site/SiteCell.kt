@@ -11,8 +11,9 @@ import java.net.InetSocketAddress
 import java.time.Instant
 
 /**
- * 이름 있는 신호 값의 종류(S3b 스펙 §5.1). picasso 신호 사양의 종류와 이름이 같다. 현장은 picasso 미들웨어에 의존하지
- * 않으므로 따로 둔다. [BOOLEAN] 이면 값은 `true`·`false` 둘이고 [TEXT] 는 어떤 문자열이든 된다.
+ * 이름 있는 신호 값의 종류(S3b 스펙 §5.1). picasso 신호 사양의 종류와 이름이 같다. 현장은 플릿 세계([SiteFleet])를 들려고 picasso
+ * `fleet-mimic` 에 의존하고 그것이 picasso 미들웨어 타입을 api 로 내지만, 셀 대역 본문은 mission-ops 안의 약속이라 picasso 의 신호 사양 타입에
+ * 묶지 않고 따로 둔다. [BOOLEAN] 이면 값은 `true`·`false` 둘이고 [TEXT] 는 어떤 문자열이든 된다.
  */
 enum class SignalKind { BOOLEAN, TEXT }
 
@@ -49,16 +50,23 @@ data class SignalFixture(
  * @param presentations 제시 자리 id 와 그 자리의 자재.
  * @param slots 슬롯 id. 순서가 `GET /cell` 의 순서다.
  * @param signals 이름 있는 신호의 선언. 순서가 `GET /cell` 의 순서다.
+ * @param handovers 플릿 인계 자리 id. 플릿 세계([SiteFleet])가 아는 자리이고 `GET /cell` 의 `handovers` 순서다. 플릿 목적지가 곧 이 셀 자리다.
+ * @param containers 플릿 세계의 처음 용기(인계 자리 → 용기). 놓인 시각은 모른다.
  */
 data class CellFixture(
     val presentations: Map<String, String>,
     val slots: List<String>,
     val signals: List<SignalFixture> = emptyList(),
+    val handovers: List<String> = emptyList(),
+    val containers: Map<String, String> = emptyMap(),
 ) {
     init {
         require(slots.distinct().size == slots.size) { "슬롯 id 가 겹친다: $slots" }
         require(presentations.keys.none { it in slots }) { "제시 자리와 슬롯이 같은 id 를 쓴다" }
         require(signals.map { it.name }.distinct().size == signals.size) { "신호 이름이 겹친다: ${signals.map { it.name }}" }
+        require(handovers.distinct().size == handovers.size) { "인계 자리 id 가 겹친다: $handovers" }
+        require(handovers.none { it in slots || it in presentations }) { "인계 자리가 제시 자리·슬롯과 같은 id 를 쓴다" }
+        require(containers.keys.all { it in handovers }) { "처음 용기가 인계 자리 밖에 있다: ${containers.keys - handovers.toSet()}" }
     }
 
     companion object {
@@ -69,6 +77,8 @@ data class CellFixture(
          * 내고 처음에는 랙이 없다(`false`). `guard_closed` 는 안전 신호이고 처음에 닫혀 있다(`true`). `lot_code` 는 텍스트 신호다. inspection_ready·inspection_complete는 공유 검사 스테이션의 일반 공정 신호다.
          * inspection_job·inspection_job_done 은 그 스테이션의 작업 번호 송신·반환 텍스트 신호이고 처음에 비어 있다. 운영 서비스가 전송 전에
          * 번호를 쓰고 설비가 완료와 함께 반환한다.
+         *
+         * 플릿 인계 자리는 `OUT-07`(출고 인계점)과 `LINE-IN-03`(라인 투입 인계점) 둘이고 처음에 `OUT-07` 에 용기 `HU-1042` 가 있다.
          */
         val STANDARD = CellFixture(
             presentations = linkedMapOf("SEQ-IN-02.BIN-A" to "ENGINE-COVER-A"),
@@ -82,6 +92,8 @@ data class CellFixture(
                 SignalFixture("guard_closed", SignalKind.BOOLEAN, safety = true, initial = "true"),
                 SignalFixture("lot_code", SignalKind.TEXT, initial = "LOT-0001"),
             ),
+            handovers = listOf("OUT-07", "LINE-IN-03"),
+            containers = linkedMapOf("OUT-07" to "HU-1042"),
         )
     }
 }
@@ -105,8 +117,16 @@ data class CellSignal(
     val observedAt: Instant?,
 )
 
-/** 셀 대역의 한 순간. 불변이며 훑기와 신호 쓰기마다 통째로 갈아 끼운다. `GET /cell` 의 본문 모양이다. */
-data class CellSnapshot(val presentations: List<CellPlace>, val slots: List<CellPlace>, val signals: List<CellSignal> = emptyList())
+/**
+ * 셀 대역의 한 순간. 불변이며 훑기와 신호 쓰기마다 통째로 갈아 끼운다. `GET /cell` 의 본문 모양이다. [handovers] 는 플릿 세계를 셀 신호로
+ * 올린 인계 자리다(점유, 자재 = 용기 신원, 관측 시각 = 놓인 시각).
+ */
+data class CellSnapshot(
+    val presentations: List<CellPlace>,
+    val slots: List<CellPlace>,
+    val signals: List<CellSignal> = emptyList(),
+    val handovers: List<CellPlace> = emptyList(),
+)
 
 /** 신호 쓰기의 결과. 거부는 그대로 HTTP 응답이 된다. */
 sealed interface SignalWrite {
@@ -140,7 +160,13 @@ sealed interface SignalWrite {
  *
  * 루프백 JDK `HttpServer` 의 `GET /cell` 과 `POST /cell/signals/{name}` 이다. `GET` 처리 스레드는 [snapshot] 만 읽고
  * 엔진에 닿지 않는다. 본문 모양과 오류 이름은 S3b JSON 계약 §1·§2 다. 같은 서버에 기체 장애 주입 `POST /faults`([SiteFaults],
- * S4a 스펙 §5)가 붙는다.
+ * S4a 스펙 §5)와 플릿 세계 면 `/fleet`([SiteFleet])가 붙는다.
+ *
+ * ## 플릿 인계(같은 세계)
+ *
+ * 플릿 세계([fleet])의 인계 자리를 [CellSnapshot.handovers] 로 올린다 — 용기가 있으면 점유, 자재 = 용기 신원, 관측 시각 = 미믹이 놓은 시각.
+ * 실행 호스트는 플릿 단위의 목적지를 이 자리로 관측해 E2 를 세운다. 투영은 훑기([scan])와 `/fleet` 의 쓰기·명령 뒤에 엔진 잠금 아래에서
+ * 갈아 끼운다. 플릿 걸음은 시계로 가므로(시계 구동) 훑기가 세계를 읽는 순간 지난 걸음이 따라잡힌다.
  *
  * @param port 0 이면 무작위(시험).
  */
@@ -156,11 +182,15 @@ class SiteCell(
     /** 기체들이 함께 보는 가상 시계. `MimicCli` 가 시계 하나를 만들어 모든 기체에 넘긴다. */
     private val clock = requireNotNull(mimic.robotIds.minOrNull()?.let { mimic.instance(it) }) { "기체가 없는 현장이다" }.clock
 
+    /** 플릿 세계(picasso `fleet-mimic`). 같은 루프백 서버의 `/fleet` 가 이것을 부른다. */
+    val fleet = SiteFleet(mimic, fixture.handovers, fixture.containers)
+
     @Volatile
     var snapshot: CellSnapshot = CellSnapshot(
         presentations = fixture.presentations.map { (id, material) -> CellPlace(id, true, material, null) },
         slots = fixture.slots.map { CellPlace(it, false, null, null) },
         signals = fixture.signals.map { CellSignal(it.name, it.location, it.kind, it.safety, it.initial, null) },
+        handovers = fleet.cellPlaces(),
     )
         private set
 
@@ -172,7 +202,14 @@ class SiteCell(
     private val server: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0).apply {
         createContext("/cell", ::handle)
         createContext(SiteFaults.PATH, faults::handle)
+        createContext(SiteFleet.PATH) { exchange -> fleet.handle(exchange, ::project) }
         start()
+    }
+
+    /** 플릿 세계를 셀 자리로 다시 올린다. 엔진 잠금 아래에서 스냅숏을 갈아 끼운다(훑기·신호 쓰기와 순서가 정해진다). */
+    fun project() = mimic.server.exclusive {
+        val handovers = fleet.cellPlaces()
+        if (handovers != snapshot.handovers) snapshot = snapshot.copy(handovers = handovers)
     }
 
     /** 열린 포트. 시험이 0 을 주면 여기서 읽는다. */
@@ -199,6 +236,7 @@ class SiteCell(
         if (changed) {
             snapshot = snapshot.copy(slots = fixture.slots.map { filled.getValue(it) })
         }
+        project()
     }
 
     /**
@@ -304,6 +342,7 @@ class SiteCell(
         "presentations" to snapshot.presentations.map(::wirePlace),
         "slots" to snapshot.slots.map(::wirePlace),
         "signals" to snapshot.signals.map(::wireSignal),
+        "handovers" to snapshot.handovers.map(::wirePlace),
     )
 
     private fun wirePlace(place: CellPlace): Map<String, Any?> = linkedMapOf(

@@ -49,6 +49,20 @@ data class PrepareSequencedRackDraft(
 }
 
 /**
+ * DeliverContainer 초안(플릿 운반 하나). 단위는 운반 하나이고 단위 id 가 용기 id 다(picasso `DeliverContainer`). 로봇 단위가 없는 플릿 전용
+ * 계획이라 실행 호스트는 요청 후보가 정확히 하나일 때만 받고(`FLEET_ONLY_CANDIDATES`) 그 기체는 묶인 기체(실행 주체 아님)다. 운영 서비스는
+ * 배정 가능한 기체를 모두 후보로 싣으므로, 배정 가능한 기체가 둘 이상이면 호스트가 거절한다.
+ *
+ * @param container WMS 가 할당한 용기. 출발 인계점의 `container` 속성이 된다
+ * @param source 출발 인계점(셀 대역의 플릿 인계 자리)
+ * @param destination 도착 인계점(셀 대역의 플릿 인계 자리). E2 는 이 자리의 셀 신호(점유·용기 신원)다
+ */
+data class DeliverContainerDraft(val container: String, val source: String, val destination: String) : JobOrderDraft {
+    override val workMasterId: String get() = JobOrderForm.DELIVER_CONTAINER
+    override val unitIds: List<String> get() = listOf(container)
+}
+
+/**
  * 폼 초안을 읽고 작업 지시 본문(JobOrder JSON)을 만든다(S3a 스펙 §7.5). 운영 서비스는 picasso 타입을 쓰지 않으므로 칸 이름만
  * picasso `JobOrder` 와 맞춘다.
  *
@@ -56,6 +70,7 @@ data class PrepareSequencedRackDraft(
  * - InspectAsset: `{"workMasterId":"InspectAsset","targets":[{"id":"T1","location":"bay-7"}]}`
  * - PrepareSequencedRack: `{"workMasterId":"PrepareSequencedRack","slots":["RACK-204.S01"],"material":"ENGINE-COVER-A",
  *   "presentation":"SEQ-IN-02.BIN-A"}`
+ * - DeliverContainer: `{"workMasterId":"DeliverContainer","container":"HU-1042","source":"OUT-07","destination":"LINE-IN-03"}`
  *
  * 그 임무가 쓰지 않는 칸은 읽지 않는다. 단위 id 가 겹치는 초안은 막는다. 겹치면 미들웨어의 태스크 id(`작업 지시 id#단위 id`)가
  * 같아져 두 단위가 한 핸들로 접힌다(스펙 §4). 장소 이름과 슬롯이 기체가 아는 명칭인지는 보지 않는다(스펙 §12).
@@ -64,9 +79,16 @@ object JobOrderForm {
 
     const val INSPECT_ASSET = "InspectAsset"
     const val PREPARE_SEQUENCED_RACK = "PrepareSequencedRack"
+    const val DELIVER_CONTAINER = "DeliverContainer"
 
-    /** 화면에 내는 임무. DeliverContainer 는 플릿 포트 구현이 없어 받지 않는다(스펙 §1). */
+    /** 화면에 내는 임무(입력 계약·자원 요구도 이 둘이다). DeliverContainer 는 화면 폼에 내지 않는다([FLEET_WORK_MASTERS]). */
     val WORK_MASTERS: Set<String> = setOf(INSPECT_ASSET, PREPARE_SEQUENCED_RACK)
+
+    /**
+     * 폼 API 만 받는 플릿 운반 임무. 실행 호스트에 플릿 포트(`host.fleet.url`)가 없으면 호스트가 판정에서 `FLEET_PORT_ABSENT` 로 거절하고, 플릿 전용
+     * 계획이라 요청 후보가 정확히 하나가 아니면 `FLEET_ONLY_CANDIDATES` 로 거절한다. 화면 폼·입력 계약 목록에는 내지 않는다.
+     */
+    val FLEET_WORK_MASTERS: Set<String> = setOf(DELIVER_CONTAINER)
 
     /** 미들웨어가 InspectAsset 의 이동 단위 id 에 붙이는 꼬리(picasso `InspectAsset.TRAVEL_SUFFIX`). */
     const val TRAVEL_SUFFIX = ".travel"
@@ -83,7 +105,7 @@ object JobOrderForm {
     const val UNIT_ID_CONFLICT = "UNIT_ID_CONFLICT"
 
     /** 임무마다 고정한 요구 근거 등급(스펙 §7.5). InspectAsset 의 최고 근거는 E0 이다. */
-    private val REQUIRED_EVIDENCE = mapOf(INSPECT_ASSET to "E0", PREPARE_SEQUENCED_RACK to "E2")
+    private val REQUIRED_EVIDENCE = mapOf(INSPECT_ASSET to "E0", PREPARE_SEQUENCED_RACK to "E2", DELIVER_CONTAINER to "E2")
 
     /** 못 읽으면 [FormRejection] 을 던진다. 판정 순서: 본문 객체 → WorkMaster → 그 임무의 칸 → 단위 id 겹침. */
     fun read(body: JsonNode?): JobOrderDraft {
@@ -96,7 +118,8 @@ object JobOrderForm {
             PREPARE_SEQUENCED_RACK -> PrepareSequencedRackDraft(
                 strings(body, "slots"), text(body, "material"), text(body, "presentation"),
             )
-            else -> throw FormRejection(UNKNOWN_WORK_MASTER, "받지 않는 임무다: $workMasterId (받는 것: ${WORK_MASTERS.sorted()})")
+            DELIVER_CONTAINER -> DeliverContainerDraft(text(body, "container"), text(body, "source"), text(body, "destination"))
+            else -> throw FormRejection(UNKNOWN_WORK_MASTER, "받지 않는 임무다: $workMasterId (받는 것: ${(WORK_MASTERS + FLEET_WORK_MASTERS).sorted()})")
         }
         val conflicts = draft.unitIds.groupingBy { it }.eachCount().filterValues { it > 1 }.keys.sorted()
         if (conflicts.isNotEmpty()) {
@@ -136,6 +159,10 @@ object JobOrderForm {
                 materials.addObject().put("materialDefinitionId", draft.material).put("quantity", draft.slots.size)
                 draft.slots.forEach { requirement(it, "destination", "material", draft.material) }
                 requirement(draft.presentation, "source", "material", draft.material)
+            }
+            is DeliverContainerDraft -> {
+                requirement(draft.source, "source", "container", draft.container)
+                equipment.addObject().put("id", draft.destination).put("equipmentUse", "destination").putObject("properties")
             }
         }
         return order

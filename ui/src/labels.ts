@@ -3,6 +3,7 @@ import type {
   CloseResult,
   CommissioningState,
   Connection,
+  ExecutionSummary,
   FaultKind,
   CancelResult,
   HoldDecision,
@@ -72,6 +73,8 @@ export const KIND_LABEL: Record<string, string> = {
   JOB_ORDER_BAD_REQUEST: '작업 지시 폼 오류',
   UNKNOWN_WORK_MASTER: '받지 않는 임무',
   FLEET_PORT_ABSENT: '플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음)',
+  FLEET_ONLY_CANDIDATES: '후보가 하나가 아님(플릿 전용 계획은 배정 가능한 기체가 정확히 하나여야 함)',
+  FLEET_UNIT_OPEN: '끝나지 않은 플릿 운반(기체 확인은 플릿 정지의 증거가 아님)',
   UNIT_ID_CONFLICT: '단위 id 겹침',
   NO_ELIGIBLE_ROBOT: '배정 가능한 기체 없음',
   MODE_NOT_ALLOWED: '이 모드에서 할 수 없는 조작',
@@ -161,12 +164,19 @@ export const rejectionLabel = (error: string | null) => (error === null ? '이�
 export const rejectionText = (who: string, rejection: { error: string | null; detail: string | null }) =>
   `${who}(${rejectionLabel(rejection.error)})${rejection.detail ? `. ${rejection.detail}` : ''}`
 
-/** 실행 호스트의 스킬 적합(S3a 스펙 §9.1). `UNKNOWN` 은 기체 케이퍼빌리티를 못 물어본 것이다. */
+/** 실행 호스트의 스킬 적합(S3a 스펙 §9.1). `UNKNOWN` 은 기체 케이퍼빌리티를 못 물어본 것이다. `NOT_APPLICABLE` 은 플릿 전용 계획이다. */
 export const SKILL_FIT_LABEL: Record<SkillFit, string> = {
   FIT: '적합',
   MISSING: '모자람',
   UNKNOWN: '모름',
+  NOT_APPLICABLE: '해당 없음(묶인 기체)',
 }
+
+/** 플릿 전용 계획의 기체 표기(picasso 한계 «§15.326 · 기체 묶임»). 운반은 플릿이 하고 그 기체는 접수가 요구해 묶였을 뿐이다. */
+export const BOUND_ROBOT_LABEL = '묶인 기체(실행 주체 아님)'
+
+/** 판정 화면의 플릿 전용 계획 안내. 운영 서비스는 배정 가능한 기체를 모두 후보로 싣는다. */
+export const FLEET_ONLY_NOTE = '플릿 전용 계획입니다. 배정 가능한 기체가 정확히 하나여야 접수됩니다(둘 이상이면 «후보가 하나가 아님» 으로 거부). 그 기체는 묶인 기체(실행 주체 아님)입니다.'
 
 /** 작업 지시 제출의 호스트 결과(S3a JSON 계약 §4). */
 export const SUBMIT_RESULT_LABEL: Record<HostSubmitResult, string> = {
@@ -541,4 +551,16 @@ export const PERMIT_CAUSE_LABEL: Record<string, string> = {
   NOT_COVERED: '허가 원천 없음',
   PORT_FAILED: '허가를 읽지 못함',
   RETIRED: '퇴역',
+}
+
+/** 호스트의 플릿 연결(`GET /api/executions/summary` 의 `fleet`)에 따른 덧붙임. 모르면 단정하지 않는다. */
+export const FLEET_HOST_NOTE = {
+  absent: '이 실행 호스트에는 플릿 포트가 없어 플릿 운반 정의는 활성화되지 않습니다.',
+  present: '이 실행 호스트에는 플릿 포트가 있어 플릿 운반 정의를 활성화할 수 있습니다(현장 플릿이 답하는지는 따로 확인합니다).',
+  unknown: '이 실행 호스트의 플릿 연결을 모릅니다. 운영 개요의 «플릿 연결» 을 확인하십시오.',
+}
+
+export function fleetHostNote(link: ExecutionSummary['fleet'] | undefined): string {
+  if (link === undefined) return FLEET_HOST_NOTE.unknown
+  return link.connected ? FLEET_HOST_NOTE.present : FLEET_HOST_NOTE.absent
 }

@@ -74,6 +74,16 @@ object HostRequests {
     /** [FLEET_PORT_ABSENT] 의 문구. 뒤에 WorkMaster 와 플릿 운반 단위 id 가 붙는다. */
     const val FLEET_PORT_ABSENT_DETAIL = "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다"
 
+    /**
+     * 플릿 전용 계획(로봇 단위 없이 플릿 운반만)의 새 접수에 요청 후보가 정확히 하나가 아닌 것(D2(a), [MissionHost.fleetOnly]). 여럿이면 호스트가 그중
+     * 하나를 고르지 않고, 비면 묶을 기체가 없다. picasso 접수가 기체 하나를 요구하고 그 기체가 실행 주체처럼 실리므로(picasso 한계 «§15.326 · 기체
+     * 묶임») 요청하는 쪽이 그 하나를 명시한다.
+     */
+    const val FLEET_ONLY_CANDIDATES = "FLEET_ONLY_CANDIDATES"
+
+    /** [FLEET_ONLY_CANDIDATES] 의 문구. 뒤에 WorkMaster 와 받은 후보 수가 붙는다. */
+    const val FLEET_ONLY_CANDIDATES_DETAIL = "플릿 전용 계획은 요청 후보 기체가 정확히 하나여야 합니다(묶인 기체, 실행 주체 아님)"
+
     /** 지목의 순번 문자열. 부호 있는 10진 정수다. */
     private val SEQUENCE = Regex("-?[0-9]{1,19}")
 

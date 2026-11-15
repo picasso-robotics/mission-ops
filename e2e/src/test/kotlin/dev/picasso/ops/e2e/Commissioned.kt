@@ -36,9 +36,15 @@ object Commissioned {
     /** 실행기를 기다리는 상한(실제 시간). */
     private val RUNNER_WAIT = Duration.ofSeconds(60)
 
-    fun complete(stack: E2eStack): Ids {
-        stack.site.teach(QUADRUPED, QUADRUPED_SITE_NAMES)
-        ROBOTS.forEach { (robotId, robot) ->
+    /**
+     * @param only 시운전할 기체(기본 둘 다). 빠진 기체는 registry 에 선언하지 않아 운영 서비스의 기체 목록에 없다 — 배정 가능한 기체를 하나로 두는
+     *   시험(플릿 전용 계획은 요청 후보가 정확히 하나여야 한다)이 쓴다.
+     */
+    fun complete(stack: E2eStack, only: Collection<String> = ROBOTS.keys): Ids {
+        val chosen = ROBOTS.filterKeys { it in only }
+        require(chosen.isNotEmpty()) { "시운전할 기체가 없다: $only" }
+        if (QUADRUPED in chosen) stack.site.teach(QUADRUPED, QUADRUPED_SITE_NAMES)
+        chosen.forEach { (robotId, robot) ->
             engineer(stack, "/api/robots", """{"robotId":"$robotId","serialNumber":"${robot.first}"}""")
         }
         stack.site.advance(REPORT)
@@ -48,7 +54,7 @@ object Commissioned {
         engineer(stack, "/api/adapters/$adapterId/versions", """{"version":"1.0.0","contractSemver":"0.11.0"}""")
         val buildId = stack.get("/api/adapters")["adapters"].single()["versions"].single()["adapterVersionId"].asLong()
 
-        ROBOTS.values.forEach { (_, model) -> engineer(stack, "/api/profile-revisions", document(model)) }
+        chosen.values.forEach { (_, model) -> engineer(stack, "/api/profile-revisions", document(model)) }
         val revisions = stack.get("/api/profiles")["revisions"].associate {
             it["revision"]["model"].asText() to it["revision"]["profileRevisionId"].asLong()
         }
@@ -60,7 +66,7 @@ object Commissioned {
         }
         revisions.values.forEach { engineer(stack, "/api/profile-revisions/$it/activation") }
 
-        ROBOTS.forEach { (robotId, robot) ->
+        chosen.forEach { (robotId, robot) ->
             val revision = revisions.getValue(robot.second)
             engineer(stack, "/api/robots/$robotId/binding", """{"adapterVersionId":$buildId,"profileRevisionId":$revision}""")
             engineer(stack, "/api/robots/$robotId/site-names")
@@ -68,7 +74,7 @@ object Commissioned {
         stack.site.advance(REPORT)
 
         val robots = stack.get("/api/robots")["robots"]
-        ROBOTS.keys.forEach { robotId ->
+        chosen.keys.forEach { robotId ->
             val robot = robots.single { it["robot"]["robotId"].asText() == robotId }
             check(robot["commissioning"]["state"].asText() == "COMPLETE" && robot["connection"].asText() == "FRESH") {
                 "$robotId 가 시운전 완료·연결 신선이 아니다: $robot"

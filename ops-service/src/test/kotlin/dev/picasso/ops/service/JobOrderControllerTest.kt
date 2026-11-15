@@ -28,6 +28,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 /**
  * 작업 지시 API 의 게이트와 사전 거부(S3a 스펙 §8·§10). 컨트롤러를 스프링 없이 바로 부른다. 게이트(`guarded`)과 폼 읽기, 상태 코드의
@@ -121,6 +122,24 @@ class JobOrderControllerTest {
         val judged = assertIs<dev.picasso.ops.service.joborders.EligibilityView>(controller.eligibility(INSPECT_FORM.toByteArray()).body)
         assertEquals(dev.picasso.ops.service.joborders.HostState.HOST_REFUSED, judged.host, judged.toString())
         assertEquals(JobOrderOperations.FLEET_PORT_ABSENT, judged.hostRefusal?.error, judged.toString())
+    }
+
+    @Test
+    fun `플릿 전용 계획에 배정 가능한 기체가 둘이면 판정에 fleetOnly 가 서고 제출은 호스트를 부르지 않고 400 FLEET_ONLY_CANDIDATES 이며 기록하지 않는다`() {
+        val bound = { id: String -> JobOrderBench.pass(id).copy(skillFit = dev.picasso.ops.service.host.HostSkillFit.NOT_APPLICABLE, boundRobot = true) }
+        bench.judge = { ids -> HostCall.Ok(ids.map(bound)) }
+        val judged = assertIs<dev.picasso.ops.service.joborders.EligibilityView>(controller.eligibility(INSPECT_FORM.toByteArray()).body)
+        assertEquals(true, judged.fleetOnly, judged.toString())
+        val reply = submit("operator")
+        assertEquals(400, reply.statusCode.value())
+        val rejection = reply.rejection()
+        assertEquals(JobOrderOperations.FLEET_ONLY_CANDIDATES, rejection.error)
+        assertTrue(rejection.detail.startsWith(JobOrderOperations.FLEET_ONLY_CANDIDATES_DETAIL), rejection.detail)
+        assertEquals(emptyList(), bench.submitted)
+        assertEquals(emptyList(), log.list())
+        // 로봇 계획이면 fleetOnly 가 아니다.
+        bench.judge = { ids -> HostCall.Ok(ids.map(JobOrderBench::pass)) }
+        assertEquals(false, assertIs<dev.picasso.ops.service.joborders.EligibilityView>(controller.eligibility(INSPECT_FORM.toByteArray()).body).fleetOnly)
     }
 
     @Test

@@ -39,6 +39,25 @@ S3a 설계 스펙(`docs/superpowers/specs/2026-10-08-s3a-execution-host-design.m
 - 칸은 넷뿐이다: `id`(문자열), `occupied`(불리언), `material`(문자열 또는 null), `observedAt`(시각 문자열 또는 null).
 - 고정 픽스처 `CellFixture.STANDARD`: 제시 자리 하나 `SEQ-IN-02.BIN-A` = `ENGINE-COVER-A`(늘 점유, `observedAt` 늘 null), 슬롯 `RACK-204.S01`~`S04`(이 순서). 슬롯은 처음에 전부 빈다.
 - 슬롯이 채워지는 때: 현장이 시계를 민 직후(`advance`·`advanceTo`·런처 1초 틱) 같은 mimic 잠금 아래에서 새로 `SUCCEEDED` 가 된 `pick_place` 태스크를 찾아 `destination` 슬롯을 `occupied=true`, `material` = `object_id` 제시 자리의 자재, `observedAt` = 그 밀기 직후의 가상 시각(= 그 태스크 종료의 `state_as_of`)으로 채운다. 같은 태스크는 한 번만. `object_id` 가 제시 자리가 아니면 `material=null` 로 점유만 채운다. `destination` 이 픽스처 슬롯이 아니면 무시한다. 슬롯은 비워지지 않는다(재기동 전까지).
+- 플릿 인계 자리 `handovers`(mission-ops `feat/fleet-site-world` 부터, 위 예의 마지막 칸으로 붙음): 현장 플릿 세계(1a)의 인계 자리를 같은 칸 넷으로 올린다 — 용기가 있으면 `occupied=true`, `material` = 용기 신원, `observedAt` = 미믹이 놓은 시각(처음 용기는 null). 표준 픽스처는 `OUT-07`(처음에 `HU-1042`)·`LINE-IN-03` 이 순서. 현장이 시계를 민 직후와 `/fleet` 의 명령·쓰기 뒤에 갈린다. 실행 호스트는 칸이 없으면 빈 목록으로 읽고, 플릿 단위의 목적지·출발지를 이 자리로 관측한다(같은 세계, E2).
+
+## 1a. 현장 플릿 세계 `http://127.0.0.1:${SITE_CELL_PORT}/fleet`
+
+**mission-ops 안의 약속이며 picasso 계약이 아니다**(플릿 proto 없음, picasso ADR 9). 플릿 계약 `AmrFleetPort` 를 대는 최소 면과 현장 운영 면이고, 셀 대역과 같은 루프백 서버다. 인증 없음. POST 는 `application/json` 만 받고(415 `UNSUPPORTED_MEDIA_TYPE`), 오류 본문은 `{error, detail}` 이다. 플릿이 아는 자리는 인계 자리(`handovers`)뿐이다.
+
+| 요청 | 본문 | 응답 |
+|---|---|---|
+| `POST /fleet/transports` | `{reference, containerId, source, destination}` 문자열 넷 | 200 `{"handle": "a1b2c3d4:tr-1"}`(앞머리는 현장 기동 id — 미믹은 기동마다 `tr-1` 부터 세므로, 현장 재기동 뒤 옛 핸들은 접두가 달라 늘 «모르는 운반» 이고 남의 운반을 가리키지 않는다). 출발지·목적지가 인계 자리가 아니면 `{"handle": null}`(맡지 않음). 같은 `reference` 는 같은 핸들(맡긴 횟수를 세지 않음). 칸이 모자라면 400 `BAD_REQUEST` |
+| `GET /fleet/transports?reference=<참조>` | 없음 | 200 `{"handle": "a1b2c3d4:tr-1"\|null}`. 찾기만 하고 새로 맡지 않는다. 인자가 `reference` 하나가 아니면 400 |
+| `GET /fleet/transports/{handle}` | 없음 | 200 `{"state", "observedContainer", "holding", "detail"}`. `state` 는 picasso `TransportState` 이름. 모르는 핸들은 `FAILED`·`holding=false`·`detail` «모르는 운반: <핸들>»(던지지 않음, 현장 장부 소실과 구분 못 함) |
+| `POST /fleet/transports/{handle}/cancel` | `{}` | 200 `{"accepted": true\|false}`. 인계했거나 출발지에서 거절했거나 모르는 핸들이면 false. 싣고 있던 용기는 출발지로 되돌린다(미믹의 약속, 실 플릿의 보장 아님) |
+| `GET /fleet/world` | 없음 | 200 `{"places": [{"location", "containerId", "placedAt"}], "blocked": [...], "dispatches": n}`. `places` 는 인계 자리 순서 |
+| `POST /fleet/world/{place\|clear\|block\|unblock}` | `{location[, containerId]}`(`place` 는 `containerId` 필수, 놓인 시각은 지금 현장 가상 시각) | 200 `GET /fleet/world` 와 같은 본문. 인계 자리가 아니면 404 `UNKNOWN_PLACE`, 모르는 조작은 404 |
+
+- 운반은 현장 가상 시계로 5초마다 한 단계: `ACCEPTED` → `PICKED_UP`(출발지 빔, `holding=true`) → `IN_TRANSIT` → (목적지가 막혔으면 `WAITING_HANDOVER`) → `DELIVERED`(목적지에 놓임). 접수 때 출발지의 용기가 요청과 다르면 `REJECTED_AT_SOURCE`(`observedContainer` = 거기 있던 것).
+- 처음 용기의 놓인 시각은 런처가 가상 시계를 실제 시각까지 민 뒤의 시각이다(시각 없이 두면 셀 관측이 «읽은 순간» 이 되어 근거 창을 늘 지난다).
+- 실행 호스트의 소비자: `HttpFleetPort`(`host.fleet.url`, 서버 주소만 — `/fleet` 를 붙이면 기동이 멈춤, 기동 때 `GET /fleet/world` 탐침이 4xx 면 기동이 멈추고 안 닿거나 5xx 면 경고만, 요청 제한 1초). 맡기기의 연결 거부·연결 시간 초과·4xx 는 «보내지 않음»(`CommandNotSent`), 보낸 뒤 시간 초과·5xx·틀린 본문은 미확정이다. 읽기·취소는 가르지 않는다.
+- 세계는 현장 프로세스 메모리에만 있다. 현장을 재기동하면 처음 세계로 돌아가고 장부가 빈다.
 
 ## 2. 실행 호스트 공통
 
@@ -53,7 +72,8 @@ S3a 설계 스펙(`docs/superpowers/specs/2026-10-08-s3a-execution-host-design.m
 | `error` | 언제 |
 |---|---|
 | `UNKNOWN_WORK_MASTER` | `jobOrder.workMasterId` 가 WorkMaster 이름 모양(대문자로 시작하는 영숫자 64자 이하)이 아님(요청 파서), 또는 고정 버전 없이 낸 WorkMaster 가 코드 정의도 활성 버전도 없음(«활성화하지 않은 임무입니다»). `DeliverContainer` 는 여기 들지 않는다(mission-ops `feat/fleet-mock-run` 부터, 아래 `FLEET_PORT_ABSENT`) |
-| `FLEET_PORT_ABSENT` | 계획한 단위에 플릿 경로(`FLEET`) 단위가 있는데 실행 호스트에 플릿 포트가 없음. 코드 임무 `DeliverContainer` 는 늘 이것이다(용기가 빠진 주문 포함). `detail` 은 «이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: <WorkMaster> 의 플릿 운반 단위 <단위 id, …>». 판정과 새 접수는 고른 임무로, 이미 실행이 있는 작업 지시의 **개정**(높은 판)은 그 실행이 쥔 케이퍼빌리티로 계획해 거른다. 개정이 아닌 재전송(같은 판 `IDEMPOTENT`, 낮은 판·종료한 실행의 거부)은 계획을 새로 세우지 않아 거르지 않는다. 같은 검사가 값 없는 승인(`REFUSED_BY_GATE`, 사유 `FLEET_PORT_ABSENT: …`)과 기동 복원(`GAVE_UP`, 사유 `FLEET_PORT_ABSENT: …`)에도 걸린다 |
+| `FLEET_ONLY_CANDIDATES` | `POST /host/job-orders` 만. 새 접수의 계획이 플릿 전용(로봇 단위 없이 플릿 운반만)인데 요청 후보(`candidates`, 같은 id 는 하나로 셈)가 정확히 하나가 아님 — 여럿이면 호스트가 그중 하나를 고르지 않고, 비면 묶을 기체가 없다. `detail` 은 «플릿 전용 계획은 요청 후보 기체가 정확히 하나여야 합니다(묶인 기체, 실행 주체 아님): <WorkMaster> 의 요청 후보 <n>개(<id, …>)». 판정(`/host/eligibility`)에는 걸지 않는다. 실행이 있는 작업 지시(개정·재전송)에도 걸지 않는다 |
+| `FLEET_PORT_ABSENT` | 계획한 단위에 플릿 경로(`FLEET`) 단위가 있는데 실행 호스트에 플릿 포트가 없음(`host.fleet.url` 빈 값. 값이 있으면 이 거절은 없다). 코드 임무 `DeliverContainer` 는 늘 이것이다(용기가 빠진 주문 포함). `detail` 은 «이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: <WorkMaster> 의 플릿 운반 단위 <단위 id, …>». 판정과 새 접수는 고른 임무로, 이미 실행이 있는 작업 지시의 **개정**(높은 판)은 그 실행이 쥔 케이퍼빌리티로 계획해 거른다. 개정이 아닌 재전송(같은 판 `IDEMPOTENT`, 낮은 판·종료한 실행의 거부)은 계획을 새로 세우지 않아 거르지 않는다. 같은 검사가 값 없는 승인(`REFUSED_BY_GATE`, 사유 `FLEET_PORT_ABSENT: …`)과 기동 복원(`DEFERRED`, 사유 `FLEET_PORT_ABSENT: …` — 미룬 행이라 다시 시도되고 플릿 포트를 붙인 기동에서 다시 지어진다, `feat/fleet-site-world` 전에는 `GAVE_UP`)에도 걸린다 |
 | `BAD_REQUEST` | 본문이 JSON 객체가 아님, 칸 누락·형 틀림, `version < 1`, `requiredEvidence` 가 `E0`~`E3` 아님, 기체 목록 누락·빈 문자열 원소 |
 
 판정 순서: 본문 객체 → `jobOrder` 객체 → `workMasterId` → 나머지 칸 → 기체 목록. 그래서 WorkMaster 가 틀리면 기체 목록이 없어도 `UNKNOWN_WORK_MASTER` 다.
@@ -121,7 +141,8 @@ InspectAsset 예:
 
 | 칸 | 값 |
 |---|---|
-| `skillFit` | `FIT`(경로가 로봇인 단위의 스킬이 기체 선언에 다 있음) · `MISSING`(모자람) · `UNKNOWN`(기체 케이퍼빌리티를 못 물어봄, 예: mimic 이 모르는 기체, mimic 불통) |
+| `skillFit` | `FIT`(경로가 로봇인 단위의 스킬이 기체 선언에 다 있음) · `MISSING`(모자람) · `UNKNOWN`(기체 케이퍼빌리티를 못 물어봄, 예: mimic 이 모르는 기체, mimic 불통) · `NOT_APPLICABLE`(플릿 전용 계획 — 로봇 단위 없이 플릿 운반만 — 이라 할 스킬이 없음. 적합이 아니고 거절 사유도 아니며 선언을 못 읽어도 이 값. 그 계획의 이유는 등록 확인(`등록 확인 안 됨: …`, 기체 스냅숏을 못 읽음)과 아래 기체 제한뿐) |
+| `boundRobot` | 플릿 전용 계획이면 참 — 그 기체는 **묶인 기체(실행 주체 아님)** 다(picasso 한계 «§15.326 · 기체 묶임»). 이 칸이 없던 본문은 거짓 |
 | `missingSkills` | `MISSING` 일 때 모자란 스킬(이름순). 그 밖에는 `[]` |
 | `runningExecutionId` | 이 기체를 쥔 실행 id(picasso `PhysicalState.occupiesRobot` = `!isSettled \|\| PARTIAL`): 종결하지 않은 실행과 부분 완료(`PARTIAL`) 실행. `OPERATOR_HOLD` 도 포함. 없으면 null. 잔여 파지 표시만 있으면 null |
 | `passed` | `reasons` 가 비었을 때만 참(`skillFit == FIT`, `runningExecutionId == null`, 복원 못 한 실행 없음, 미해소 잔여 파지 표시 없음, 현장 시간값 적용됨, 실행 일지 차단 없음). 코드: `HostEligibility.passed` KDoc «스킬 적합이고 진행 중인 실행이 없으며 판정 이유가 하나도 없다» |
@@ -193,6 +214,7 @@ InspectAsset 예:
 - `sourceUnobserved`: 출발 미관측이면 picasso `SourceUnobserved` 의 `{material, source, occupied}`. `occupied` null = 설비가 말이 없음, true = 설비가 «있다» 고만 함(신원 없음). 출발 결품과 접지 않는다: 그 기체의 `sourceMissing`·`alternativeLocations` 는 null 이다(대체 자리를 계산하지 않음). REJECTED 의 맨 위 칸은 picasso `Submission.Rejected.sourceUnobserved` 에서, UNASSIGNED 의 기체별 칸은 `Unassigned.sourceUnobserved[robotId]` 에서 옮긴다. 조치 탐색 기록에는 적히지 않는다. 출발 관측을 요구한(`REQUIRED`) 단위에서만 나온다. 지금 `assign` 경로에서는 UNASSIGNED 로만 오고, REJECTED 모양은 `SubmitOutcomeTest` 가 picasso 값을 직접 세워 고정한다. 아니면 null. 근거: `SubmitOutcomeTest` 의 `출발 미관측 거부는 그 자리와 설비가 말한 것을 싣고 결품과 대체 자리를 싣지 않는다`, `미배정의 기체별 사유는 출발 미관측일 때만 그 자리를 싣고 결품 칸과 대체 자리는 비었다`, `SourceObservationHostTest` 의 `출발 관측을 요구한 버전은 설비가 말이 없거나 있다고만 하면 미배정이고 기체별 사유에 출발 미관측이 실리며 결품 칸은 비었다`, `확인한 신원이 다르면 결품이고 설비가 비었다고 말하면 사람의 확인이 그 관측을 뒤집지 않는다`.
 - `remedy`·`remedyWithheld`·`residualHoldMarkers`(기체별): 관문 확인 제출에서 사슬 위반으로 거절된 경우 그 기체의 `refusals[]`에 조치 탐색 결과(`remedy`: `FOUND`·`NONE`), 조치 보류 여부(`remedyWithheld`), 당시 열려 있던 잔여 파지 표시 식별자 목록(`residualHoldMarkers`)을 싣습니다. 일반 후보의 `refusals[]`에도 `remedy`와 `remedyWithheld`가 실립니다(근거: `IncidentLoopHostTest`).
 - `forgottenJobOrder`: boolean. `POST /host/job-orders` 본문의 마지막 칸이며 기본값은 false이다. 거부 사유가 `FORGOTTEN_JOB_ORDER`로 시작하는 REJECTED일 때만 true이다. 운영 서비스는 이를 `/api/job-orders` 결과와 작업 요청 상세 `rejection`에 전달한다. 근거: `SubmitOutcomeTest` 의 `picasso 가 놓은 작업 지시로 거부하면 놓은 작업 지시 칸이 참이고 그 밖의 거부는 거짓이다`, `ForgetSettledTest` 의 `FAILED 는 두는 폭 동안 메모리에 남아 같은 판은 IDEMPOTENT 이고 폭이 지나면 놓아 같은 작업 지시는 판과 무관하게 놓은 작업 지시로 거부한다`, `재기동해 picasso 가 놓은 작업 지시를 몰라도 실행 일지가 같은 작업 지시를 놓은 작업 지시로 거부하고 일지 막힘이 없다`, `정착하지 않은 일지 행이 있는 작업 지시를 다시 내면 일지 쓰기 전에 거부해 호스트가 막히지 않는다`, `MissionHostTest` 의 `끝난 InspectAsset 를 같은 id 로 다시 내면 놓은 작업 지시로 REJECTED 이고 실행에 마지막 작업 응답이 붙는다`.
+- `boundRobot`: boolean, 기본 false. ACCEPTED·IDEMPOTENT 의 실행이 플릿 전용 계획이면 참이고 그때 `robotId` 는 묶인 기체(실행 주체 아님)다. 근거: `FleetOnlyHostTest` 의 `후보 하나의 플릿 전용 계획은 받아 플릿에 맡기고 묶인 기체로 표기하며 인계가 셀 신호로 오르면 E2 로 끝난다`.
 - 맨 위 다섯 칸(`sourceUnobserved` 포함)은 미들웨어가 거부한 REJECTED 일 때만 값이 있다. ACCEPTED·IDEMPOTENT·UNASSIGNED·일지 차단 REJECTED 는 null·false. UNASSIGNED 의 출발 결품은 맨 위가 아니라 `refusals[]` 의 기체별 칸에 실린다. `forgottenJobOrder`는 REJECTED(picasso의 거부이거나 실행 일지의 거부)일 때만 true일 수 있고 그 밖에는 false이다.
 - 지금 실행 호스트의 `assign` 경로에서 출발 결품은 UNASSIGNED 로 오므로 `sourceMissing`·`alternativeLocations` 가 찬 REJECTED 는 HTTP 로 나오지 않는다. 모양은 `SubmitOutcomeTest` 가 picasso 거부 값을 직접 세워 고정한다. UNASSIGNED 는 HTTP 로 기체별 구조를 싣는다. 호스트 셀 대역은 스냅숏이 있으면 늘 답하므로 HTTP 로는 기체별 `[]`·목록만 나오고, 기체별 null(셀 무응답)은 `SubmitOutcomeTest` 가 picasso 값을 직접 세워 고정한다.
 
@@ -444,7 +466,7 @@ InspectAsset 예:
 
 `GET /host/executions?before=<settleSeq>[&limit=M]`. `before`는 양의 정수, M은 1~200 정수이며 기본값은 20이다. 본문은 `{settled, nextBefore, olderTotal}`이다. `settleSeq`가 `before`보다 작은 이력 행을 최신 순으로 최대 M개 담는다. 칸의 뜻은 위와 같다.
 
-`GET /host/executions/summary`. 본문은 `{instanceId, pumpedAt, live, states, journalBlockedExecutionIds}`다. `live`는 남은 실행 수다. `states`는 열한 가지 `PhysicalState` 이름을 모두 담고(0 포함) 남은 실행만 센다. 늘 200이다.
+`GET /host/executions/summary`. 본문은 `{instanceId, pumpedAt, live, states, journalBlockedExecutionIds, fleet}`다. `fleet` 은 플릿 연결 `{connected, url}`(`host.fleet.url` 이 비면 `{false, null}`, 주소가 있으면 `{true, "<주소>"}`, 주소 없는 시험 주입 포트면 `url` null)이고 연결은 설정의 뜻이지 현장이 지금 답한다는 뜻이 아니다. `live`는 남은 실행 수다. `states`는 열한 가지 `PhysicalState` 이름을 모두 담고(0 포함) 남은 실행만 센다. 늘 200이다.
 
 읽기 순서는 메모리가 먼저이고(호스트 잠금 아래) DB가 나중이다(잠금 밖). 남은 실행이 아닌 실행은 이미 종결 기록이 커밋되었으므로 빠뜨리지 않는다. 그 사이에 종결 기록이 쓰인 실행은 양쪽에 모두 나타날 수 있으며, 화면은 (인스턴스, 실행 id) 기준 남은 실행 쪽에 한 번만 표시한다. 호스트는 호스트 잠금 아래 단일 트랜잭션 안에서만 종결 기록을 쓰므로 `event_id` 할당 순서는 커밋 순서와 같다(단일 호스트 전제).
 
@@ -454,7 +476,7 @@ InspectAsset 예:
 
 ### 5.9 실행의 `blockedFaults`·`releases` 칸
 
-실행마다 끝에 `blockedFaults`(`permitBlock` 뒤, 열두째 칸)와 `releases`(마지막 열셋째 칸). 실행 행은 칸 13개 이 순서 `executionId, jobOrderId, workMasterId, missionVersion, robotId, physicalState, units, jobResponse, restoredFrom, cancel, permitBlock, blockedFaults, releases`. `blockedFaults` 는 결함 객체의 배열. 지금 다음 단위를 막고 있는 기체 결함 전부(picasso `Execution.blockedBy`). 없으면 `[]`. 결함 객체 칸은 S4a JSON 계약 §4 의 결함 객체 9칸과 같다(`failureClass, errorType, vendorDetail, errorHint, references[{key, value}], canContinueCurrentTask, canAcceptNewTask, activeUntilKind, activeUntilTime`), 같은 결함이면 인시던트 상세 `blockedBy` 와 칸마다 같다. `failureClass` 는 분류 이름(접두사 `FAILURE_CLASS_` 를 뗀 것, 분류가 없거나 모르면 picasso `Middleware.UNCLASSIFIED`), 그 목록은 작업 응답 `blockedBy` 의 이름들과 같다. 참조 `key` 는 계약 열거형 이름(예 `KEY_TASK_ID`). 작업 응답의 `blockedBy` 는 분류 이름뿐이고 picasso 가 새 작업 응답을 낼 때만 바뀌지만 `blockedFaults` 는 지금의 값이다. 결함 수용(§5.10)이 이것과 대조한다. 작업 허가 차단(`permitBlock`)과 다른 칸이다. `releases` 는 그 작업 지시에 건 운영자 결함 수용(V11 `execution_fault_release`, 적은 순서). 없으면 `[]`. 원소 칸 5개 이 순서 `requestId`, `approverId`, `reason`, `faults`, `recordedAt`. `requestId` 는 없으면 null. `faults` 는 수용할 때의 `blockedFaults` 그대로(결함 객체 배열). `recordedAt` 은 DB 시각. 작업 지시 id 로 읽으므로 재기동 전 인스턴스가 적은 수용도 싣는다. 이 인스턴스가 이빅션한 실행의 줄과 종결 이력의 `execution`(§5.8)은 종결할 때 적은 본문이라 두 칸도 종결할 때의 값이다. V11 전에 적은 종결 본문에는 두 칸이 없다. 이빅션한 실행의 줄로 읽으면 두 칸이 `[]` 로 나오고, 종결 이력의 `execution` 은 적힌 글자 그대로라 두 칸이 빠진다. 근거 시험: `FaultReleaseHostTest` 의 `본 결함대로 감수하면 감수 행과 판단 기록을 곧바로 적고 막힘이 걷힌 작업 응답 하나를 곧바로 내며 이동이 실패한 대상의 점검은 거르고 다음 대상의 단위를 낸다`(실행 목록 `blockedFaults` 가 인시던트 상세 `blockedBy` 와 같음, `releases` 칸 순서), `JudgmentRecordHostTest` 의 `감수한 결함을 실은 기록으로 다시 지으면 그 결함이 다음 단위를 다시 막지 않는다`(재기동한 인스턴스의 `releases` 가 앞 인스턴스의 수용을 실음), 칸 순서는 `HostRestoreTest` 의 `EXECUTION_FIELDS`.
+실행마다 끝에 `blockedFaults`(`permitBlock` 뒤, 열두째 칸)와 `releases`(마지막 열셋째 칸). 실행 행은 칸 14개 이 순서 `executionId, jobOrderId, workMasterId, missionVersion, robotId, physicalState, units, jobResponse, restoredFrom, cancel, permitBlock, blockedFaults, releases, boundRobot`. 마지막 `boundRobot`(mission-ops `feat/fleet-site-world` 부터)은 로봇 단위 없이 플릿 운반만 든 실행이면 참이고 그때 `robotId` 는 묶인 기체(실행 주체 아님)다(picasso 한계 «§15.326 · 기체 묶임»). 그 전에 적은 종결 본문에는 칸이 없다. `blockedFaults` 는 결함 객체의 배열. 지금 다음 단위를 막고 있는 기체 결함 전부(picasso `Execution.blockedBy`). 없으면 `[]`. 결함 객체 칸은 S4a JSON 계약 §4 의 결함 객체 9칸과 같다(`failureClass, errorType, vendorDetail, errorHint, references[{key, value}], canContinueCurrentTask, canAcceptNewTask, activeUntilKind, activeUntilTime`), 같은 결함이면 인시던트 상세 `blockedBy` 와 칸마다 같다. `failureClass` 는 분류 이름(접두사 `FAILURE_CLASS_` 를 뗀 것, 분류가 없거나 모르면 picasso `Middleware.UNCLASSIFIED`), 그 목록은 작업 응답 `blockedBy` 의 이름들과 같다. 참조 `key` 는 계약 열거형 이름(예 `KEY_TASK_ID`). 작업 응답의 `blockedBy` 는 분류 이름뿐이고 picasso 가 새 작업 응답을 낼 때만 바뀌지만 `blockedFaults` 는 지금의 값이다. 결함 수용(§5.10)이 이것과 대조한다. 작업 허가 차단(`permitBlock`)과 다른 칸이다. `releases` 는 그 작업 지시에 건 운영자 결함 수용(V11 `execution_fault_release`, 적은 순서). 없으면 `[]`. 원소 칸 5개 이 순서 `requestId`, `approverId`, `reason`, `faults`, `recordedAt`. `requestId` 는 없으면 null. `faults` 는 수용할 때의 `blockedFaults` 그대로(결함 객체 배열). `recordedAt` 은 DB 시각. 작업 지시 id 로 읽으므로 재기동 전 인스턴스가 적은 수용도 싣는다. 이 인스턴스가 이빅션한 실행의 줄과 종결 이력의 `execution`(§5.8)은 종결할 때 적은 본문이라 두 칸도 종결할 때의 값이다. V11 전에 적은 종결 본문에는 두 칸이 없다. 이빅션한 실행의 줄로 읽으면 두 칸이 `[]` 로 나오고, 종결 이력의 `execution` 은 적힌 글자 그대로라 두 칸이 빠진다. 근거 시험: `FaultReleaseHostTest` 의 `본 결함대로 감수하면 감수 행과 판단 기록을 곧바로 적고 막힘이 걷힌 작업 응답 하나를 곧바로 내며 이동이 실패한 대상의 점검은 거르고 다음 대상의 단위를 낸다`(실행 목록 `blockedFaults` 가 인시던트 상세 `blockedBy` 와 같음, `releases` 칸 순서), `JudgmentRecordHostTest` 의 `감수한 결함을 실은 기록으로 다시 지으면 그 결함이 다음 단위를 다시 막지 않는다`(재기동한 인스턴스의 `releases` 가 앞 인스턴스의 수용을 실음), 칸 순서는 `HostRestoreTest` 의 `EXECUTION_FIELDS`.
 
 ```json
 "blockedFaults": [{"failureClass": "LOCALIZATION_LOST", "errorType": "LOCALIZATION_LOST", "vendorDetail": "", "errorHint": "로봇을 알려진 랜드마크 앞으로 옮기고 재측위를 실행하십시오.", "references": [], "canContinueCurrentTask": false, "canAcceptNewTask": false, "activeUntilKind": "KIND_UNTIL_CLEARED", "activeUntilTime": ""}]
@@ -525,7 +547,7 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 응답 200 늘:
 
 ```json
-{"cell": {"presentations": [...], "slots": [...]}}
+{"cell": {"presentations": [...], "slots": [...], "signals": [...], "handovers": [...]}}
 ```
 
 - `cell` 은 마지막 pump 가 현장 `/cell` 에서 읽은 스냅숏이며 모양은 1절 본문과 같다(칸 넷, 시각은 ISO 문자열).
@@ -550,7 +572,7 @@ picasso `ddca127`(PR #109)부터 `release`는 true를 반환할 때 `notify`를 
 | `POST /host/executions/{executionId}/cancel` | 결과 넷 전부(5.2) | `BAD_REQUEST`(그 밖 409 `INSTANCE_MISMATCH`, 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `POST /host/executions/{executionId}/release` | 결과 다섯 전부(5.10) | `BAD_REQUEST`(그 밖 409 `INSTANCE_MISMATCH`, 409 `REQUEST_ID_REUSED`, 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `GET /host/robots/residual-holds` | 늘 | 없음 | 없음 |
-| `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` | 해소함 | `BAD_REQUEST`(그 밖 400 `RESIDUAL_HOLD_CITATION_INVALID`, 404 `RESIDUAL_HOLD_NOT_FOUND`, 409 `RESIDUAL_HOLD_ALREADY_CLEARED`, 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`, 409 `REQUEST_ID_REUSED`, 403 `APPROVER_REFUSED`(REST 로는 안 남), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
+| `POST /host/robots/{robotId}/residual-holds/{markerId}/clear` | 해소함 | `BAD_REQUEST`(그 밖 400 `RESIDUAL_HOLD_CITATION_INVALID`, 404 `RESIDUAL_HOLD_NOT_FOUND`, 409 `RESIDUAL_HOLD_ALREADY_CLEARED`, 409 `RESIDUAL_HOLD_OBSERVATION_MISMATCH`, 409 `REQUEST_ID_REUSED`, 409 `FLEET_UNIT_OPEN`(그 표시의 작업 지시에 끝나지 않은 플릿 운반 단위가 있음 — 빈손 확인은 플릿 정지의 증거가 못 됨, 아무것도 적지 않음), 403 `APPROVER_REFUSED`(REST 로는 안 남), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | `GET /host/robots/{robotId}/residual-holds/{markerId}` | 늘 | `BAD_REQUEST`(그 밖 404 `RESIDUAL_HOLD_NOT_FOUND`) | 없음 |
 | `POST /host/job-orders/{jobOrderId}/withdraw` | 결과 둘 전부(5.11) | `BAD_REQUEST`(그 밖 409 `REQUEST_ID_REUSED`, 500 `JOURNAL_WRITE_FAILED`(일지 막힘), 500 `RECORD_WRITE_FAILED`) | JSON 아님 |
 | 현장 `GET /cell` | 늘 | 없음(405·404 는 위 1절) | 없음 |

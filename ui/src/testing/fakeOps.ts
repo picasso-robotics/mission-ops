@@ -55,6 +55,8 @@ export interface Call {
 
 /** 시험이 고칠 수 있는 대역의 상태. 조작마다 [answer] 를 돌려준다. */
 export interface FakeOps {
+  /** 실행 수 본문의 플릿 연결. 비우면 칸을 싣지 않는다(옛 호스트). */
+  fleet?: ExecutionSummary['fleet']
   interfaces: MissionInterfaceView[]
   contracts: JobContract[]
   calls: Call[]
@@ -735,7 +737,7 @@ export function installFakeOps(
         return new Response(JSON.stringify(body), { status: 200 })
       }
       if (method === 'GET' && path === '/api/executions/summary') {
-        return new Response(JSON.stringify(executionSummary(fake.executions)), { status: 200 })
+        return new Response(JSON.stringify({ ...executionSummary(fake.executions), ...(fake.fleet === undefined ? {} : { fleet: fake.fleet }) }), { status: 200 })
       }
       if (method === 'GET' && path === '/api/job-responses') {
         const jobOrderId = params.get('jobOrderId')

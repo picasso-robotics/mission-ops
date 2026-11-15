@@ -49,6 +49,15 @@ class Site private constructor(
     /** 셀 대역의 지금 스냅숏. `GET /cell` 이 내는 것과 같다. */
     val cellSnapshot: CellSnapshot get() = cell.snapshot
 
+    /**
+     * 플릿 세계(플릿 미믹 하나, [SiteFleet]). 셀 대역 서버의 `/fleet` 가 연다. 실행 호스트는 `host.fleet.url` 에 이 서버 주소를 주면 붙는다.
+     * 시험이 세계를 채우고(출발지에 용기) 맡긴 횟수를 볼 때 쓴다. 세계를 바꾼 뒤 [projectFleet] 를 부르면 셀 투영이 곧 바뀐다(아니면 다음 시계 밀기).
+     */
+    val fleet: SiteFleet get() = cell.fleet
+
+    /** 플릿 세계를 셀 대역의 인계 자리로 다시 올린다([SiteCell.project]). */
+    fun projectFleet() = cell.project()
+
     /** mimic 의 가상 시각. */
     fun now(): Instant = mimic.server.exclusive { clock.now() }
 
@@ -212,6 +221,9 @@ class Site private constructor(
             val site = Site(registry, mimic, cell, runner, link, registryUrl, mimic.robotIds)
             try {
                 site.advanceTo(Instant.now())
+                // 플릿 세계의 처음 용기는 셀 대역을 지을 때(가상 시계 EPOCH) 놓였다. 실제 시각까지 민 뒤 그 시각으로 다시 찍는다.
+                site.fleet.stampInitial()
+                site.projectFleet()
             } catch (e: Exception) {
                 site.close()
                 throw e

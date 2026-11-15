@@ -12,6 +12,7 @@ import type {
 } from '../api'
 import { EXECUTIONS_RECENT_PATH } from '../api'
 import { ELIGIBILITY_DEBOUNCE_MS, POLL_MS, SIGNAL_SETTLE_MS } from '../poll'
+import { FLEET_ONLY_NOTE } from '../labels'
 import { cellView, eligibilityView, executionsView, installFakeOps, standardSignals } from '../testing/fakeOps'
 import type { FakeOps } from '../testing/fakeOps'
 import { OperationsArea } from './OperationsArea'
@@ -393,6 +394,22 @@ describe('운영 영역', () => {
     expect(notice).toHaveTextContent('InspectAsset 작업 지시: 막힘(플릿 포트 없음(이 실행 호스트는 플릿 운반을 받지 않음))')
     expect(notice).toHaveTextContent(detail)
     expect(notice).not.toHaveTextContent('배정 가능한 기체 없음')
+  })
+
+  it('배정 가능 표는 플릿 전용 계획의 스킬 판정을 해당 없음(묶인 기체)으로 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.eligibility = eligibilityView({
+      registry: 'OK',
+      host: 'OK',
+      robots: [robotRow('humanoid-01', { host: hostRow('humanoid-01', { skillFit: 'NOT_APPLICABLE', requiredSkills: [], availableSkills: null, boundRobot: true }) })],
+      fleetOnly: true,
+    })
+    open()
+    await fillTarget(1, 'T1', 'bay-7')
+    const table = await screen.findByRole('table', { name: '기체별 배정 가능' })
+    const rows = within(table).getAllByRole('row').slice(1)
+    expect(rows.map(cells)).toEqual([['humanoid-01', '완료', '신선(현장 설정 버전 1)', '없음', '없음', '모름', '해당 없음(묶인 기체)', '가능', '']])
+    expect(screen.getByRole('note')).toHaveTextContent(FLEET_ONLY_NOTE)
   })
 
   it('배정 가능 표는 못 물어본 칸을 모름으로 보이고 배정 불가로 둔다', async () => {

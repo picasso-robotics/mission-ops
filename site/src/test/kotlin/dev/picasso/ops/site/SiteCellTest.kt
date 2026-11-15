@@ -152,7 +152,7 @@ class SiteCellTest {
             assertEquals(200, got.statusCode())
             assertEquals("application/json", got.headers().firstValue("Content-Type").orElse(null))
             val body = json.readTree(got.body())
-            assertEquals(listOf("presentations", "slots", "signals"), body.fieldNames().asSequence().toList())
+            assertEquals(listOf("presentations", "slots", "signals", "handovers"), body.fieldNames().asSequence().toList())
 
             val source = body["presentations"].single()
             assertEquals(SOURCE, source["id"].asText())

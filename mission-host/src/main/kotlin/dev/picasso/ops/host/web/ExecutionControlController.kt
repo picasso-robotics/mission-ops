@@ -220,6 +220,7 @@ class ExecutionControlController(private val host: MissionHost, private val json
             is ClearOutcome.ObservationMismatch -> ResponseEntity.status(HttpStatus.CONFLICT).body(ObservationMismatchRejection.of(outcome))
             is ClearOutcome.CitationInvalid -> ResponseEntity.status(HttpStatus.BAD_REQUEST).body(HostRejection(RESIDUAL_HOLD_CITATION_INVALID, outcome.reason))
             is ClearOutcome.RequestReused -> ResponseEntity.status(HttpStatus.CONFLICT).body(HostRejection(MissionController.REQUEST_ID_REUSED, outcome.reason))
+            is ClearOutcome.FleetUnitOpen -> ResponseEntity.status(HttpStatus.CONFLICT).body(HostRejection(MissionHost.FLEET_UNIT_OPEN, outcome.reason))
         }
     }
 

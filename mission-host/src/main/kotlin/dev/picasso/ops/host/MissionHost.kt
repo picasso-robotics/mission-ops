@@ -54,6 +54,9 @@ import dev.picasso.ops.host.cell.CellBandSignals
 import dev.picasso.ops.host.cell.CellSnapshot
 import dev.picasso.ops.host.cell.SourceConfirmation
 import dev.picasso.ops.host.incident.IncidentExport
+import dev.picasso.ops.host.mission.MockRunner
+import dev.picasso.middleware.mission.MissionDefinitionParser
+import dev.picasso.middleware.mission.MissionParse
 import dev.picasso.ops.host.mission.SiteInputs
 import dev.picasso.ops.host.mission.StoredMissionCatalog
 import dev.picasso.ops.host.permit.CellWorkPermits
@@ -94,8 +97,12 @@ import kotlin.concurrent.withLock
 /** 출발 관문 앞에 설 수 있는 단위 상태(`MissionHost.startingRobots`). */
 private val STARTING_UNIT_STATES = setOf(UnitState.PENDING, UnitState.IN_DOUBT, UnitState.OPERATOR_HOLD)
 
-/** 스킬 적합 판정(S3a 스펙 §7.6). [UNKNOWN] 은 기체 케이퍼빌리티를 못 물어봤다는 뜻이고 적합이 아니다. */
-enum class SkillFit { FIT, MISSING, UNKNOWN }
+/**
+ * 스킬 적합 판정(S3a 스펙 §7.6). [UNKNOWN] 은 기체 케이퍼빌리티를 못 물어봤다는 뜻이고 적합이 아니다. [NOT_APPLICABLE] 은 플릿 전용 계획
+ * (로봇 단위 없음, [MissionHost.fleetOnly])이라 기체가 할 스킬이 없다는 뜻이다 — 적합이 아니고(«아무 기체» 를 고르는 근거가 되지 않는다) 거절
+ * 사유도 아니다. 그 기체는 실행 주체가 아니라 picasso 접수가 요구해 묶인 기체다(picasso 한계 «§15.326 · 기체 묶임»).
+ */
+enum class SkillFit { FIT, MISSING, UNKNOWN, NOT_APPLICABLE }
 
 /**
  * 기체 하나의 호스트 판정(T3). 운영 서비스가 시운전·연결 판정과 합쳐 배정 가능을 낸다.
@@ -107,6 +114,9 @@ enum class SkillFit { FIT, MISSING, UNKNOWN }
  * @param reasons 통과하지 못한 이유. 화면에 그대로 보인다. [gateTrial] 이면 잔여 파지 표시 사유 하나가 남아 있다.
  * @param gateTrial **관문 확인용**으로만 넘긴다. 남은 이유가 잔여 파지 표시뿐인 새 접수의 기체다. picasso `assign` 의 `trialOnly` 로 넘겨, 관문이
  *   사슬 위반으로 거절하면 조치 제안을 얻고([Refusal.remedy]) 통과하면 실행 없이 표시 사유로 뺀다([submit]). 이 기체에 일반 배정은 서지 않는다.
+ *   플릿 전용 계획에는 쓰지 않는다(로봇 단위가 없어 사슬 검사가 없다).
+ * @param boundRobot 플릿 전용 계획이다 — 이 기체는 **묶인 기체(실행 주체 아님)** 다. picasso 접수가 기체 하나를 요구해 실행·인시던트의
+ *   `robotId` 에 실릴 뿐 운반은 플릿이 한다(picasso 한계 «§15.326 · 기체 묶임»). 그때 [skillFit] 은 [SkillFit.NOT_APPLICABLE] 이다.
  */
 data class HostEligibility(
     val robotId: String,
@@ -118,6 +128,7 @@ data class HostEligibility(
     val requiredSkills: List<String>? = null,
     val availableSkills: List<String>? = null,
     val gateTrial: Boolean = false,
+    val boundRobot: Boolean = false,
 )
 
 /** 미들웨어 `Submission` 넷의 이름(S3a 스펙 §7.6). */
@@ -203,6 +214,7 @@ data class SubmitOutcome(
     val sourceMissing: SourceMissingView? = null,
     val sourceUnobserved: SourceUnobservedView? = null,
     val forgottenJobOrder: Boolean = false,
+    val boundRobot: Boolean = false,
 ) {
     companion object {
         /**
@@ -335,6 +347,8 @@ data class JobResponseView(
  * @param blockedFaults 지금 다음 단위를 막고 있는 기체 결함 전부(picasso `Execution.blockedBy`). 없으면 빈 목록이다. 작업 응답의
  *   `blockedBy` 는 분류 이름뿐이고 picasso 가 새 작업 응답을 낼 때만 바뀐다. 이것은 지금의 값이다. 운영자 결함 감수가 이것과 대조한다
  * @param releases 그 작업 지시에 건 운영자 결함 감수(V11, 적은 순서). 작업 지시 id 로 읽어 재기동 전 인스턴스의 것도 든다
+ * @param boundRobot 로봇 단위 없이 플릿 운반만 든 실행이다 — [robotId] 는 **묶인 기체(실행 주체 아님)** 다(picasso 한계 «§15.326 · 기체 묶임»).
+ *   이 칸이 생기기 전에 적은 정착 본문에는 없다
  */
 data class ExecutionView(
     val executionId: String,
@@ -350,6 +364,7 @@ data class ExecutionView(
     val permitBlock: PermitBlockView? = null,
     val blockedFaults: List<FaultDetailView> = emptyList(),
     val releases: List<FaultReleaseView> = emptyList(),
+    val boundRobot: Boolean = false,
 )
 
 /** 다시 지은 실행의 이전 실행(S4b 스펙 §6.3). 바로 앞 인스턴스에서 그 작업 지시를 들었던 실행이다. */
@@ -592,6 +607,7 @@ class MissionHost(
     private val entitlements: Entitlements = Entitlements.None,
     export: Path? = null,
     retention: Retention = RETENTION,
+    fleet: AmrFleetPort = AmrFleetPort.None,
 ) : AutoCloseable {
     init {
         require(!revisableRetention.isNegative) { "개정판을 받을 실행을 두는 폭은 음수가 아니어야 한다: $revisableRetention" }
@@ -601,14 +617,19 @@ class MissionHost(
     private val signals = CellBandSignals()
 
     /**
-     * 이 호스트의 플릿 포트. 지금은 늘 없다(`AmrFleetPort.None`) — 플릿 세계를 site 프로세스에 두고 잇는 것은 2단계다. 그래서 플릿 경로
-     * 정의의 활성화([dev.picasso.ops.host.mission.MissionVersions.FLEET_PORT_ABSENT])와 플릿 단위가 든 계획의 새 접수([refuseFleetPlan])를
-     * 명시 사유로 거절한다. 모의 실행은 이것과 무관하게 인프로세스 플릿 미믹으로 돈다.
+     * 이 호스트의 플릿 포트(`host.fleet.url`). 비우면 `AmrFleetPort.None` 이고 플릿 경로 정의의 활성화
+     * ([dev.picasso.ops.host.mission.MissionVersions.FLEET_PORT_ABSENT])와 플릿 단위가 든 계획의 새 접수([refuseFleetPlan])를 명시 사유로
+     * 거절한다. 주소가 있으면 현장 플릿 세계 면을 부르는 HTTP 포트를 [dev.picasso.ops.host.fleet.HostFleetPort] 로 감싼 것이고 그 차단은 풀린다.
+     * 모의 실행은 이것과 무관하게 인프로세스 플릿 미믹으로 돈다.
      */
-    private val fleetPort: AmrFleetPort = AmrFleetPort.None
+    private val fleetPort: AmrFleetPort = fleet
 
     /** 이 호스트에 플릿 포트가 있는가. 없으면 플릿 운반을 맡길 곳이 없다. */
     val hasFleetPort: Boolean get() = fleetPort !== AmrFleetPort.None
+
+    /** 플릿 연결(호스트 상태 응답·개요 화면). 없으면 `connected` 가 거짓이고 주소가 널이다. */
+    val fleetLink: FleetLinkView
+        get() = FleetLinkView(hasFleetPort, (fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort)?.url)
 
     /**
      * `instanceId` 를 넘기지 않는다 — picasso 기본값(`mw-<UUID>`)이 생성마다 새 값이다. 그 값이 인시던트 열쇠(`incidentKey`)의 유일성을
@@ -928,10 +949,12 @@ class MissionHost(
      * @return 결과, RESTORED 의 실행 id, DEFERRED·GAVE_UP 의 사유
      */
     private fun resumed(waiting: Deferred): Triple<RestoreResult, String?, String?> {
-        // 다시 지을 계획에 플릿 단위가 있으면 다시 짓지 않고 포기한다(사유 `FLEET_PORT_ABSENT`). 운반을 맡길 곳 없이 실행을 세우면 실패 운반으로
-        // 조용히 정착한다. 포기한 행은 운영자 종결 대상이 된다(복원 못 한 실행).
+        // 다시 지을 계획에 플릿 단위가 있는데 플릿 포트가 없으면 다시 짓지 않고 미룬다(사유 `FLEET_PORT_ABSENT`). 운반을 맡길 곳 없이 실행을 세우면
+        // 실패 운반으로 조용히 정착한다. 포기(GAVE_UP)로 적지 않는다 — 포기한 행은 다시 시도되지 않고 플릿 단위가 있어 운영자 종결도 받지 않으므로
+        // 출구가 없다. 미룬 행은 pump 마다 다시 시도하고 재기동에서도 다시 읽혀, 플릿 포트를 붙인 기동에서 같은 참조로 그 운반에 다시 붙는다.
+        // 그동안 그 기체는 판정에서 빠진다(미룬 행). 운영자 종결은 받지 않는다(`RESUME_SNAPSHOT_UNREADABLE` 미룸이 아님).
         fleetPlanRefusal(checkNotNull(waiting.order), checkNotNull(waiting.mission).capability)?.let {
-            return Triple(RestoreResult.GAVE_UP, null, "${HostRequests.FLEET_PORT_ABSENT}: $it")
+            return Triple(RestoreResult.DEFERRED, null, "${HostRequests.FLEET_PORT_ABSENT}: $it")
         }
         val cancel = records.cancelOf(waiting.row.jobOrderId)
         val stored = records.latestJudgmentRecord(waiting.row.jobOrderId)
@@ -1140,6 +1163,24 @@ class MissionHost(
     private fun refuseFleetPlan(order: JobOrder, capability: LogicalCapability? = catalog.active(order.workMasterId)?.capability) {
         fleetPlanRefusal(order, capability)?.let { throw BadRequest(HostRequests.FLEET_PORT_ABSENT, it) }
     }
+
+    /**
+     * **플릿 전용 계획의 기체 규칙(D2(a)).** 고른 임무로 [order] 를 계획해 로봇 단위가 없고 플릿 단위가 있으면([fleetOnly]) 요청 후보가 **정확히 하나**
+     * 여야 한다 — 여럿이거나 비면 400 [HostRequests.FLEET_ONLY_CANDIDATES] 로 거절한다. 호스트가 그중 아무 기체를 고르지 않는다: 스킬 판정이
+     * «해당 없음» 이라 비용 순위로 고르면 근거 없는 고르기가 된다. 그 하나는 picasso 접수가 요구해 묶일 뿐 실행 주체가 아니다(picasso 한계
+     * «§15.326 · 기체 묶임»). 등록·점유·기존 제한은 그 하나에 그대로 건다([judge]). 새 접수에만 부른다 — 실행이 있는 작업 지시는 그 실행의 기체다.
+     */
+    private fun refuseFleetOnlyCandidates(order: JobOrder, candidates: List<String>) {
+        val capability = catalog.active(order.workMasterId)?.capability ?: return
+        if (!fleetOnly(capability.plan(order))) return
+        val distinct = candidates.distinct()
+        if (distinct.size == 1) return
+        throw BadRequest(
+            HostRequests.FLEET_ONLY_CANDIDATES,
+            "${HostRequests.FLEET_ONLY_CANDIDATES_DETAIL}: ${order.workMasterId} 의 요청 후보 ${distinct.size}개" +
+                (if (distinct.isEmpty()) "" else "(${distinct.joinToString(", ")})"),
+        )
+    }
     private fun eligibilityCurrent(order: JobOrder, robotIds: List<String>): List<HostEligibility> = lock.withLock {
         val applied = siteTimings.current() != null
         robotIds.distinct().map { judge(order, it, applied, trialable = true) }
@@ -1180,7 +1221,10 @@ class MissionHost(
             // 계획을 새로 세우지 않으므로 거르지 않는다.
             val existing = middleware.executions().firstOrNull { it.order.jobOrderId == order.jobOrderId }
             when {
-                existing == null -> refuseFleetPlan(order)
+                existing == null -> {
+                    refuseFleetPlan(order)
+                    refuseFleetOnlyCandidates(order, candidates)
+                }
                 revises(existing, order) -> refuseFleetPlan(order, existing.capability)
             }
             submitCurrent(order,candidates,confirmations)
@@ -1240,10 +1284,12 @@ class MissionHost(
                 }
                 SubmitOutcome(
                     SubmitResult.ACCEPTED, submission.execution.executionId, submission.execution.robotId, null, emptyList(), excluded,
+                    boundRobot = fleetOnly(submission.execution.units),
                 )
             }
             is Middleware.Submission.Idempotent -> SubmitOutcome(
                 SubmitResult.IDEMPOTENT, submission.execution.executionId, submission.execution.robotId, null, emptyList(), excluded,
+                boundRobot = fleetOnly(submission.execution.units),
             )
             // 같은 잠금 안이라 이번 `assign` 뒤에 조치 탐색 기록에 붙은 줄은 이 제출의 것이며, 거절된 작업 수락(`submit` 또는 리비전)은 많아야
             // 한 줄을 남긴다. picasso PR #109부터 UNASSIGNED로 끝난 `assign`은 후보당 한 줄씩 덧붙일 수 있지만, UNASSIGNED 분기는 조치 탐색 기록을 읽지 않는다.
@@ -1517,6 +1563,7 @@ class MissionHost(
             live = live.size,
             states = states,
             journalBlockedExecutionIds = journalBlocked(),
+            fleet = fleetLink,
         )
     }
 
@@ -1615,6 +1662,7 @@ class MissionHost(
                     permitBlock = execution.permitBlock?.let(PermitBlockView::of),
                     blockedFaults = execution.blockedBy.map(FaultDetailView::fromContract),
                     releases = released[execution.order.jobOrderId].orEmpty().map(::releaseView),
+                    boundRobot = fleetOnly(execution.units),
                 )
             },
             restore = restoreView(),
@@ -2099,6 +2147,14 @@ class MissionHost(
         if (approver.kind != ApproverKind.PERSON) return@withLock ClearOutcome.Refused("$AGENT_CLEAR_REFUSED: ${approver.id}")
         val (hold, clearing) = records.residualHold(markerId)?.takeIf { it.first.robotId == robotId } ?: return@withLock ClearOutcome.NotFound
         if (clearing != null) return@withLock ClearOutcome.AlreadyCleared(ResidualHoldClearingView.of(clearing))
+        // 끝나지 않은 플릿 단위가 있는 실행의 표시는 해소하지 않는다. 빈손 확인은 기체의 손만 보므로 플릿이 멈췄다는 증거가 못 된다.
+        openFleetUnits(hold.jobOrderId).takeIf { it.isNotEmpty() }?.let { open ->
+            return@withLock ClearOutcome.FleetUnitOpen("$FLEET_UNIT_OPEN: ${hold.jobOrderId} 의 끝나지 않은 플릿 운반 단위 ${open.joinToString(", ")}")
+        }
+        // 다시 짓지 못한 행(미룬·포기)은 메모리에 실행이 없어 단위 상태를 모른다 — 운영자 종결과 같은 일지 판정을 건다(대칭).
+        unrestoredFleetRisk(hold.jobOrderId)?.let { risk ->
+            return@withLock ClearOutcome.FleetUnitOpen("$FLEET_UNIT_OPEN: ${hold.jobOrderId} 는 다시 짓지 못한 실행이고 $risk")
+        }
         val request = requestId?.let(UUID::fromString) ?: UUID.randomUUID()
         records.residualHoldConflict(request)?.let { stored ->
             if (stored.markerId != markerId) {
@@ -2304,7 +2360,9 @@ class MissionHost(
     /** [revising] 은 개정할 기존 실행이다. 그 실행 자신은 그 기체를 쥐어도 도는 실행으로 세지 않는다([submit]). */
     private fun judge(order: JobOrder, robotId: String, applied: Boolean, revising: String? = null, trialable: Boolean = false): HostEligibility {
         val active = requireNotNull(catalog.active(order.workMasterId)) { "카탈로그에 없는 WorkMaster 다: ${order.workMasterId}" }
-        val needed = active.capability.plan(order).filter { it.route == Route.ROBOT }.map { it.skillType }.toSortedSet()
+        val planned = active.capability.plan(order)
+        if (fleetOnly(planned)) return judgeBound(robotId, applied, revising)
+        val needed = planned.filter { it.route == Route.ROBOT }.map { it.skillType }.toSortedSet()
         val declared = robots.capabilities(robotId)?.skillsList?.map { it.skillType }?.toSet()
         val missing = declared?.let { (needed - it).toList() } ?: emptyList()
         val fit = when {
@@ -2315,7 +2373,8 @@ class MissionHost(
         val running = runningOn(robotId, revising)
         val reasons = buildList {
             when (fit) {
-                SkillFit.FIT -> Unit
+                // 로봇 계획의 판정은 이 값을 내지 않는다(플릿 전용 계획은 [judgeBound]).
+                SkillFit.FIT, SkillFit.NOT_APPLICABLE -> Unit
                 SkillFit.MISSING -> add("모자란 스킬: ${missing.joinToString(", ")}")
                 SkillFit.UNKNOWN -> add("기체 케이퍼빌리티를 못 물어봤다")
             }
@@ -2326,6 +2385,25 @@ class MissionHost(
         return HostEligibility(
             robotId, fit, missing, running, passed = reasons.isEmpty() || trial, reasons = reasons,
             requiredSkills = needed.toList(), availableSkills = declared?.sorted(), gateTrial = trial,
+        )
+    }
+
+    /**
+     * 플릿 전용 계획의 기체 판정(D2(a)). 그 기체는 **묶인 기체(실행 주체 아님)** 다. 스킬 판정은 [SkillFit.NOT_APPLICABLE] 이고 선언을 못 읽은 것은
+     * 거절 사유가 아니다(할 스킬이 없다). 등록과 기존 제한([robotRestrictions] — 점유·복원 못 한 행·잔여 파지 표시·현장 시간값 미적용·일지 막힘)은
+     * 그대로 건다. 등록은 그 기체의 스냅숏을 지금 한 번 읽어 본다 — 못 읽으면 이 현장의 기체인지 모르므로 [UNREGISTERED_REASON] 으로 뺀다. 관문
+     * 확인용([HostEligibility.gateTrial])은 쓰지 않는다(로봇 단위가 없어 사슬 검사가 없고 표시가 막는다).
+     */
+    private fun judgeBound(robotId: String, applied: Boolean, revising: String?): HostEligibility {
+        val declared = robots.capabilities(robotId)?.skillsList?.map { it.skillType }?.toSet()
+        val registered = runCatching { robots.snapshot(robotId) }.getOrNull() != null
+        val reasons = buildList {
+            if (!registered) add(UNREGISTERED_REASON)
+            addAll(robotRestrictions(robotId, applied, revising))
+        }
+        return HostEligibility(
+            robotId, SkillFit.NOT_APPLICABLE, emptyList(), runningOn(robotId, revising), passed = reasons.isEmpty(), reasons = reasons,
+            requiredSkills = emptyList(), availableSkills = declared?.sorted(), gateTrial = false, boundRobot = true,
         )
     }
 
@@ -2472,6 +2550,11 @@ class MissionHost(
         if (seen.first != previous.instanceId || seen.second != previous.executionId) {
             return answer(CloseResult.TARGET_CHANGED, "본 실행이 지금 일지와 다르다: 지금은 ${previous.instanceId} ${previous.executionId}")
         }
+        // 플릿 운반 단위가 든 행은 종결하지 않는다. 다시 짓지 못한 실행이라 그 운반이 끝났는지 모르고, 아래 정지 확인은 기체의 태스크만 본다 —
+        // 플릿이 멈췄다는 증거가 못 된다. 해소는 플릿 포트를 붙인 호스트의 복원(같은 참조로 그 운반에 다시 붙음)이다.
+        journalFleetRisk(journal)?.let { risk ->
+            return answer(CloseResult.NOT_CLOSABLE, "$FLEET_UNIT_OPEN: $risk. 기체의 정지 확인은 플릿 정지의 증거가 아니다")
+        }
         val snapshot = robots.snapshot(journal.robotId)
         val live = snapshot?.tasks.orEmpty().filter { (taskId, state) -> taskId.startsWith("$jobOrderId#") && state !in TERMINAL_TASK_STATES }
         val basis = when {
@@ -2550,7 +2633,10 @@ class MissionHost(
         }
         val waiting = deferred.map {
             val row = restoreRows[it.index]
-            val held = it.heldBy != null || row.reason?.startsWith(HELD_BY_LIVE_INSTANCE) == true
+            // 살아 있는 다른 인스턴스가 든 행과 플릿 포트가 없어 미룬 행은 닫을 수 없다([closeLocked]). 앞의 것은 그 심장박동이 끊기면, 뒤의 것은
+            // 플릿 포트를 붙인 기동에서 다시 지어진다.
+            val held = it.heldBy != null || row.reason?.startsWith(HELD_BY_LIVE_INSTANCE) == true ||
+                row.reason?.startsWith(HostRequests.FLEET_PORT_ABSENT) == true
             UnrestoredRowView(
                 row.jobOrderId, row.robotId, row.previousInstanceId, row.previousExecutionId, RestoreResult.DEFERRED.name, row.reason,
                 restoredAt ?: clock.now(), closable = !held, notClosableReason = row.reason.takeIf { held }, close = null, robotExcluded = true,
@@ -2597,6 +2683,51 @@ class MissionHost(
         }
         return CloseInputs(version, evidence, units)
     }
+
+    /**
+     * 일지 행([journal])의 실행이 플릿 운반을 했을 수 있는가. 아니라고 확인되면 `null`, 그럴 수 있으면 그 까닭(문장)이다. 판정은 그 행의 **대상 임무
+     * 버전**(일지의 `missionVersion`, 없으면 코드 정의)으로만 한다 — 같은 WorkMaster 의 다른 버전은 보지 않는다.
+     *
+     * - 대상 버전을 모르거나(버전 행 유실, 코드 정의가 없는 WorkMaster) 그 정의를 못 읽으면 «모름» 이고 막는다.
+     * - 대상 버전이 로봇 전용(정의에 플릿 노드가 없음, 코드 정의면 `DeliverContainer` 가 아님)으로 확인되면 작업 지시를 못 읽어도 막지 않는다.
+     * - 대상 버전이 플릿 노드를 들면 마지막으로 받은 판(개정판이 있으면 그것)을 계획해 플릿 단위가 있으면 막고, 계획을 못 지으면 «모름» 으로 막는다.
+     */
+    private fun journalFleetRisk(journal: JournalRow): String? {
+        val where = journal.missionVersion?.let { "${journal.workMasterId} 버전 $it" } ?: "${journal.workMasterId} 코드 정의"
+        val target = runCatching {
+            val row = journal.missionVersion?.let { store.version(journal.workMasterId, it) ?: error("임무 버전 행이 없다") }
+            val capability = catalog.mission(journal.workMasterId, row).capability
+            val fleet = if (row == null) {
+                journal.workMasterId == DeliverContainer.WORK_MASTER
+            } else {
+                when (val parsed = MissionDefinitionParser.parse(row.definition)) {
+                    is MissionParse.Parsed -> MockRunner.hasFleet(parsed.definition)
+                    is MissionParse.Unreadable -> error("정의를 읽지 못했다")
+                }
+            }
+            capability to fleet
+        }.getOrNull() ?: return "대상 임무($where)를 모르거나 그 정의를 읽지 못해 플릿 운반 단위를 모른다(모름은 플릿으로 본다)"
+        val (capability, fleet) = target
+        if (!fleet) return null
+        val planned = runCatching {
+            val revision = records.latestRevision(journal.jobOrderId)
+            capability.plan(HostRequests.jobOrder(json.readTree(revision?.jobOrder ?: journal.jobOrder)))
+        }.getOrNull() ?: return "대상 임무($where)가 플릿 운반을 쓰는데 작업 지시를 계획하지 못해 단위를 모른다(모름은 플릿으로 본다)"
+        val units = planned.filter { it.route == Route.FLEET }.map { it.unitId }.distinct()
+        return if (units.isEmpty()) null else "플릿 운반 단위 ${units.joinToString(", ")} 가 든 실행이다"
+    }
+
+    /** 그 작업 지시가 다시 짓지 못한 행(미룬·포기)이면 [journalFleetRisk], 아니면 `null`. 호스트 잠금 아래에서 부른다. */
+    private fun unrestoredFleetRisk(jobOrderId: String): String? {
+        if (middleware.executions().any { it.order.jobOrderId == jobOrderId }) return null
+        if (deferred.none { it.row.jobOrderId == jobOrderId } && jobOrderId !in unclosed) return null
+        return records.journalRow(jobOrderId)?.let(::journalFleetRisk)
+    }
+
+    /** 그 작업 지시의 메모리 실행에서 끝나지 않은 플릿 경로 단위 id([FLEET_ENDED_UNIT_STATES] 밖). 실행이 없으면 빈 목록이다. 호스트 잠금 아래에서 부른다. */
+    private fun openFleetUnits(jobOrderId: String): List<String> = middleware.executions()
+        .filter { it.order.jobOrderId == jobOrderId }
+        .flatMap { e -> e.units.filter { it.route == Route.FLEET && it.state !in FLEET_ENDED_UNIT_STATES }.map { it.unitId } }
 
     /** 종결 응답. 성공을 추정하지 않는다: 완료·미확정·불확실 단위가 없고 모든 단위가 [UNRESTORED_CLOSED] 로 미완이며 도달 근거는 `E0` 이다. */
     private fun closeResponse(row: CloseRow, inputs: CloseInputs) = JobResponseView(
@@ -2805,6 +2936,24 @@ class MissionHost(
          * 쪽이 같이 바뀌어야 한다.
          */
         const val UNRESTORED_CLOSED = "UNRESTORED_CLOSED"
+
+        /**
+         * 끝나지 않은 플릿 운반 단위가 있어 운영자 종결(`NOT_CLOSABLE` 의 detail 앞머리)이나 빈손 확인(409)을 받지 않는다는 고정 코드. 두 조작은
+         * 기체의 태스크·손만 확인하므로 플릿이 멈췄다는 증거가 못 된다.
+         */
+        const val FLEET_UNIT_OPEN = "FLEET_UNIT_OPEN"
+
+        /** 끝난 플릿 단위 상태. 그 밖(대기·미확정·진행·확인 중·운영자 보류)은 끝나지 않은 것이다. */
+        private val FLEET_ENDED_UNIT_STATES = setOf(UnitState.DONE, UnitState.UNVERIFIED, UnitState.FAILED, UnitState.ABORTED)
+
+        /** 플릿 전용 계획의 묶인 기체를 등록 확인으로 뺀 사유(D2(a)). 스냅숏을 못 읽어 이 현장의 기체인지 모른다. */
+        const val UNREGISTERED_REASON = "등록 확인 안 됨: 이 현장의 기체인지 모른다(기체 스냅숏을 못 읽었다)"
+
+        /**
+         * 플릿 전용 계획인가 — 로봇 단위가 없고 플릿 단위가 있다. 그 실행의 기체는 **묶인 기체(실행 주체 아님)** 다(picasso 한계 «§15.326 · 기체
+         * 묶임»). 설비 대기 단위만 든 계획은 여기 들지 않는다(플릿이 없다).
+         */
+        fun fleetOnly(units: List<ExecutionUnit>): Boolean = units.any { it.route == Route.FLEET } && units.none { it.route == Route.ROBOT }
 
         /** 에이전트 승인자의 종결 거부 사유의 앞부분. 뒤에 승인자 id 가 붙는다. */
         const val AGENT_CLOSE_REFUSED = "에이전트는 복원 못 한 실행을 종결하지 못한다. 로봇이 멈췄는지는 사람이 현장에서 확인한다"

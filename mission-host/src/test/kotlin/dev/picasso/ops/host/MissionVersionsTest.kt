@@ -752,7 +752,7 @@ class MissionVersionsTest {
             assertEquals(listOf("false", "true", "LOT-0001"), signals.map { it["value"].asText() })
             assertTrue(signals.all { it["value"].isTextual })
             assertEquals("BOOLEAN", signals[0]["kind"].asText())
-            assertEquals(listOf("presentations", "slots", "signals"), bench.get("/host/cell")["cell"].fieldNames().asSequence().toList())
+            assertEquals(listOf("presentations", "slots", "signals", "handovers"), bench.get("/host/cell")["cell"].fieldNames().asSequence().toList())
             assertEquals(listOf("name", "location", "kind", "safety", "value", "observedAt"), signals[0].fieldNames().asSequence().toList())
             assertNotNull(bench.host.cell()?.signals)
         }

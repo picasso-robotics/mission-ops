@@ -51,6 +51,8 @@ data class RobotEligibility(
  * @param host 호스트 상태. `HOST_SILENT` 면 호스트 칸이 모두 «모름» 이다
  * @param robots 널이면 기체 목록을 한 번도 읽지 못한 것(«모름»), 빈 목록은 기체가 없는 것이다
  * @param hostRefusal [host] 가 `HOST_REFUSED` 일 때 호스트의 `{error, detail}`. 그 밖에는 널이다
+ * @param fleetOnly 호스트가 이 작업 지시를 플릿 전용 계획(로봇 단위 없이 플릿 운반만)으로 판정했다(어느 행이든 `boundRobot`). 그러면 배정 가능한
+ *   기체가 **정확히 하나**여야 접수된다 — 운영 서비스는 배정 가능한 기체를 모두 후보로 싣으므로 둘 이상이면 `FLEET_ONLY_CANDIDATES` 로 거부한다
  */
 data class EligibilityView(
     val checkedAt: Instant,
@@ -59,6 +61,7 @@ data class EligibilityView(
     val host: HostState,
     val robots: List<RobotEligibility>?,
     val hostRefusal: HostJudgmentRefusal? = null,
+    val fleetOnly: Boolean = false,
 )
 
 /**
@@ -93,6 +96,7 @@ class JobOrderEligibility(
                 row(view, list.registry, known, list.settingsVersion, list.connectionThresholdSeconds, hostRows, refusal)
             },
             hostRefusal = refusal,
+            fleetOnly = hostRows?.values?.any { it.boundRobot } == true,
         )
     }
 

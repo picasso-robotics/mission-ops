@@ -125,6 +125,7 @@ data class SettledPageView(
  * @param live 지금 인스턴스의 남은 실행([ExecutionPages.live]) 수. 화면 목록의 [ExecutionPageView.executions] 수와 같다
  * @param states `PhysicalState` 이름마다 남은 실행 가운데 그 상태인 수. 이름 열한 개가 0 이어도 다 든다
  * @param journalBlockedExecutionIds 일지에 막힌 실행 id. `GET /host/executions` 의 같은 칸과 같다
+ * @param fleet 이 호스트의 플릿 연결(`host.fleet.url`). 없으면 `connected` 가 거짓이다
  */
 data class ExecutionSummaryView(
     val instanceId: String,
@@ -132,7 +133,15 @@ data class ExecutionSummaryView(
     val live: Int,
     val states: Map<String, Int>,
     val journalBlockedExecutionIds: List<String>,
+    val fleet: FleetLinkView = FleetLinkView(false, null),
 )
+
+/**
+ * 실행 호스트의 플릿 연결(`host.fleet.url`). [connected] 가 거짓이면 플릿 포트가 없어(`AmrFleetPort.None`) 플릿 운반 단위가 든 계획을 받지 않는다.
+ * [url] 은 현장 플릿 세계 면의 주소이고, 시험이 주입한 포트처럼 주소가 없는 포트면 널이다. 연결이 «있다» 는 설정의 뜻이지 현장이 지금 답한다는
+ * 뜻이 아니다.
+ */
+data class FleetLinkView(val connected: Boolean, val url: String?)
 
 /** 화면 실행 목록의 판정(HA 설계 기록 §10). */
 object ExecutionPages {

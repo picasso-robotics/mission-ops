@@ -20,6 +20,8 @@ fun main() {
     println("registry: ${site.registryUrl} (site=${config.siteId})")
     println("mimic: ${site.robotIds.sorted()} (gRPC 포트 ${site.mimicPort})")
     println("셀 대역: http://127.0.0.1:${site.cellPort}/cell")
+    // 플릿 세계는 같은 서버의 /fleet 다. 실행 호스트는 host.fleet.url(환경 변수 HOST_FLEET_URL)에 이 주소를 주면 플릿 포트를 붙인다.
+    println("플릿 세계: http://127.0.0.1:${site.cellPort}/fleet/world (인계 자리 ${site.fleet.places})")
     // uplink 가 거절 결과를 버리고 registry 도 남기지 않아서, 선언 전 보고의 거절은 어디에도 안 보인다.
     println("선언 전 mimic 의 생존 보고는 registry 가 거절하며 이 로그에도 남지 않는다. 기체를 선언하면 보고가 붙는다")
 

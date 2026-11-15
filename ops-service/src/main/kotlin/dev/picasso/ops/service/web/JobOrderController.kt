@@ -126,7 +126,7 @@ class JobOrderController(
         const val HOST_SILENT = "HOST_SILENT"
 
         /** 판정을 거부하는 호스트 사유 가운데 제출 응답에 그대로 내는 것. 접수 상세가 «코드: 문구» 로 시작한다. */
-        val HOST_REFUSAL_CODES: Set<String> = setOf(JobOrderOperations.FLEET_PORT_ABSENT)
+        val HOST_REFUSAL_CODES: Set<String> = setOf(JobOrderOperations.FLEET_PORT_ABSENT, JobOrderOperations.FLEET_ONLY_CANDIDATES)
 
         /** 제출하지 않은 거부 접수(`submission` 없음)의 상세가 [HOST_REFUSAL_CODES] 의 코드로 시작하면 (코드, 문구). 아니면 널. */
         fun hostRefusalOf(receipt: dev.picasso.ops.service.requests.Receipt): Pair<String, String>? {

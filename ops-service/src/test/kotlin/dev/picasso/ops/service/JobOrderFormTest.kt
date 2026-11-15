@@ -1,6 +1,7 @@
 package dev.picasso.ops.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import dev.picasso.ops.service.joborders.DeliverContainerDraft
 import dev.picasso.ops.service.joborders.FormRejection
 import dev.picasso.ops.service.joborders.InspectAssetDraft
 import dev.picasso.ops.service.joborders.InspectionTarget
@@ -38,6 +39,25 @@ class JobOrderFormTest {
             ),
             JobOrderForm.jobOrder(draft, "JO-1", json),
         )
+    }
+
+    @Test
+    fun `DeliverContainer 폼은 용기 속성의 출발 인계점과 도착 인계점이 되고 단위는 용기 하나이며 요구 근거 등급은 E2 다`() {
+        val draft = read("""{"workMasterId":"DeliverContainer","container":"HU-1042","source":"OUT-07","destination":"LINE-IN-03"}""")
+        assertEquals(DeliverContainerDraft("HU-1042", "OUT-07", "LINE-IN-03"), draft)
+        assertEquals(listOf("HU-1042"), draft.unitIds)
+        assertEquals(
+            json.readTree(
+                """{"jobOrderId":"JO-3","workMasterId":"DeliverContainer","version":1,"requiredEvidence":"E2","parameters":{},
+                   "materialRequirements":[],
+                   "equipmentRequirements":[
+                     {"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},
+                     {"id":"LINE-IN-03","equipmentUse":"destination","properties":{}}]}""",
+            ),
+            JobOrderForm.jobOrder(draft, "JO-3", json),
+        )
+        // 화면 폼·입력 계약의 임무 목록에는 들지 않는다.
+        assertEquals(setOf("InspectAsset", "PrepareSequencedRack"), JobOrderForm.WORK_MASTERS)
     }
 
     @Test
@@ -99,7 +119,9 @@ class JobOrderFormTest {
 
     @Test
     fun `받지 않는 임무는 UNKNOWN_WORK_MASTER 이고 깨진 폼은 JOB_ORDER_BAD_REQUEST 다`() {
-        assertEquals(JobOrderForm.UNKNOWN_WORK_MASTER, rejected("""{"workMasterId":"DeliverContainer"}""").error)
+        assertEquals(JobOrderForm.UNKNOWN_WORK_MASTER, rejected("""{"workMasterId":"Teleport"}""").error)
+        // DeliverContainer 는 받는 임무지만 칸이 비면 깨진 폼이다.
+        assertEquals(JobOrderForm.BAD_REQUEST, rejected("""{"workMasterId":"DeliverContainer"}""").error)
         listOf(
             null,
             "작업 지시",
