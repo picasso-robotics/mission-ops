@@ -31,8 +31,15 @@ sealed interface HostCall<out T> {
      * [unreached] 는 호스트가 아무 답도 하지 않은 경우(연결 실패·시간 초과)만 참이다. 200 아닌 응답과 해석 못 한 본문은 호스트가
      * 답한 것이라 거짓이다. 읽는 쪽이 «닿지 못함» 과 «읽지 못함» 을 가를 때만 쓰고, 같음 비교는 그대로 [cause] 와 함께 한다.
      */
-    data class Silent(val cause: String, val unreached: Boolean = false) : HostCall<Nothing>
+    data class Silent(val cause: String, val unreached: Boolean = false, val refusal: HostJudgmentRefusal? = null) : HostCall<Nothing>
 }
+
+/**
+ * 호스트가 4xx 의 `{error, detail}` 로 판정을 거부한 것. [HostCall.Silent.refusal] 에 실린다 — 호스트가 답했으나 판정 행을 주지 않았다.
+ * 지금은 판정(`/host/eligibility`)의 400 `FLEET_PORT_ABSENT`(플릿 포트 없는 실행 호스트가 플릿 운반 단위가 든 계획을 받지 않음)를 읽는
+ * 쪽이 쓴다. 다른 4xx 도 같은 모양이면 실린다.
+ */
+data class HostJudgmentRefusal(val error: String, val detail: String)
 
 /**
  * 제출 한 번의 결과. 응답이 오면 코드와 본문을 그대로 넘기고, 분류는 부르는 쪽이 한다(스펙 §8).
@@ -444,6 +451,11 @@ class HostClient(
         val response = when (val write = post("/host/eligibility", body)) {
             is HostWrite.NoResponse -> return HostCall.Silent(write.cause)
             is HostWrite.Answered -> write
+        }
+        if (response.status in 400..499) {
+            val body = runCatching { json.readTree(response.body) }.getOrNull()?.takeIf { it.isObject }
+            val refusal = body?.get("error")?.takeIf { it.isTextual }?.let { HostJudgmentRefusal(it.asText(), body.get("detail")?.asText().orEmpty()) }
+            return HostCall.Silent("HTTP ${response.status}", refusal = refusal)
         }
         if (response.status != 200) return HostCall.Silent("HTTP ${response.status}")
         return read(response.body) { json.readValue<HostEligibilityList?>(it)?.robots }

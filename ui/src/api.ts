@@ -413,7 +413,7 @@ export const bindRobot = (session: Session, robotId: string, adapterVersionId: n
 export const recordSiteNames = (session: Session, robotId: string) =>
   send('POST', `/api/robots/${encodeURIComponent(robotId)}/site-names`, session)
 
-/** 작업 지시 폼이 내는 임무(S3a 스펙 §9.1). DeliverContainer 는 플릿 포트 구현이 없어 내지 않는다. */
+/** 작업 지시 폼이 내는 임무(S3a 스펙 §9.1). DeliverContainer 는 실행 호스트에 플릿 포트가 없어(`FLEET_PORT_ABSENT`) 내지 않는다. */
 export type WorkMasterId = 'InspectAsset' | 'PrepareSequencedRack'
 
 /** InspectAsset 의 점검 대상 하나. `location` 은 기체가 아는 명칭이어야 하나 화면이 검사하지 않는다. */
@@ -462,15 +462,20 @@ export interface RobotEligibility {
   gateTrial?: boolean
 }
 
-export type HostState = 'OK' | 'HOST_SILENT'
+/** 실행 호스트 판정의 상태. `HOST_REFUSED` 는 호스트가 답했으나 판정을 거부한 것이다(예: `FLEET_PORT_ABSENT`). 무응답과 다르다. */
+export type HostState = 'OK' | 'HOST_SILENT' | 'HOST_REFUSED'
 
-/** 운영 서비스의 `POST /api/job-orders/eligibility`. `robots` 가 null 이면 기체 목록을 한 번도 못 읽은 모름이다. */
+/**
+ * 운영 서비스의 `POST /api/job-orders/eligibility`. `robots` 가 null 이면 기체 목록을 한 번도 못 읽은 모름이다. `hostRefusal` 은 `host` 가
+ * `HOST_REFUSED` 일 때 호스트의 `{error, detail}` 이고 그 밖에는 null 이다(칸이 없던 본문은 undefined).
+ */
 export interface EligibilityView {
   checkedAt: string
   registry: RegistryState
   robotsAsOf: string | null
   host: HostState
   robots: RobotEligibility[] | null
+  hostRefusal?: { error: string; detail: string } | null
 }
 
 export type HostSubmitResult = 'ACCEPTED' | 'IDEMPOTENT' | 'REJECTED' | 'UNASSIGNED'
@@ -526,12 +531,19 @@ export interface JobOrderOutcome {
   outcome: HostSubmitOutcome | null
 }
 
-/** 실행의 단위 하나(S3a JSON 계약 §5). `reached` 는 그 단위가 얻은 근거 등급이다. */
+/** 단위의 경로(picasso `Route`). `ROBOT` 은 기체, `FLEET` 은 플릿에 맡긴 운반, `SIGNAL` 은 설비 대기다. */
+export type UnitRoute = 'ROBOT' | 'FLEET' | 'SIGNAL'
+
+/**
+ * 실행의 단위 하나(S3a JSON 계약 §5). `reached` 는 그 단위가 얻은 근거 등급이다. `route` 는 그 칸이 생기기 전에 적은 정착 본문에는
+ * 없다(«기록 없음», 추정하지 않는다).
+ */
 export interface ExecutionUnit {
   unitId: string
   skillType: string
   state: string
   reached: string
+  route?: UnitRoute | null
 }
 
 /** 실행의 마지막 작업 응답(S3a JSON 계약 §5). 상위 시스템이 없어 실행 호스트의 아웃박스에 남는다. */
@@ -861,10 +873,10 @@ export function manualJobOutcome(receipt: ManualReceipt): JobOrderOutcome {
 /** 화면이 편집하는 임무. 작업 지시 폼과 실행 호스트가 두 임무로 고정이라 하나만 편집한다(S3b 스펙 T6). */
 export const EDITABLE_WORK_MASTER = 'PrepareSequencedRack'
 
-/** 모의 실행의 단위 하나(S3b JSON 계약 §4.5). `route` 가 `SIGNAL` 이면 설비 대기 단위다. */
+/** 모의 실행의 단위 하나(S3b JSON 계약 §4.5). `route` 가 `SIGNAL` 이면 설비 대기, `FLEET` 이면 플릿 미믹에 맡긴 운반 단위다. */
 export interface MockRunUnit {
   unitId: string
-  route: 'ROBOT' | 'SIGNAL'
+  route: UnitRoute
   skillType: string
   state: string
   reached: string
@@ -872,15 +884,21 @@ export interface MockRunUnit {
 }
 
 /** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). 통과면 null 이다. */
-export type MockRunFailure = 'DEFINITION' | 'SUBMISSION_REJECTED' | 'NOT_SETTLED' | 'WALL_CLOCK_LIMIT' | 'EXECUTION_FAILED' | 'FLEET_ROUTE'
+export type MockRunFailure = 'DEFINITION' | 'SUBMISSION_REJECTED' | 'NOT_SETTLED' | 'WALL_CLOCK_LIMIT' | 'EXECUTION_FAILED'
 
 /**
- * 모의 실행 결과(S3b JSON 계약 §4.5). 가상 기체 하나와 이상적 현장으로 표본 작업 지시 하나를 끝까지 돌린 것이다. 실행이 서지
- * 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`·`FLEET_ROUTE`) `physicalState` 가 null 이고 `units` 가 비었다.
+ * 옛 모의 실행 행에만 남은 하위 범주. `FLEET_ROUTE` 는 플릿 경로 노드를 돌리지 않던 때의 실패다. 지금 실행 호스트는 플릿 노드를
+ * 인프로세스 플릿 미믹으로 돌려 이 값을 내지 않는다(표본이 용기를 못 채우면 `DEFINITION`).
+ */
+export type LegacyMockRunFailure = 'FLEET_ROUTE'
+
+/**
+ * 모의 실행 결과(S3b JSON 계약 §4.5). 가상 기체 하나·플릿 미믹 하나와 이상적 현장으로 표본 작업 지시 하나를 끝까지 돌린 것이다.
+ * 실행이 서지 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`, 옛 행의 `FLEET_ROUTE`) `physicalState` 가 null 이고 `units` 가 비었다.
  */
 export interface MockRunResult {
   passed: boolean
-  failure: MockRunFailure | null
+  failure: MockRunFailure | LegacyMockRunFailure | null
   detail: string | null
   robotId: string
   sample: { jobOrderId: string; requiredEvidence: string; slots: string[]; material: string; presentation: string; equipment?:{id:string;equipmentUse:string;properties:Record<string,string>}[] } | null
@@ -972,7 +990,8 @@ export interface HostMockRun extends HostJudgment<'PASSED' | 'FAILED' | 'REFUSED
   mockRun: MockRunView | null
 }
 
-export interface HostActivation extends HostJudgment<'ACTIVATED' | 'REFUSED' | 'MOCK_RUN_REQUIRED' | 'INPUT_UNKNOWN'> {
+/** 실행 호스트 활성화 결과. `FLEET_PORT_ABSENT` 는 플릿 경로 정의를 플릿 포트 없는 실행 호스트가 받지 않은 것이다(모의 실행 통과와 무관). */
+export interface HostActivation extends HostJudgment<'ACTIVATED' | 'REFUSED' | 'FLEET_PORT_ABSENT' | 'MOCK_RUN_REQUIRED' | 'INPUT_UNKNOWN'> {
   version: number | null
   lastMockRun: MockRunView | null
   activated: VersionView | null

@@ -31,7 +31,7 @@ class RequestInProgress(val requestId: UUID) : RuntimeException("그 요청 id �
  * - 검증·모의 실행: 검증 입력([SiteInputs])을 읽는 동안만 호스트 잠금을 잡는다. 그동안 DB 연결을 쥐지 않는다. 모의 실행은
  *   잠금을 놓은 뒤 별도 mimic·미들웨어로 돈다(실제 시간 몇 초).
  * - 활성화: 처음부터 끝까지 호스트 잠금 아래다. 판정과 배정 사이에 활성화가 끼면 한 제출 안에서 판정 계획과 실행 계획의
- *   버전이 갈린다. 다시 검증하고, 마지막 모의 실행을 보고, `DefinedCapability` 를 먼저 만들고, 버전 행을 넣고, 마지막에
+ *   버전이 갈린다. 다시 검증하고, 플릿 경로 정의면 플릿 포트를 보고, 마지막 모의 실행을 보고, `DefinedCapability` 를 먼저 만들고, 버전 행을 넣고, 마지막에
  *   카탈로그를 바꾼다. 행을 넣기 전에 케이퍼빌리티를 만드는 것은 만들다 실패한 정의가 버전 번호를 쓰지 않게 하려는 것이다.
  *
  * ## 처리 중인 요청(T9)
@@ -131,7 +131,7 @@ class MissionVersions(
             is Judgment.Unknown -> return outcome(INPUT_UNKNOWN, judgment, null)
         }
         // 검증이 지났으면 스냅숏이 있다(신호 사양을 읽었다).
-        val order = draft.sampleOrder?.let{dev.picasso.ops.host.web.HostRequests.jobOrder(json.readTree(it)).copy(jobOrderId="MOCK-$draftId")} ?: MockRunner.sampleOrder(draft.workMasterId, draftId, inputs.cell!!)
+        val order = draft.sampleOrder?.let{dev.picasso.ops.host.web.HostRequests.jobOrder(json.readTree(it)).copy(jobOrderId="MOCK-$draftId")} ?: MockRunner.sampleOrder(draft.workMasterId, draftId, inputs.cell!!, fleet = MockRunner.hasFleet(definition))
             ?: return outcome(INPUT_UNKNOWN, Judgment.Unknown(listOf(UnknownInput.SAMPLE_ORDER), emptyList()), null)
 
         val startedAt = store.now()
@@ -174,12 +174,15 @@ class MissionVersions(
             is Judgment.Refused -> return outcome(REFUSED, judgment, null, null)
             is Judgment.Unknown -> return outcome(INPUT_UNKNOWN, judgment, null, null)
         }
-        // 2. 그 초안의 마지막 모의 실행이 통과여야 한다. 앞 초안들의 모의 실행은 보지 않는다(S3b 스펙 §1).
         val last = store.lastMockRun(draft.draftId)
         val lastView = last?.let(::view)
+        // 2. 플릿 경로 노드를 든 정의는 이 호스트에 플릿 포트가 있어야 받는다. 모의 실행 통과(인프로세스 플릿 미믹)는 «정의가 끝까지
+        //    돈다» 일 뿐 «이 호스트에서 돈다» 가 아니다 — 활성화하면 운반을 맡길 곳이 없는 버전이 접수 경로에 선다.
+        if (!host.hasFleetPort && MockRunner.hasFleet(definition)) return outcome(FLEET_PORT_ABSENT, null, lastView, null)
+        // 3. 그 초안의 마지막 모의 실행이 통과여야 한다. 앞 초안들의 모의 실행은 보지 않는다(S3b 스펙 §1).
         if (last?.passed != true) return outcome(MOCK_RUN_REQUIRED, null, lastView, null)
 
-        // 3. 케이퍼빌리티 → 버전 행(번호 = 최대 + 1) → 카탈로그.
+        // 4. 케이퍼빌리티 → 버전 행(번호 = 최대 + 1) → 카탈로그.
         // 버전 행의 키 충돌은 요청 id 재사용으로 옮기지 않는다. 기본 키(WorkMaster, 버전) 충돌은 호스트 잠금 아래에서 번호를
         // 매기므로 닿지 않고, 요청 id 충돌은 위에서 이미 보았고 같은 요청 id 는 처리 중 집합이 동시에 들이지 않아 닿지 않는다.
         // 그래도 나면 호스트의 결함이라 500 으로 올린다.
@@ -225,6 +228,9 @@ class MissionVersions(
         const val INPUT_UNKNOWN = "INPUT_UNKNOWN"
         const val ACTIVATED = "ACTIVATED"
         const val MOCK_RUN_REQUIRED = "MOCK_RUN_REQUIRED"
+
+        /** 플릿 경로 노드를 든 정의인데 이 실행 호스트에 플릿 포트가 없다([MissionHost.hasFleetPort]). 활성화하지 않는다. */
+        const val FLEET_PORT_ABSENT = dev.picasso.ops.host.web.HostRequests.FLEET_PORT_ABSENT
 
         const val SOURCE_CODE = "CODE"
         const val SOURCE_DATA = "DATA"

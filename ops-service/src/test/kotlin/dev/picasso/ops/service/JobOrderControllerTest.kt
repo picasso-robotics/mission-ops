@@ -7,6 +7,7 @@ import dev.picasso.ops.service.JobOrderBench.Companion.INSPECT_FORM
 import dev.picasso.ops.service.JobOrderBench.Companion.QUADRUPED
 import dev.picasso.ops.service.JobOrderBench.Companion.missing
 import dev.picasso.ops.service.host.HostCall
+import dev.picasso.ops.service.host.HostJudgmentRefusal
 import dev.picasso.ops.service.joborders.EligibilityView
 import dev.picasso.ops.service.joborders.JobOrderForm
 import dev.picasso.ops.service.joborders.JobOrderOperations
@@ -105,6 +106,21 @@ class JobOrderControllerTest {
         assertEquals("$HUMANOID: 모자란 스킬: inspect / $QUADRUPED: 모자란 스킬: inspect", rejection.detail)
         assertEquals(emptyList(), bench.submitted)
         assertEquals(emptyList(), log.list())
+    }
+
+    @Test
+    fun `호스트가 판정을 FLEET_PORT_ABSENT 로 거부하면 판정 화면에 그 사유가 가고 제출은 400 FLEET_PORT_ABSENT 이며 기록하지 않는다`() {
+        bench.judge = { HostCall.Silent("HTTP 400", refusal = HostJudgmentRefusal(JobOrderOperations.FLEET_PORT_ABSENT, "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1")) }
+        val reply = submit("operator")
+        assertEquals(400, reply.statusCode.value())
+        val rejection = reply.rejection()
+        assertEquals(listOf(JobOrderOperations.FLEET_PORT_ABSENT, "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1"), listOf(rejection.error, rejection.detail))
+        assertEquals(emptyList(), bench.submitted)
+        assertEquals(emptyList(), log.list())
+
+        val judged = assertIs<dev.picasso.ops.service.joborders.EligibilityView>(controller.eligibility(INSPECT_FORM.toByteArray()).body)
+        assertEquals(dev.picasso.ops.service.joborders.HostState.HOST_REFUSED, judged.host, judged.toString())
+        assertEquals(JobOrderOperations.FLEET_PORT_ABSENT, judged.hostRefusal?.error, judged.toString())
     }
 
     @Test

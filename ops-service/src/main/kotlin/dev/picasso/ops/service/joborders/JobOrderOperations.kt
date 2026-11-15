@@ -45,6 +45,12 @@ sealed interface JobOrderSubmission {
 
     /** 배정 가능한 기체가 없다. [detail] 은 기체별 이유를 이은 문장이다. 조작 기록에 남지 않는다. */
     data class NoEligibleRobot(val detail: String) : JobOrderSubmission
+
+    /**
+     * 실행 호스트가 판정을 거부했다(예: 400 `FLEET_PORT_ABSENT`). 제출하지 않았고 조작 기록에 남지 않는다. [error]·[detail] 은 호스트의 것
+     * 그대로다 — «배정 가능한 기체 없음» 으로 접지 않는다.
+     */
+    data class HostRefused(val error: String, val detail: String) : JobOrderSubmission
 }
 
 /**
@@ -78,6 +84,7 @@ class JobOrderOperations(
         val jobOrderId = stableJobOrderId ?: jobOrderId(requestId)
         val order = JobOrderForm.jobOrder(draft, jobOrderId, json)
         val judged = eligibility.judge(order)
+        judged.hostRefusal?.let { return JobOrderSubmission.HostRefused(it.error, it.detail) }
         val candidates = judged.robots.orEmpty().filter { it.eligible }.map { it.robotId }
         if (candidates.isEmpty()) return JobOrderSubmission.NoEligibleRobot(noEligibleDetail(judged))
 
@@ -190,6 +197,9 @@ class JobOrderOperations(
     companion object {
         const val OP = "SUBMIT_JOB_ORDER"
         const val NO_ELIGIBLE_ROBOT = "NO_ELIGIBLE_ROBOT"
+
+        /** 실행 호스트의 판정 거부: 플릿 포트가 없어 플릿 운반 단위가 든 계획을 받지 않는다(실행 호스트 `HostRequests.FLEET_PORT_ABSENT`). */
+        const val FLEET_PORT_ABSENT = "FLEET_PORT_ABSENT"
         private val DATE: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
 
         /**

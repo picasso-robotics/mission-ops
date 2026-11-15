@@ -1,11 +1,13 @@
 package dev.picasso.ops.host
 
+import dev.picasso.middleware.DeliverContainer
 import dev.picasso.ops.host.HostBench.Companion.GHOST
 import dev.picasso.ops.host.HostBench.Companion.HUMANOID
 import dev.picasso.ops.host.HostBench.Companion.QUADRUPED
 import dev.picasso.ops.host.HostBench.Companion.inspect
 import dev.picasso.ops.host.HostBench.Companion.rack
 import dev.picasso.ops.host.HostBench.Companion.request
+import dev.picasso.ops.host.web.HostRequests
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -297,11 +299,12 @@ class MissionHostTest {
     @Test
     fun `받지 않는 WorkMaster 와 못 읽는 본문은 400 이고 JSON 이 아니면 415 다`() {
         HostBench().use { bench ->
-            val deliver = inspect("JO-1", "T1" to "bay-7").replace("InspectAsset", "DeliverContainer")
+            val malformed = inspect("JO-1", "T1" to "bay-7").replace("InspectAsset", "deliverContainer")
             listOf("/host/eligibility" to "robotIds", "/host/job-orders" to "candidates").forEach { (path, field) ->
-                val unknown = bench.post(path, request(deliver, field, HUMANOID))
+                val unknown = bench.post(path, request(malformed, field, HUMANOID))
                 assertEquals(400, unknown.status, "$path ${unknown.body}")
                 assertEquals("UNKNOWN_WORK_MASTER", unknown.body!!["error"].asText())
+                assertTrue(unknown.body["detail"].asText().startsWith("WorkMaster 이름이 아니다"), unknown.body.toString())
 
                 val broken = bench.post(path, "{not json")
                 assertEquals(400, broken.status, path)
@@ -319,6 +322,41 @@ class MissionHostTest {
                 assertEquals(415, text.status, path)
             }
             assertEquals(0, bench.get("/host/executions")["executions"].size())
+        }
+    }
+
+    /**
+     * 플릿 포트가 없는 호스트(지금 전부)는 플릿 단위가 든 계획을 판정·접수하지 않는다. 코드 임무 `DeliverContainer` 는 요청 파서가 받고
+     * (예전에는 UNKNOWN_WORK_MASTER 로 먼저 막았다) 계획이 플릿 운반 단위라 같은 사유 FLEET_PORT_ABSENT 로 막힌다. 실행도 기체 명령도 남지 않는다.
+     */
+    @Test
+    fun `플릿 운반 단위가 든 작업 지시는 판정과 접수 모두 400 FLEET_PORT_ABSENT 이고 실행이 서지 않는다`() {
+        HostBench().use { bench ->
+            bench.awaitPump()
+            assertEquals(false, bench.host.hasFleetPort)
+            val deliver = """{"jobOrderId":"WT-781","workMasterId":"${DeliverContainer.WORK_MASTER}","version":1,"requiredEvidence":"E2",""" +
+                """"parameters":{},"materialRequirements":[],"equipmentRequirements":[""" +
+                """{"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},""" +
+                """{"id":"SEQ-IN-02","equipmentUse":"destination","properties":{}}]}"""
+            // 고정 버전 CODE 도 같은 길이다. 용기가 빠진 주문도 계획이 플릿 단위(INCOMPLETE_ORDER)라 같다.
+            val pinned = deliver.removeSuffix("}") + ""","missionVersion":"CODE"}"""
+            val incomplete = deliver.replace(""""properties":{"container":"HU-1042"}""", """"properties":{}""")
+            listOf("/host/eligibility" to "robotIds", "/host/job-orders" to "candidates").forEach { (path, field) ->
+                listOf(deliver, pinned, incomplete).forEach { order ->
+                    val refused = bench.post(path, request(order, field, HUMANOID))
+                    assertEquals(400, refused.status, "$path ${refused.body}")
+                    assertEquals(HostRequests.FLEET_PORT_ABSENT, refused.body!!["error"].asText(), refused.body.toString())
+                    assertTrue(refused.body["detail"].asText().startsWith(HostRequests.FLEET_PORT_ABSENT_DETAIL), refused.body.toString())
+                    assertTrue(DeliverContainer.WORK_MASTER in refused.body["detail"].asText(), refused.body.toString())
+                }
+            }
+            assertTrue("HU-1042" in bench.post("/host/job-orders", request(deliver, "candidates", HUMANOID)).body!!["detail"].asText())
+            assertEquals(0, bench.get("/host/executions")["executions"].size())
+            assertEquals(0, bench.mimic.server.exclusive { bench.mimic.instance(HUMANOID)!!.tasks.all.size })
+
+            // 로봇 경로 작업 지시는 그대로 받는다 — 거절은 계획에 플릿 단위가 있을 때뿐이다.
+            val rack = bench.post("/host/job-orders", request(rack("JO-2", "RACK-204.S01"), "candidates", HUMANOID)).body!!
+            assertEquals("ACCEPTED", rack["result"].asText(), rack.toString())
         }
     }
 

@@ -396,12 +396,12 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 
 | 칸 | 값 |
 |---|---|
-| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(돌리기 전 검사에서 걸림, 돌지 않음: 표본으로 세운 계획이 비었거나 단위 id 가 겹침, 표본 작업 지시에 없는 반복 대상(최상위 단위 노드·반복 그룹의 `forEach`), 같은 신호를 기대 값이 다른 대기 노드 둘이 씀. 어느 것인지는 `detail` 이 말함) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님) · `FLEET_ROUTE`(플릿 경로 노드가 있음, 모의 실행 하네스에 플릿 포트가 없어 돌지 않음, `detail` 은 «플릿 경로 노드는 모의 실행할 수 없음(…)»: 노드 id) |
+| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(돌리기 전 검사에서 걸림, 돌지 않음: 표본으로 세운 계획이 비었거나 단위 id 가 겹침, 표본 작업 지시에 없는 반복 대상(최상위 단위 노드·반복 그룹의 `forEach`), 플릿 경로 단위의 용기·출발지·목적지를 표본이 채우지 못함(`detail` 은 «표본이 플릿 운반 단위를 채우지 못했습니다: <단위 id>(용기 없음, …)»), 같은 신호를 기대 값이 다른 대기 노드 둘이 씀. 어느 것인지는 `detail` 이 말함) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님). 옛 행에만 `FLEET_ROUTE`(플릿 경로 노드를 돌리지 않던 때의 실패)가 남아 있을 수 있고 지금 호스트는 내지 않는다. 플릿 경로 노드는 요청마다 새 인프로세스 플릿 미믹(picasso `fleet-mimic` 의 `AmrFleetMimic`)으로 돈다 |
 | `detail` | 실패의 화면용 한국어. 통과면 null |
 | `robotId` | 모의 실행 기체 id `mock-01`(현장 기체와 겹치지 않음) |
 | `sample` | 표본 작업 지시: 마지막 셀 스냅숏의 슬롯 앞 둘, 자재를 든 첫 제시 자리, 자재 수 = 슬롯 수, 요구 근거 E2. id 는 `MOCK-<draftId>` |
-| `physicalState` | 실행의 마지막 물리 상태. 실행이 서지 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`·`FLEET_ROUTE`) null |
-| `units` | 단위별 상태와 근거 등급. 실행이 서지 않았으면 `[]`. `route` 는 `ROBOT`·`SIGNAL`(대기 단위, `skillType` 은 `equipment_wait`), `state`·`reached` 는 S3a §5 의 단위 칸과 같은 이름이다 |
+| `physicalState` | 실행의 마지막 물리 상태. 실행이 서지 않았으면(`DEFINITION`·`SUBMISSION_REJECTED`, 옛 행의 `FLEET_ROUTE`) null |
+| `units` | 단위별 상태와 근거 등급. 실행이 서지 않았으면 `[]`. `route` 는 `ROBOT`·`FLEET`(플릿 미믹에 맡긴 운반, `skillType` 은 `transport`)·`SIGNAL`(대기 단위, `skillType` 은 `equipment_wait`), `state`·`reached` 는 S3a §5 의 단위 칸과 같은 이름이다 |
 | `virtualElapsedSeconds` | 표본 작업 지시 뒤 흐른 가상 시간(정수 초) |
 | `wallElapsedMillis` | 실제로 걸린 시간 |
 
@@ -440,12 +440,13 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 |---|---|---|---|---|---|
 | `ACTIVATED` | 활성화됨 | 선 버전과 그 행 | `[]` | null | 통과한 그 모의 실행 |
 | `REFUSED` | 다시 검증에서 거부 | null | 3.1 | null | null |
+| `FLEET_PORT_ABSENT` | 정의에 플릿 경로 노드가 있는데 실행 호스트에 플릿 포트가 없음. 마지막 모의 실행이 통과여도 활성화하지 않음(모의 실행 통과는 «이 호스트에서 돈다» 가 아님) | null | `[]` | null | 마지막 모의 실행 또는 null |
 | `MOCK_RUN_REQUIRED` | 그 초안의 마지막 모의 실행이 없거나 실패 | null | `[]` | null | 마지막 모의 실행(실패한 것) 또는 null |
 | `INPUT_UNKNOWN` | 신호 사양이나 현장 스킬을 모름. 활성화하지 않음 | null | `[]` | 3.2 | null |
 
-- 판정 순서가 위 순서라 거부와 모의 실행 없음이 함께면 `REFUSED` 다.
+- 판정 순서가 위 순서라 거부와 모의 실행 없음이 함께면 `REFUSED` 다. 플릿 포트 없음과 모의 실행 없음이 함께면 `FLEET_PORT_ABSENT` 다.
 - 앞 초안·다른 초안의 모의 실행은 보지 않는다. 같은 초안을 다시 활성화하면 새 버전 번호가 선다.
-- 버전 행만 남는다(`REFUSED`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` 은 아무것도 남지 않아 요청 id 재조회가 404).
+- 버전 행만 남는다(`REFUSED`·`FLEET_PORT_ABSENT`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` 은 아무것도 남지 않아 요청 id 재조회가 404).
 
 ### 4.7 `GET /host/missions/requests/{requestId}`
 
@@ -494,8 +495,8 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 
 | 엔드포인트 | 200 | 400 | 403 | 404 | 409 | 415 | 503 |
 |---|---|---|---|---|---|---|---|
-| `POST /host/eligibility` | 판정 | `UNKNOWN_WORK_MASTER`·`BAD_REQUEST` | | | | JSON 아님 | |
-| `POST /host/job-orders` | 결과 넷 | `UNKNOWN_WORK_MASTER`·`BAD_REQUEST` | | | | JSON 아님 | |
+| `POST /host/eligibility` | 판정 | `UNKNOWN_WORK_MASTER`·`FLEET_PORT_ABSENT`·`BAD_REQUEST` | | | | JSON 아님 | |
+| `POST /host/job-orders` | 결과 넷 | `UNKNOWN_WORK_MASTER`·`FLEET_PORT_ABSENT`·`BAD_REQUEST` | | | | JSON 아님 | |
 | `GET /host/executions` | 늘 | | | | | | |
 | `GET /host/cell` | 늘(`cell` null 가능) | | | | | | |
 | `GET /host/missions/{wm}` | 개요 | `UNKNOWN_WORK_MASTER` | | | | | |
@@ -503,7 +504,7 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 | `POST /host/missions/{wm}/drafts` | 저장 | `UNKNOWN_WORK_MASTER`·`BAD_REQUEST` | | | `REQUEST_ID_REUSED` | JSON 아님 | |
 | `POST .../drafts/{id}/validate` | 결과 셋 | `BAD_REQUEST` | | `DRAFT_NOT_FOUND` | | JSON 아님 | |
 | `POST .../drafts/{id}/mock-run` | 결과 넷 | `BAD_REQUEST` | | `DRAFT_NOT_FOUND` | `REQUEST_ID_REUSED` | JSON 아님 | |
-| `POST .../drafts/{id}/activate` | 결과 넷 | `BAD_REQUEST` | | `DRAFT_NOT_FOUND` | `REQUEST_ID_REUSED` | JSON 아님 | |
+| `POST .../drafts/{id}/activate` | 결과 다섯 | `BAD_REQUEST` | | `DRAFT_NOT_FOUND` | `REQUEST_ID_REUSED` | JSON 아님 | |
 | `GET /host/missions/requests/{id}` | 남은 행 | `BAD_REQUEST` | | `REQUEST_NOT_FOUND` | `REQUEST_IN_PROGRESS` | | |
 | `POST /host/cell/signals/{name}` | 현장 200 | 현장 400 | 현장 403 | 현장 404 | | 현장 415·호스트 415 | `CELL_SILENT` |
 | 현장 `GET /cell` | 늘 | | | (다른 경로) | | | |
@@ -523,7 +524,7 @@ S3a 그대로 호스트 `GET /host/cell` 의 200 본문을 해석 없이 넘긴�
 
 S3a §9.6 의 네 행은 그대로다. 임무 엔드포인트(`GET /api/missions/{workMasterId}`, 템플릿 읽기, 초안 저장·검증·모의 실행·활성화)와 `POST /api/cell/signals/{name}` 의 모양·상태 코드는 운영 서비스 영역이 S3b 스펙 §7 에 따라 정해 10절에 적었다(상태 코드는 §10.10). 맞춘 것:
 
-- 호스트 결과 → 조작 기록: `ACTIVATED` → `SUCCEEDED`, `REFUSED`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` → `REJECTED`(호스트 본문의 `result` 가 남음). 모의 실행 `PASSED`·`FAILED` 는 돌았으므로 둘 다 호스트가 받은 조작이다. 호스트 불통·5xx 는 `NO_RESPONSE` 와 4.7 재조회.
+- 호스트 결과 → 조작 기록: `ACTIVATED` → `SUCCEEDED`, `REFUSED`·`FLEET_PORT_ABSENT`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` → `REJECTED`(호스트 본문의 `result` 가 남음). 모의 실행 `PASSED`·`FAILED` 는 돌았으므로 둘 다 호스트가 받은 조작이다. 호스트 불통·5xx 는 `NO_RESPONSE` 와 4.7 재조회.
 - 409 `REQUEST_ID_REUSED` 는 운영 서비스가 같은 요청 id 를 두 번 보냈다는 뜻이다(재조회 대신 다시 보낸 경우).
 - 거부 → `Finding`: `target` null, `observed` 앞에 `노드 <nodeId>: `(nodeId 가 null 이면 붙이지 않음), `owner` ENGINEER → ENGINEER(`inScreen` 참), OUTSIDE_CONSOLE → SITE(`inScreen` 거짓), `basisVersion` 은 `Long` 으로, `checkedAt` 은 거부의 `checkedAt`.
 - 신호 조작의 재조회 대조는 `GET /host/cell` 의 `cell.signals[name].value`.
@@ -576,15 +577,15 @@ S3a §9.6 의 네 행은 그대로다. 임무 엔드포인트(`GET /api/missions
 | 모의 실행 | `PASSED`·`FAILED` | `SUCCEEDED`(돌았다) |
 | 모의 실행 | `REFUSED`·`INPUT_UNKNOWN` | `REJECTED` |
 | 활성화 | `ACTIVATED` | `SUCCEEDED` |
-| 활성화 | `REFUSED`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` | `REJECTED` |
+| 활성화 | `REFUSED`·`FLEET_PORT_ABSENT`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` | `REJECTED` |
 | 신호 조작 | (현장 200, 바뀐 신호, `name` 이 문자열) | `SUCCEEDED` |
 
-- 결과 이름은 호스트 본문의 `result` 에 그대로 남는다. **화면은 `REJECTED` 를 보고 거부 카드를 그리지 말고 호스트 본문의 `result` 로 가를 것.** `INPUT_UNKNOWN` 은 «모름»(호스트 `unknown.detail` 을 보인다), `MOCK_RUN_REQUIRED` 는 «통과한 모의 실행이 없다», `REFUSED` 만 거부 카드(`findings`)다.
+- 결과 이름은 호스트 본문의 `result` 에 그대로 남는다. **화면은 `REJECTED` 를 보고 거부 카드를 그리지 말고 호스트 본문의 `result` 로 가를 것.** `INPUT_UNKNOWN` 은 «모름»(호스트 `unknown.detail` 을 보인다), `MOCK_RUN_REQUIRED` 는 «통과한 모의 실행이 없다», `FLEET_PORT_ABSENT` 는 «이 실행 호스트에는 플릿 포트가 없어 플릿 운반 노드를 든 정의를 활성화하지 않는다», `REFUSED` 만 거부 카드(`findings`)다.
 - 2xx 인데 결과 이름이 그 조작의 것이 아니거나(예: 활성화에 `PASSED`), 거부 원소를 못 읽으면(모르는 `owner` 등) 본문을 못 읽은 것이라 `NO_RESPONSE` 와 재조회다.
 
 ### 10.2 거부 카드 `Finding`(호스트 거부 → 화면)
 
-호스트 결과가 `REFUSED` 일 때만 `findings` 에 거부마다 하나씩, 호스트 순서대로 온다. 그 밖(통과, `FAILED`, `INPUT_UNKNOWN`, `MOCK_RUN_REQUIRED`)은 `[]` 이다.
+호스트 결과가 `REFUSED` 일 때만 `findings` 에 거부마다 하나씩, 호스트 순서대로 온다. 그 밖(통과, `FAILED`, `INPUT_UNKNOWN`, `FLEET_PORT_ABSENT`, `MOCK_RUN_REQUIRED`)은 `[]` 이다.
 
 ```json
 {

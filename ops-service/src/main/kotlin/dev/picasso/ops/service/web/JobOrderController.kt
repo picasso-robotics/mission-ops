@@ -61,6 +61,9 @@ class JobOrderController(
             val accepted=requests.receiveManual(actor,value)
             when(accepted.receipt.state) {
                 "WAITING_RESOURCE" -> ResponseEntity.status(202).body(accepted)
+                // 호스트가 판정을 거부해 제출하지 않았다(FLEET_PORT_ABSENT). 접수 상세가 «코드: 문구» 이고 그 코드를 그대로 사전 거부로 낸다.
+                "REJECTED" -> hostRefusalOf(accepted.receipt)?.let { (code, detail) -> reject(HttpStatus.BAD_REQUEST, code, detail) }
+                    ?: ResponseEntity.ok(accepted.receipt.submission?.let{json.treeToValue(it,dev.picasso.ops.service.joborders.JobOrderOutcome::class.java)}?:accepted)
                 "UNASSIGNED" -> if(accepted.receipt.submission==null) reject(HttpStatus.BAD_REQUEST, JobOrderOperations.NO_ELIGIBLE_ROBOT,accepted.receipt.detail?:"미배정") else ResponseEntity.ok(json.treeToValue(accepted.receipt.submission,dev.picasso.ops.service.joborders.JobOrderOutcome::class.java))
                 else -> ResponseEntity.ok(accepted.receipt.submission?.let{json.treeToValue(it,dev.picasso.ops.service.joborders.JobOrderOutcome::class.java)}?:accepted)
             }
@@ -121,6 +124,17 @@ class JobOrderController(
 
     companion object {
         const val HOST_SILENT = "HOST_SILENT"
+
+        /** 판정을 거부하는 호스트 사유 가운데 제출 응답에 그대로 내는 것. 접수 상세가 «코드: 문구» 로 시작한다. */
+        val HOST_REFUSAL_CODES: Set<String> = setOf(JobOrderOperations.FLEET_PORT_ABSENT)
+
+        /** 제출하지 않은 거부 접수(`submission` 없음)의 상세가 [HOST_REFUSAL_CODES] 의 코드로 시작하면 (코드, 문구). 아니면 널. */
+        fun hostRefusalOf(receipt: dev.picasso.ops.service.requests.Receipt): Pair<String, String>? {
+            if (receipt.submission != null) return null
+            val detail = receipt.detail ?: return null
+            val code = HOST_REFUSAL_CODES.firstOrNull { detail.startsWith("$it: ") } ?: return null
+            return code to detail.removePrefix("$code: ")
+        }
 
         /** 실행 목록 페이지 인자가 틀렸다. 호스트에 닿지 않은 사전 거부다. */
         const val EXECUTIONS_BAD_REQUEST = "EXECUTIONS_BAD_REQUEST"

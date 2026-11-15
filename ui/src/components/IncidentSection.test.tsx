@@ -108,10 +108,23 @@ describe('인시던트', () => {
     const table = await within(region).findByRole('table', { name: '인시던트 목록' })
     expect(within(region).getByText('실행 호스트 인스턴스 mw-1, 인시던트 7건 가운데 최신 3건')).toBeInTheDocument()
     expect(within(table).getAllByRole('row').slice(1).map(cells)).toEqual([
-      ['incident-3', 'h30', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결', '보류 중'],
-      ['incident-2', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨', '-'],
-      ['incident-1', 'h5', '-', 'humanoid-01', 'exec-0', 'RACK-204.S01', 'GRASP_FAILED', 'ROBOT', '모름', '코드 정의', '판단 대상 아님', '-'],
+      ['incident-3', 'h30', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL(설비 대기)', '버전 2', '버전 3', '미해결', '보류 중'],
+      ['incident-2', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL(설비 대기)', '버전 2', '버전 3', '판단됨', '-'],
+      ['incident-1', 'h5', '-', 'humanoid-01', 'exec-0', 'RACK-204.S01', 'GRASP_FAILED', 'ROBOT(기체)', '모름', '코드 정의', '판단 대상 아님', '-'],
     ])
+  })
+
+  it('플릿 운반 인시던트의 경로 원문 FLEET 에 이름표를 붙이고 모르는 경로는 원문 그대로 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.incidents = incidentsView([
+      incidentRow({ incidentId: 'incident-2', unitId: 'HU-1042', failureClass: 'SOURCE_MISMATCH', route: 'FLEET' }),
+      incidentRow({ incidentId: 'incident-1', route: 'TELEPORT' }),
+    ])
+    open()
+    const table = await screen.findByRole('table', { name: '인시던트 목록' })
+    const [, fleet, unknown] = within(table).getAllByRole('row')
+    expect(cells(fleet)[7]).toBe('FLEET(플릿 운반)')
+    expect(cells(unknown)[7]).toBe('TELEPORT')
   })
 
   it('보류 중 강조는 held 인 줄에만 있고 미해결이어도 held 가 아니면 강조하지 않는다', async () => {
@@ -581,8 +594,8 @@ describe('재기동 뒤 인시던트', () => {
       '판단',
     ])
     expect(within(table).getAllByRole('row').slice(1).map(cells)).toEqual([
-      ['mw-0', 'incident-1', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '판단됨'],
-      ['mw-00', 'incident-2', 'h3', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL', '버전 2', '버전 3', '미해결'],
+      ['mw-0', 'incident-1', 'h10', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL(설비 대기)', '버전 2', '버전 3', '판단됨'],
+      ['mw-00', 'incident-2', 'h3', '-', 'humanoid-01', 'exec-1', 'rack-arrival', 'SIGNAL_DEADLINE', 'SIGNAL(설비 대기)', '버전 2', '버전 3', '미해결'],
     ])
     expect(within(table).queryByText('보류 중')).toBeNull()
     // 지금 인스턴스의 같은 id 줄은 지금 표에 따로 있다.

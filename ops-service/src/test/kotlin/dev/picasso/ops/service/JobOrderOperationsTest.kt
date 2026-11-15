@@ -8,6 +8,7 @@ import dev.picasso.ops.service.JobOrderBench.Companion.pass
 import dev.picasso.ops.service.actor.Actor
 import dev.picasso.ops.service.actor.Mode
 import dev.picasso.ops.service.host.HostCall
+import dev.picasso.ops.service.host.HostJudgmentRefusal
 import dev.picasso.ops.service.host.HostReads
 import dev.picasso.ops.service.host.HostSubmitResult
 import dev.picasso.ops.service.host.HostWrite
@@ -133,6 +134,15 @@ class JobOrderOperationsTest {
         bench.judge = { ids -> HostCall.Ok(ids.map { missing(it, "inspect") }) }
         val submission = assertIs<JobOrderSubmission.NoEligibleRobot>(operations.submit(kim, draft))
         assertEquals("$HUMANOID: 모자란 스킬: inspect / $QUADRUPED: 모자란 스킬: inspect", submission.detail)
+        assertEquals(emptyList(), bench.submitted)
+        assertEquals(emptyList(), log.list())
+    }
+
+    @Test
+    fun `호스트가 판정을 FLEET_PORT_ABSENT 로 거부하면 그 사유 그대로 답하고 제출하지 않고 기록하지 않는다`() {
+        bench.judge = { HostCall.Silent("HTTP 400", refusal = HostJudgmentRefusal(JobOrderOperations.FLEET_PORT_ABSENT, "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1")) }
+        val submission = assertIs<JobOrderSubmission.HostRefused>(operations.submit(kim, draft))
+        assertEquals(JobOrderSubmission.HostRefused(JobOrderOperations.FLEET_PORT_ABSENT, "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1"), submission)
         assertEquals(emptyList(), bench.submitted)
         assertEquals(emptyList(), log.list())
     }

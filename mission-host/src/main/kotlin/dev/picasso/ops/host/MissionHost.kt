@@ -11,10 +11,12 @@ import dev.picasso.contracts.v1.Fault
 import dev.picasso.contracts.v1.HoldKind
 import dev.picasso.contracts.v1.TaskState
 import dev.picasso.middleware.ActiveMission
+import dev.picasso.middleware.AmrFleetPort
 import dev.picasso.middleware.ApprovalAttempt
 import dev.picasso.middleware.ApprovalOutcome
 import dev.picasso.middleware.ApprovalRefusal
 import dev.picasso.middleware.Approver
+import dev.picasso.middleware.DeliverContainer
 import dev.picasso.middleware.ApproverKind
 import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.Evidence
@@ -28,6 +30,7 @@ import dev.picasso.middleware.InspectAsset
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.JobResponse
 import dev.picasso.middleware.JudgmentRecordWire
+import dev.picasso.middleware.LogicalCapability
 import dev.picasso.middleware.Middleware
 import dev.picasso.middleware.OperatorDecision
 import dev.picasso.middleware.PhysicalState
@@ -282,6 +285,8 @@ data class SourceUnobservedView(val material: String?, val source: String, val o
  * 실행의 단위 하나. [reached] 는 단위가 이른 근거 등급이다.
  *
  * @param attempt 단위의 지금 시도(picasso `ExecutionUnit.attempt`). 이 칸이 생기기 전에 적은 정착 본문은 `null` 이다
+ * @param route 단위의 경로(picasso `Route` 이름: `ROBOT`·`FLEET`·`SIGNAL`). 이 칸이 생기기 전에 적은 정착 본문에는 없어 화면이 «기록 없음» 으로
+ *   보인다 — 스킬 이름 따위로 추정하지 않는다
  * @param decision 그 단위의 판단 기록 판단(picasso `JudgmentRecord` 의 단위 `decision`, 가장 최근 하나). 운영 서비스의 판단 재조회가 대상·시도·판단으로
  *   대조하는 자리다(§15.323). 판단이 없거나 이 칸이 생기기 전의 본문이면 `null` 이다
  */
@@ -292,6 +297,7 @@ data class UnitView(
     val reached: String,
     val attempt: Int? = null,
     val decision: UnitDecisionView? = null,
+    val route: String? = null,
 )
 
 /**
@@ -595,12 +601,22 @@ class MissionHost(
     private val signals = CellBandSignals()
 
     /**
+     * 이 호스트의 플릿 포트. 지금은 늘 없다(`AmrFleetPort.None`) — 플릿 세계를 site 프로세스에 두고 잇는 것은 2단계다. 그래서 플릿 경로
+     * 정의의 활성화([dev.picasso.ops.host.mission.MissionVersions.FLEET_PORT_ABSENT])와 플릿 단위가 든 계획의 새 접수([refuseFleetPlan])를
+     * 명시 사유로 거절한다. 모의 실행은 이것과 무관하게 인프로세스 플릿 미믹으로 돈다.
+     */
+    private val fleetPort: AmrFleetPort = AmrFleetPort.None
+
+    /** 이 호스트에 플릿 포트가 있는가. 없으면 플릿 운반을 맡길 곳이 없다. */
+    val hasFleetPort: Boolean get() = fleetPort !== AmrFleetPort.None
+
+    /**
      * `instanceId` 를 넘기지 않는다 — picasso 기본값(`mw-<UUID>`)이 생성마다 새 값이다. 그 값이 인시던트 열쇠(`incidentKey`)의 유일성을
      * 진다(picasso §15.322): 인시던트 id 는 재기동마다 `incident-1` 부터 다시 세므로, 고정하면 다른 사건이 같은 열쇠를 얻어 읽는 쪽이
      * 서로 다른 보류를 한 사건으로 접는다. 실행 일지·사본·송신 기록의 인스턴스 칸도 이 값이다.
      */
     private val middleware = Middleware(
-        robots = robots, cell = signals, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
+        robots = robots, cell = signals, fleet = fleetPort, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
         retirements = retirements, entitlements = entitlements, retention = retention,
     )
 
@@ -679,6 +695,20 @@ class MissionHost(
      * 메모리에만 둔다. picasso 의 제안 장부도 메모리라 재기동 뒤에는 같이 없다.
      */
     private val trialProposals = mutableMapOf<Pair<String, String>, Set<Long>>()
+
+    /**
+     * 실행을 세우지 못한 마지막 제출의 작업 지시(작업 지시 id → 작업 지시). 값 없는 승인([attemptApproval])이 승인으로 설 계획을 미리 세워 플릿
+     * 차단([fleetPlanRefusal])을 보려고 든다 — picasso 는 제안의 작업 지시를 밖에 내주지 않는다. 제안처럼 메모리에만 있고 [proposedOrdersLimit] 개를
+     * 넘으면 오래된 것부터 버린다. 상한은 미들웨어에 넘긴 picasso 제안 보존 상한(`Retention.proposals`)과 같다 — 이 인스턴스의 picasso 가 든
+     * 제안이면 호스트도 그 작업 지시를 든다. 이 인스턴스가 받은 제출이 아니면 승인이 그 계획을 미리 보지 못한다(그런 제안은 플릿 차단을 지난
+     * 제출에서만 서므로 같은 임무면 계획에 플릿 단위가 없다). 호스트 잠금 아래에서만 읽고 쓴다.
+     */
+    private val proposedOrders = object : LinkedHashMap<String, JobOrder>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, JobOrder>?) = size > proposedOrdersLimit
+    }
+
+    /** [proposedOrders] 의 상한. 미들웨어에 넘긴 picasso 제안 보존 상한(`Retention.proposals`) 그대로다. */
+    internal val proposedOrdersLimit: Int = retention.proposals
 
     /**
      * 이 인스턴스에서 건 운영자 취소. 실행 id 에서. 이전 인스턴스의 취소는 그 작업 지시를 다시 지은 실행에 다시 건 것만 싣는다([carryCancel]).
@@ -898,6 +928,11 @@ class MissionHost(
      * @return 결과, RESTORED 의 실행 id, DEFERRED·GAVE_UP 의 사유
      */
     private fun resumed(waiting: Deferred): Triple<RestoreResult, String?, String?> {
+        // 다시 지을 계획에 플릿 단위가 있으면 다시 짓지 않고 포기한다(사유 `FLEET_PORT_ABSENT`). 운반을 맡길 곳 없이 실행을 세우면 실패 운반으로
+        // 조용히 정착한다. 포기한 행은 운영자 종결 대상이 된다(복원 못 한 실행).
+        fleetPlanRefusal(checkNotNull(waiting.order), checkNotNull(waiting.mission).capability)?.let {
+            return Triple(RestoreResult.GAVE_UP, null, "${HostRequests.FLEET_PORT_ABSENT}: $it")
+        }
         val cancel = records.cancelOf(waiting.row.jobOrderId)
         val stored = records.latestJudgmentRecord(waiting.row.jobOrderId)
         val record = stored?.let {
@@ -1033,8 +1068,16 @@ class MissionHost(
         robotRestrictions(attempt.robotId, siteTimings.current() != null, revising = existing?.executionId, holds = !excepted).takeIf { it.isNotEmpty() }?.let { reasons ->
             return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "실행 호스트 판정: ${reasons.joinToString("; ")}")
         }
+        // 승인으로 설 계획에 플릿 단위가 있으면 미들웨어를 부르지 않는다(제안은 지우지 않는다 — 관문 거절과 같다). 계획은 제출 때 받은 작업 지시를
+        // 실행이 있으면 그 실행의 케이퍼빌리티로, 없으면 지금 활성 임무로 세운다(picasso 승인 접수가 그렇게 계획한다).
+        proposedOrders[attempt.jobOrderId]?.let { order ->
+            fleetPlanRefusal(order, existing?.capability ?: catalog.active(order.workMasterId)?.capability)?.let {
+                return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "${HostRequests.FLEET_PORT_ABSENT}: $it")
+            }
+        }
         val outcome = approve(middleware, attempt)
         if (outcome is ApprovalOutcome.Approved) {
+            proposedOrders.remove(attempt.jobOrderId)
             if (!existed && excepted) {
                 // 표시 기체의 회복 실행은 일지·판단 기록·표시 연결을 한 트랜잭션에 적는다 — 승인된 조치 열이 복원 기록에서 빠지지 않게.
                 val execution = middleware.executions().first { it.executionId == outcome.executionId }
@@ -1064,7 +1107,7 @@ class MissionHost(
     /** 기체마다 호스트 판정을 낸다. [order] 의 WorkMaster 는 부르는 쪽이 [WORK_MASTERS] 로 거른다. */
     private fun selectedMission(workMaster:String,version:String?):dev.picasso.middleware.ActiveMission? {
         if(version==null){if(catalog.active(workMaster)==null)throw BadRequest(HostRequests.UNKNOWN_WORK_MASTER,"활성화하지 않은 임무입니다: $workMaster");return null}
-        if(version=="CODE"){if(workMaster !in WORK_MASTERS)throw BadRequest(HostRequests.BAD_REQUEST,"새 임무는 숫자 버전이 필요합니다");return catalog.mission(workMaster,null)}
+        if(version=="CODE"){if(workMaster !in CODE_WORK_MASTERS)throw BadRequest(HostRequests.BAD_REQUEST,"새 임무는 숫자 버전이 필요합니다");return catalog.mission(workMaster,null)}
         val number=version.toIntOrNull()?.takeIf{it>0 && it.toString()==version}
             ?: throw BadRequest(HostRequests.BAD_REQUEST,"고정 임무 버전이 잘못되었습니다")
         val row=store.version(workMaster,number)
@@ -1072,7 +1115,30 @@ class MissionHost(
         return catalog.mission(workMaster,row)
     }
     fun eligibility(order:JobOrder,robotIds:List<String>,missionVersion:String?=null):List<HostEligibility> = lock.withLock {
-        catalog.withMission(order.workMasterId,selectedMission(order.workMasterId,missionVersion)) { eligibilityCurrent(order,robotIds) }
+        catalog.withMission(order.workMasterId,selectedMission(order.workMasterId,missionVersion)) {
+            refuseFleetPlan(order)
+            eligibilityCurrent(order,robotIds)
+        }
+    }
+
+    /**
+     * **플릿 차단의 한 자리.** 플릿 포트가 없는 호스트([hasFleetPort])에서 [capability] 로 [order] 를 계획해 플릿 경로 단위가 하나라도 있으면
+     * 그 거절 문구(`FLEET_PORT_ABSENT` 의 detail)를, 아니면 `null` 을 낸다. 실행을 세우는 입구가 모두 이것을 부른다 — 판정·새 접수와
+     * 개정([refuseFleetPlan]), 값 없는 승인([attemptApproval]), 기동 복원([resumed]). 받으면 운반이 맡겨지지 않은 채 실행이 선다.
+     */
+    private fun fleetPlanRefusal(order: JobOrder, capability: LogicalCapability?): String? {
+        if (hasFleetPort || capability == null) return null
+        val fleet = capability.plan(order).filter { it.route == Route.FLEET }
+        if (fleet.isEmpty()) return null
+        return "${HostRequests.FLEET_PORT_ABSENT_DETAIL}: ${order.workMasterId} 의 플릿 운반 단위 ${fleet.joinToString(", ") { it.unitId }}"
+    }
+
+    /**
+     * [fleetPlanRefusal] 을 400 `FLEET_PORT_ABSENT`([HostRequests.FLEET_PORT_ABSENT])로 던진다. [capability] 의 기본은 고른 임무다(고른 임무
+     * 아래, [StoredMissionCatalog.withMission] 에서 부른다). 코드 임무 `DeliverContainer` 도 이 길로 거절한다(계획이 늘 플릿 단위다).
+     */
+    private fun refuseFleetPlan(order: JobOrder, capability: LogicalCapability? = catalog.active(order.workMasterId)?.capability) {
+        fleetPlanRefusal(order, capability)?.let { throw BadRequest(HostRequests.FLEET_PORT_ABSENT, it) }
     }
     private fun eligibilityCurrent(order: JobOrder, robotIds: List<String>): List<HostEligibility> = lock.withLock {
         val applied = siteTimings.current() != null
@@ -1109,7 +1175,16 @@ class MissionHost(
      * 출발 자리 확인)이 관문 확인으로 제안을 다시 세우지 않게 한다. 철회 행은 DB 에 있어 재기동 뒤에도 같다.
      */
     fun submit(order:JobOrder,candidates:List<String>,missionVersion:String?=null,confirmations:List<SourceConfirmation> = emptyList()):SubmitOutcome = lock.withLock {
-        catalog.withMission(order.workMasterId,selectedMission(order.workMasterId,missionVersion)) { submitCurrent(order,candidates,confirmations) }
+        catalog.withMission(order.workMasterId,selectedMission(order.workMasterId,missionVersion)) {
+            // 새 접수는 고른 임무로, 개정은 그 실행이 쥔 케이퍼빌리티로 계획해 거른다. 개정이 아닌 재전송(같은 판 IDEMPOTENT, 낮은 판 거부 등)은
+            // 계획을 새로 세우지 않으므로 거르지 않는다.
+            val existing = middleware.executions().firstOrNull { it.order.jobOrderId == order.jobOrderId }
+            when {
+                existing == null -> refuseFleetPlan(order)
+                revises(existing, order) -> refuseFleetPlan(order, existing.capability)
+            }
+            submitCurrent(order,candidates,confirmations)
+        }
     }
     private fun submitCurrent(order: JobOrder, candidates: List<String>, confirmations: List<SourceConfirmation>): SubmitOutcome = lock.withLock {
         if (journalBlocked().isNotEmpty()) return@withLock SubmitOutcome(SubmitResult.REJECTED, null, null, "실행 일지 저장 실패: 호스트 복구 전 제출 차단", emptyList(), emptyList())
@@ -1152,6 +1227,9 @@ class MissionHost(
         } finally {
             signals.confirmations = emptyMap()
         }
+        // 실행을 세우지 못한 제출의 작업 지시는 승인이 미리 계획해 보도록 든다([proposedOrders]). 실행이 서면 지운다.
+        if (assigned is Middleware.Submission.Rejected || assigned is Unassigned) proposedOrders[order.jobOrderId] = order
+        else proposedOrders.remove(order.jobOrderId)
         when (val submission = assigned) {
             is Middleware.Submission.Accepted -> {
                 if (!existed) {
@@ -1447,6 +1525,9 @@ class MissionHost(
      * 그대로다 — 건너뛴 단위의 술어(`PREDECESSOR_NOT_DONE` ∧ 태스크 빔)를 호스트가 사본으로 들면 picasso 의 묶음 규칙과 갈린다. 호스트는 보존 만료
      * 시각만 덧붙인다.
      *
+     * 플릿 단위는 묶음에 들지 않는다 — picasso 의 묶음은 로봇 단위만 뿌리로 삼고, 선행으로 딸려 오는 단위는 같은 반복 그룹 안인데 그룹 안에는
+     * 플릿 단위가 올 수 없다(picasso 규칙에 기댄다). 호스트는 따로 거르지 않는다.
+     *
      * `FAILED` 는 지금의 종결 기록을 적은 실행만 싣고([settleRecorded]) 보존 만료 시각을 그 기록 시각에서 정한다. 기록을 적기 전이면
      * 만료 시각을 모르므로 싣지 않는다. 한 pump 안에 지난다. `PARTIAL` 은 만료가 없다. picasso 후보는 이 둘 밖의 상태를 내지 않지만, 내면
      * 싣지 않는다(만료를 정할 수 없다). [latest] 는 [latestResponses] 다. 호스트 잠금 아래에서 부른다.
@@ -1526,7 +1607,7 @@ class MissionHost(
                         val decision = decisions[unit.unitId]?.let {
                             UnitDecisionView(it.decision.name, it.approver.id, it.approver.kind.name, it.at, it.attempt)
                         }
-                        UnitView(unit.unitId, unit.skillType, unit.state.name, unit.reached.name, unit.attempt, decision)
+                        UnitView(unit.unitId, unit.skillType, unit.state.name, unit.reached.name, unit.attempt, decision, unit.route.name)
                     },
                     jobResponse = responses[execution.executionId]?.let(::view),
                     restoredFrom = restoredFrom[execution.executionId],
@@ -2762,7 +2843,13 @@ class MissionHost(
          */
         const val EVICTED = "EVICTED"
 
-        /** 받는 WorkMaster. DeliverContainer 는 플릿 포트 구현이 없어 받지 않는다(스펙 §1). */
+        /** 받는 로봇 경로 코드 WorkMaster. 작업 지시 폼이 내는 둘이다. */
         val WORK_MASTERS: Set<String> = setOf(InspectAsset.WORK_MASTER, PrepareSequencedRack.WORK_MASTER)
+
+        /**
+         * 코드 정의가 있는 WorkMaster. [WORK_MASTERS] 에 플릿 운반 코드 임무 `DeliverContainer` 를 더한 것이다 — 요청 파서는 그것을 받고,
+         * 플릿 포트가 없는 이 호스트는 계획에서 `FLEET_PORT_ABSENT` 로 거절한다([refuseFleetPlan]).
+         */
+        val CODE_WORK_MASTERS: Set<String> = WORK_MASTERS + DeliverContainer.WORK_MASTER
     }
 }

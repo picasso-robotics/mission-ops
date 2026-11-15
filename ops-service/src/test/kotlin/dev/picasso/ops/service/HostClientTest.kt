@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpServer
 import dev.picasso.ops.service.host.HostCall
 import dev.picasso.ops.service.host.HostClient
 import dev.picasso.ops.service.host.HostEligibility
+import dev.picasso.ops.service.host.HostJudgmentRefusal
 import dev.picasso.ops.service.host.HostSkillFit
 import dev.picasso.ops.service.host.HostWrite
 import java.net.InetSocketAddress
@@ -79,7 +80,12 @@ class HostClientTest {
     @Test
     fun `판정이 200 아님이나 모양 어긋남이면 모름이다`() {
         val client = serve("/host/eligibility" to (400 to """{"error":"BAD_REQUEST","detail":"x"}"""))
-        assertEquals(HostCall.Silent("HTTP 400"), client.eligibility(order, listOf("r1")))
+        // 호스트가 답한 4xx 의 {error, detail} 은 거부로 싣는다 — «무응답» 과 같은 칸에 두되 사유를 잃지 않는다.
+        assertEquals(HostCall.Silent("HTTP 400", refusal = HostJudgmentRefusal("BAD_REQUEST", "x")), client.eligibility(order, listOf("r1")))
+        val fleet = serve("/host/eligibility" to (400 to """{"error":"FLEET_PORT_ABSENT","detail":"이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1"}"""))
+        assertEquals(HostCall.Silent("HTTP 400", refusal = HostJudgmentRefusal("FLEET_PORT_ABSENT", "이 실행 호스트에는 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 받지 않습니다: ContainerSupply 의 플릿 운반 단위 HU-1")), fleet.eligibility(order, listOf("r1")))
+        // {error, detail} 모양이 아닌 4xx 는 거부를 싣지 않는다.
+        assertEquals(HostCall.Silent("HTTP 415"), serve("/host/eligibility" to (415 to "")).eligibility(order, listOf("r1")))
         stop()
         val odd = serve("/host/eligibility" to (200 to """{"robots":[{"robotId":"r1","skillFit":"MAYBE","passed":true}]}"""))
         assertIs<HostCall.Silent>(odd.eligibility(order, listOf("r1")))

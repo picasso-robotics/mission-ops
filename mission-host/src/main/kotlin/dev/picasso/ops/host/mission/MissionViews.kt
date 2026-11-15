@@ -175,7 +175,8 @@ data class MockRunOutcomeView(
 )
 
 /**
- * 활성화 결과(S3b 스펙 §6.5). [result] 는 `ACTIVATED`·`REFUSED`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` 넷이다.
+ * 활성화 결과(S3b 스펙 §6.5). [result] 는 `ACTIVATED`·`REFUSED`·`FLEET_PORT_ABSENT`·`MOCK_RUN_REQUIRED`·`INPUT_UNKNOWN` 다섯이다.
+ * `FLEET_PORT_ABSENT` 는 정의에 플릿 경로 노드가 있는데 이 실행 호스트에 플릿 포트가 없어 받지 않은 것이다(모의 실행 통과와 무관).
  *
  * @param version ACTIVATED 일 때 선 버전. 그 밖에는 `null`.
  * @param activated ACTIVATED 일 때 그 버전 행. 그 밖에는 `null`.
