@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import {
   EDITABLE_WORK_MASTER,
   activateMissionDraft,
+  fetchExecutionSummary,
   fetchMission,
   fetchMissionTemplates,
   mockRunMissionDraft,
   saveMissionDraft,
   validateMissionDraft,
 } from '../api'
-import type { DraftView, MissionOverview, MissionTemplate, MissionTemplates, Session } from '../api'
+import type { DraftView, ExecutionSummary, MissionOverview, MissionTemplate, MissionTemplates, Session } from '../api'
 import { TEMPLATE_LABEL, mockRunVerdict } from '../labels'
 import { POLL_MS } from '../poll'
 import type { HostRead } from './ExecutionList'
@@ -58,6 +59,13 @@ export function MissionDefinitionEditor({ session, onChanged, onOverview, sectio
   const [problem, setProblem] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [last, setLast] = useState<MissionSent | null>(null)
+  // 플릿 운반 모의 실행 안내가 이 호스트의 플릿 연결을 말하려고 읽는다. 못 읽으면 모름(단정하지 않음).
+  const [fleet, setFleet] = useState<ExecutionSummary['fleet']>(undefined)
+  useEffect(() => {
+    let alive = true
+    fetchExecutionSummary(session).then((value) => { if (alive) setFleet(value.fleet) }).catch(() => { if (alive) setFleet(undefined) })
+    return () => { alive = false }
+  }, [session, tick])
 
   useEffect(() => {
     const timer = setInterval(() => setTick((value) => value + 1), POLL_MS)
@@ -208,7 +216,7 @@ export function MissionDefinitionEditor({ session, onChanged, onOverview, sectio
       {engineer ? (
         <section aria-label="임무 편집">
           <h2>편집</h2>
-          {last !== null && <MissionNotice last={last} />}
+          {last !== null && <MissionNotice last={last} fleet={fleet} />}
           <Templates
             templates={templateList}
             error={templates.error}
@@ -333,7 +341,7 @@ export function MissionDefinitionEditor({ session, onChanged, onOverview, sectio
                             <summary>
                               {mockRunVerdict(draft.lastMockRun)} {draft.lastMockRun.finishedAt}
                             </summary>
-                            <MockRunReport run={draft.lastMockRun} />
+                            <MockRunReport run={draft.lastMockRun} fleet={fleet} />
                           </details>
                         )}
                       </td>

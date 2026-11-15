@@ -171,6 +171,13 @@
 | 퇴역 기체 대기 | 운영 › «실행» 물리 상태 칸 아래 region «퇴역 기체 대기»(까닭이 모두 퇴역일 때, 작업 허가 대기와 같은 region), 작업 요청 상세의 같은 region. 새 로봇 명령(단위 출발, 개정 갱신, 미확정 조회)을 내지 않고 실행 목록 칸 `permitBlock`(작업 허가 대기와 같은 칸)에 `INHIBITED`, 까닭 `RETIRED`(화면 라벨 «퇴역»), 막는 주체는 퇴역 사유, 풀릴 근거 «운영자가 이 기체의 퇴역을 취소할 때». 단위는 `PENDING`, 물리 상태는 운영자 보류가 아님. 도는 단위는 끊지 않음. | 기체 화면에서 그 기체의 퇴역을 취소(복귀)하면 실행 호스트가 다음 읽기(기본 2초) 뒤 pump 에 명령을 냅니다. 결함 해제나 보류 판단으로는 풀리지 않습니다. | 실행 호스트 시험 `RetirementHostTest` 의 `퇴역한 기체에는 새 명령을 내지 않고 퇴역 사유가 차단으로 보이며 퇴역을 취소하면 낸다`, 화면 시험 `PermitBlockNotice.test.tsx` 의 `퇴역만으로 막힌 실행은 퇴역의 제목과 안내를 보이고 안전 신호와 운영자 판단 불가 안내는 보이지 않는다`. |
 | 실행 호스트 응답 없음 | 운영 › «실행» 스테이션 상태 `WAITING_READY`, 사유 «실행 호스트 응답 없음; 작업 번호를 쓰지 않고 작업 요청을 내지 않습니다: …» | 운영자 조작은 없음. 실행 호스트 또는 네트워크를 복구합니다. 실행 호스트가 다시 응답하면 «실행 호스트 응답 복귀; 설비 준비 기한을 다시 셉니다»로 설비 준비가 이어집니다. | `StationCoordinatorTest` 의 `호스트가 응답하지 않으면 허가를 대기한다고 하지 않고 호스트 응답 없음으로 작업 번호를 쓰지 않고 설비 준비 기한을 멈춘다`, `호스트가 다시 응답하면 호스트 응답 복귀로 설비 준비 기한을 다시 세고 준비되면 작업 번호를 쓴다`, `호스트가 응답하지 않다 허가가 막는다고 돌아오면 사유만 바꿔 다시 대기하고 호스트가 허가와 함께 돌아오면 풀린다` |
 
+### D1-6 플릿 운반 중 실행 호스트 재기동
+- 사전 조건: 실행 호스트를 `HOST_FLEET_URL=http://127.0.0.1:<SITE_CELL_PORT>`(또는 `--host.fleet.url=…`)로 띄웁니다. 주소에 `/fleet` 를 붙이지 않습니다(서버 주소만, 붙이면 기동이 멈춤). 기동 탐침(`GET /fleet/world`)이 4xx 면 기동이 멈추고, 현장이 안 떠 있거나 5xx 면 경고만 남기고 뜹니다. 운영 개요 «호스트 실행 관측» 의 «플릿 연결» 이 그 주소여야 합니다(«없음» 이면 플릿 포트가 없어 `DeliverContainer` 가 `FLEET_PORT_ABSENT` 로 거절됨). 현장 플릿 세계는 `GET http://127.0.0.1:<SITE_CELL_PORT>/fleet/world` 로 봅니다. 출발 인계점에 용기를 두려면 `POST /fleet/world/place`(`{"location":"OUT-07","containerId":"HU-1042"}`, `Content-Type: application/json`)를 현장에 직접 보냅니다 — 실행 호스트·운영 서비스·화면은 세계 채우기를 중계하지 않습니다. 배정 가능한 기체가 정확히 하나여야 플릿 전용 계획이 받아집니다(둘 이상이면 `FLEET_ONLY_CANDIDATES`).
+- 조작: 운영 서비스 `POST /api/job-orders`(운영자 모드, 본문 `{"workMasterId":"DeliverContainer","container":"HU-1042","source":"OUT-07","destination":"LINE-IN-03"}`)로 운반 하나를 내고, `GET /fleet/world` 의 `dispatches` 와 운반 상태가 인수(`PICKED_UP`) 뒤인 것을 본 다음 실행 호스트만 D1-1 처럼 다시 띄웁니다. 현장은 내리지 않습니다.
+- 확인할 곳: 운영 → «실행» 의 복원 보고와 그 실행의 기체 칸(«묶인 기체(실행 주체 아님)»), 단위 경로 «플릿 운반», 현장 `GET /fleet/world` 의 `dispatches`, 운영 › 실행 뷰의 셀 대역 인계 자리(`GET /api/cell` 의 `handovers`).
+- 기대하는 결과: 복원 보고가 그 작업 지시를 «리빌드했습니다» 로 보이고, 다시 지은 실행이 같은 참조로 그 운반에 다시 붙어 끝까지 따라가 E2 로 끝납니다. `dispatches` 는 재기동 전과 같습니다(새 운반 없음). 근거 시험: 통합 시험 `FleetTransportTest` 의 `실행 호스트만 재기동하면 같은 운반에 다시 붙어 끝까지 추적하고 현장의 맡긴 횟수는 하나다`.
+- 다르면: 운반 단위가 `FAILED`(«모르는 운반») 로 끝나면 현장도 재기동돼 플릿 장부가 비었을 수 있습니다 — 그 결과는 운반 실패가 아니라 «모름» 입니다(보장 아님: 현장 재기동 복구, 장부 소실과 빈 장부 구분 불가). 현장에서 용기가 어디 있는지 확인합니다. 복원 못 한 행으로 남은 플릿 운반 작업 지시는 운영자 종결로 닫지 않습니다(`FLEET_UNIT_OPEN`, 계획을 못 지어 모르는 것도 플릿 임무면 플릿으로 봄) — 기체 정지 확인은 플릿 정지의 증거가 아닙니다. 플릿 포트 없이 띄운 실행 호스트는 그 행을 «미룬 실행»(`FLEET_PORT_ABSENT`)으로 두므로, 플릿 포트를 붙여 실행 호스트를 다시 띄우면 복원됩니다. 정지한 동안 인계가 끝나 근거 창을 넘겼으면 그 단위는 `UNVERIFIED` 로 끝납니다. 끝나지 않은 플릿 단위가 있는 작업 지시의 잔여 파지 표시도 빈손 확인을 받지 않습니다(409 `FLEET_UNIT_OPEN`). 작업 허가는 플릿 맡기기를 막지 않습니다(picasso §15.219) — 셀 문을 열어도 플릿 운반은 나갑니다.
+
 ### D1 에서 확인하는 기록
 | 기록 | 화면 | API | 알 수 있는 것 |
 |---|---|---|---|
@@ -180,6 +187,7 @@
 | 기체 퇴역 지금 | 없음 | 실행 호스트 `GET /host/retirements`(루프백, 운영 서비스 경로 없음) | `declared`(registry 주소가 있어 퇴역 포트를 붙였는가), `retired[]`(기체 id 순, 칸 `robotId`·`reason`), `readAt`(마지막 읽기 성공 시각), `lastReadAt`(성공 실패를 가리지 않은 마지막 읽기 시각), `readError`(마지막 읽기가 실패했으면 그 까닭). 주소가 비면 `declared` false. |
 | 잔여 파지 표시 | 운영 → «배정 가능» 아래 «잔여 파지 확인» | `GET /api/robots/residual-holds` | 미해소 표시(`markerId`, `robotId`, `jobOrderId`, `executionId`, `instanceId`, `unitId`, `objectRef`, `recordedAt`). 해소한 표시는 목록에서 빠지고 해소 기록(승인자·사유·시각)은 호스트 표 `mission.robot_residual_hold_clearing` 과 조작 기록 `CONFIRM_ROBOT_EMPTY` 행에 있음. |
 | 작업 응답 송신 기록 | 운영 → «작업 응답 송신 기록» | `GET /api/job-responses?jobOrderId=` | `SENT` 와 `RESTART_DUPLICATE` 처분 |
+| 플릿 연결과 플릿 세계 | 운영 개요 «호스트 실행 관측» 의 «플릿 연결» | `GET /api/executions/summary` 의 `fleet`(`connected`·`url`), 현장 `GET /fleet/world`(루프백, 운영 서비스 경로 없음) | 실행 호스트에 플릿 포트가 있는가와 그 주소, 인계 자리마다 용기와 놓인 시각, 막힌 자리, 맡긴 횟수(`dispatches`, 같은 참조 재전송은 세지 않음) |
 | 결과 버전과 전달 | «외부 결과 · 수신 확인», «로컬 Mock MES 결과 전달» | `GET /api/work-requests/{id}` 의 `latestResult`·`deliveries`, `GET /integration/v1/job-orders/{id}/results/{version}` | 결과 버전, `resultHash`, 전달 상태, 수신 확인 |
 | 결과 수집 상태 | 운영 개요 «결과 자동 수집» | `GET /api/work-requests/collector` | 커서 순번, 마지막 번호, 생산자 id |
 | 스테이션 작업 이벤트 | 공유 자원 «기록된 근거» | `GET /api/stations/runs/{id}/evidence` | 상태 이력과 사유, 판단자 |

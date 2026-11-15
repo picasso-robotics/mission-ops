@@ -43,8 +43,16 @@ data class CellSignal(
  *
  * [signals] 가 `null` 이면 현장 본문에 `signals` 칸이 없었다(신호를 선언하지 않는 셀 대역). 빈 목록과 다르다. 빈 목록은
  * «신호가 하나도 없다» 는 사양이고 `null` 은 «신호 사양을 모른다» 다. 검증은 `null` 을 «못 읽음» 으로 다룬다(T7).
+ *
+ * [handovers] 는 현장 플릿 세계를 셀 신호로 올린 인계 자리다(점유, 자재 = 용기 신원, 관측 시각 = 놓인 시각). 플릿 단위의 목적지·출발지는 이
+ * 자리로 관측한다(같은 세계). 칸이 없는 현장 본문은 빈 목록이다 — 그 자리는 «말이 없다» 로 읽힌다.
  */
-data class CellSnapshot(val presentations: List<CellPlace>, val slots: List<CellPlace>, val signals: List<CellSignal>? = null) {
+data class CellSnapshot(
+    val presentations: List<CellPlace>,
+    val slots: List<CellPlace>,
+    val signals: List<CellSignal>? = null,
+    val handovers: List<CellPlace> = emptyList(),
+) {
     /** 신호 사양. 모르면 `null` 이다. 본문 칸이 아니므로 속성이 아니라 함수다(`GET /host/cell` 이 이 모양을 그대로 낸다). */
     fun signalSpecs(): List<SignalSpec>? = signals?.map { it.spec() }
 }
@@ -126,7 +134,10 @@ class CellBandClient(
 
         /** 본문 모양이 어긋나면 예외다. [fetch] 가 그것을 «스냅숏 없음» 으로 접는다. `signals` 칸이 없으면 신호 사양을 모른다. */
         fun parse(node: JsonNode): CellSnapshot =
-            CellSnapshot(places(node, "presentations"), places(node, "slots"), node.get("signals")?.let(::signals))
+            CellSnapshot(
+                places(node, "presentations"), places(node, "slots"), node.get("signals")?.let(::signals),
+                node.get("handovers")?.let { places(node, "handovers") }.orEmpty(),
+            )
 
         private fun signals(node: JsonNode): List<CellSignal> {
             require(node.isArray) { "signals 가 배열이 아니다" }
@@ -173,7 +184,7 @@ data class SourceConfirmation(val source: String, val identity: String, val conf
  * 셀 대역 스냅숏 위의 [CellSignals](S3a 스펙 §7.4). 호스트가 pump 직전에 [snapshot] 을 갈아 끼우고, 미들웨어는 같은 잠금
  * 아래에서 읽는다.
  *
- * - [observe]: 스냅숏에서 자리 id 로 답한다. 스냅숏에 없는 자리는 `null`(말이 없다)이다. 그 자리에 사람의 확인([confirmations])이
+ * - [observe]: 스냅숏에서 자리 id 로 답한다(제시 자리·슬롯·플릿 인계 자리). 스냅숏에 없는 자리는 `null`(말이 없다)이다. 그 자리에 사람의 확인([confirmations])이
  *   있고 설비가 말이 없거나 «있다» 고만 했으면 확인한 신원으로 답한다. 설비가 비었다·다른 것이 있다·무엇인지까지 말했으면 설비의 답이
  *   이긴다 — 확인은 관측이 모자란 자리를 채울 뿐 관측을 뒤집지 않는다.
  * - [holding]: 그 자재를 든 **제시 자리**만 낸다. 채운 슬롯을 대안 자리로 내면 미들웨어가 막 놓은 자재를 다시 집으러 보낸다.
@@ -191,7 +202,7 @@ class CellBandSignals : CellSignals {
 
     override fun observe(location: String): SlotSignal? {
         val seen = snapshot?.let { current ->
-            (current.presentations.asSequence() + current.slots.asSequence()).firstOrNull { it.id == location }
+            (current.presentations.asSequence() + current.slots.asSequence() + current.handovers.asSequence()).firstOrNull { it.id == location }
         }?.let { SlotSignal(it.occupied, it.material, it.observedAt) }
         val confirmed = confirmations[location] ?: return seen
         if (seen != null && !(seen.occupied && seen.identity == null)) return seen

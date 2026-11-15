@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import type {
+  ExecutionSummary,
   Delivered,
   DraftSaved,
   Finding,
@@ -25,15 +26,15 @@ export type MissionSent =
  * `result` 로 보인다. 거부 카드는 `REFUSED` 뿐이고, `INPUT_UNKNOWN` 과 시운전 완료 기체를 모르는 503 은 모름, `MOCK_RUN_REQUIRED`
  * 와 `FLEET_PORT_ABSENT`(플릿 포트 없는 실행 호스트) 는 따로 적는다. 응답 없음은 재조회로 확인되기 전에는 성공으로도 실패로도 보이지 않는다.
  */
-export function MissionNotice({ last }: { last: MissionSent }) {
+export function MissionNotice({ last, fleet }: { last: MissionSent; fleet?: ExecutionSummary['fleet'] }) {
   return (
     <div role="status" aria-label="임무 조작 결과">
-      {describe(last)}
+      {describe(last, fleet)}
     </div>
   )
 }
 
-function describe(last: MissionSent): ReactNode {
+function describe(last: MissionSent, fleet: ExecutionSummary['fleet'] | undefined): ReactNode {
   const { what } = last
   switch (last.op) {
     case 'save':
@@ -59,7 +60,7 @@ function describe(last: MissionSent): ReactNode {
               <p>
                 {what}: {mockRunVerdict(outcome.mockRun)}
               </p>
-              <MockRunReport run={outcome.mockRun} />
+              <MockRunReport run={outcome.mockRun} fleet={fleet} />
             </>
           )
         }),

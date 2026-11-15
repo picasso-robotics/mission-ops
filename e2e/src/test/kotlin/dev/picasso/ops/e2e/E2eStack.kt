@@ -43,6 +43,7 @@ class E2eStack private constructor(
     val opsUrl: String,
     val siteId: String,
     private val permitMapping: Path? = null,
+    private val fleet: Boolean = false,
 ) : AutoCloseable {
 
     /** 운영 서비스 응답 한 건. 본문이 비면 널이다. */
@@ -70,7 +71,7 @@ class E2eStack private constructor(
         val deadline = Instant.now().plus(RESTART_WAIT)
         while (true) {
             try {
-                host = startHost(site, port, permitMapping)
+                host = startHost(site, port, permitMapping, fleet)
                 return
             } catch (e: Exception) {
                 if (Instant.now().isAfter(deadline)) throw IllegalStateException("실행 호스트를 포트 $port 에 다시 띄우지 못했다", e)
@@ -106,8 +107,11 @@ class E2eStack private constructor(
         private val http = HttpClient.newHttpClient()
         private val json = ObjectMapper()
 
-        /** @param permitMapping 주면 현장이 이 작업 허가 대응을 선언한 것이다(ADR 52). 실행 호스트에 그대로 넘긴다. */
-        fun start(integrationToken: String = "", permitMapping: Path? = null): E2eStack {
+        /**
+         * @param permitMapping 주면 현장이 이 작업 허가 대응을 선언한 것이다(ADR 52). 실행 호스트에 그대로 넘긴다.
+         * @param fleet 참이면 실행 호스트의 `host.fleet.url` 을 현장 플릿 세계 면(셀 대역 서버)으로 둔다. 거짓이면 플릿 포트가 없다(기본 설정).
+         */
+        fun start(integrationToken: String = "", permitMapping: Path? = null, fleet: Boolean = false): E2eStack {
             SlowCallDiagnostic.reset()
             val siteId = checkNotNull(System.getenv("SITE_ID")) { "SITE_ID 가 없다(루트 .env)" }
             PostgresSupport.reset()
@@ -129,7 +133,7 @@ class E2eStack private constructor(
             )
             // 실행 호스트는 Site 다음, 운영 서비스 앞이다. 운영 서비스가 기동에서 호스트 주소를 받는다.
             val host = try {
-                startHost(site, permitMapping = permitMapping)
+                startHost(site, permitMapping = permitMapping, fleet = fleet)
             } catch (e: Exception) {
                 site.close()
                 throw e
@@ -142,7 +146,7 @@ class E2eStack private constructor(
                 site.close()
                 throw e
             }
-            return E2eStack(site, host, ops, hostUrl, "http://127.0.0.1:${(ops as WebServerApplicationContext).webServer.port}", siteId, permitMapping)
+            return E2eStack(site, host, ops, hostUrl, "http://127.0.0.1:${(ops as WebServerApplicationContext).webServer.port}", siteId, permitMapping, fleet)
         }
 
         /** [baseUrl] 의 운영 서비스를 화면처럼 부른다. */
@@ -194,8 +198,9 @@ class E2eStack private constructor(
          * 같은 Postgres 이고, 모의 실행 프로파일·스키마는 절대 경로로 넘긴다(시험의 작업 디렉터리는 모듈 폴더다).
          *
          * @param port 0 이면 무작위다. 다시 띄울 때는 앞 호스트의 포트다.
+         * @param fleet 참이면 플릿 포트를 현장 플릿 세계 면(`/fleet`, 셀 대역과 같은 서버)에 붙인다.
          */
-        private fun startHost(site: Site, port: Int = 0, permitMapping: Path? = null): ConfigurableApplicationContext {
+        private fun startHost(site: Site, port: Int = 0, permitMapping: Path? = null, fleet: Boolean = false): ConfigurableApplicationContext {
             val db = db()
             return MissionHostApplication.builder(HostClock { site.now() }).run(
                 "--host.work-permit.mapping=${permitMapping ?: ""}",
@@ -203,6 +208,7 @@ class E2eStack private constructor(
                 "--server.port=$port",
                 "--host.mimic.port=${site.mimicPort}",
                 "--host.cell.url=http://127.0.0.1:${site.cellPort}",
+                "--host.fleet.url=${if (fleet) "http://127.0.0.1:${site.cellPort}" else ""}",
                 "--spring.datasource.url=${db.url}",
                 "--spring.datasource.username=${db.user}",
                 "--spring.datasource.password=${db.password}",

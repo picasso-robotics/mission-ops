@@ -133,6 +133,12 @@ sealed interface ClearOutcome {
 
     /** 그 요청 id 를 다른 표시의 충돌이나 해소에 이미 썼다. 아무것도 적지 않았다. */
     data class RequestReused(val reason: String) : ClearOutcome
+
+    /**
+     * 그 표시의 작업 지시에 끝나지 않은 플릿 운반 단위가 있다([MissionHost.FLEET_UNIT_OPEN]). 빈손 확인은 기체의 손만 보므로 플릿이 멈췄다는 증거가
+     * 못 된다. 아무것도 적지 않았고 표시는 그대로다.
+     */
+    data class FleetUnitOpen(val reason: String) : ClearOutcome
 }
 
 /**

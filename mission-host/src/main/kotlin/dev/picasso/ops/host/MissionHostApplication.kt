@@ -3,6 +3,7 @@ package dev.picasso.ops.host
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.picasso.client.PicassoClient
 import dev.picasso.host.FileEntitlements
+import dev.picasso.middleware.AmrFleetPort
 import dev.picasso.middleware.ClientRobotPort
 import dev.picasso.middleware.Entitlements
 import dev.picasso.middleware.IssuingRobotPort
@@ -10,6 +11,8 @@ import dev.picasso.middleware.PrefetchingRobotPort
 import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.ops.host.cell.CellBandClient
+import dev.picasso.ops.host.fleet.HostFleetPort
+import dev.picasso.ops.host.fleet.HttpFleetPort
 import dev.picasso.ops.host.incident.ApprovalWindow
 import dev.picasso.ops.host.mission.MissionVersions
 import dev.picasso.ops.host.mission.MockRunner
@@ -71,6 +74,18 @@ open class MissionHostApplication {
     @ConditionalOnMissingBean(RobotPort::class)
     open fun robotPort(channel: ManagedChannel, clock: HostClock): RobotPort =
         HostRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), clock)
+
+    /**
+     * 플릿 포트(`host.fleet.url`). 비우면 `AmrFleetPort.None` 이다 — 플릿 운반 단위가 든 계획을 받지 않는다(`FLEET_PORT_ABSENT`). 값이 있으면 현장
+     * 플릿 세계 면(`/fleet`, mission-ops 안의 약속)을 부르는 [HttpFleetPort] 를 picasso 의 두 데코레이터로 감싼 [HostFleetPort] 다 — 기체
+     * 포트([robotPort])와 대칭이고 기한 예산(미리 읽은 값 `maxAge` 2초, 요청 제한 1초)도 같은 결이다. `mimic` 같은 스위치 값은 없다: 주소가 곧
+     * 선언이다. 주소가 틀린 모양(http(s) 아님)이면 기동이 멈춘다. 현장이 지금 안 닿는 것은 기동을 막지 않는다(pump 가 다음 라운드에 다시 본다).
+     *
+     * 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다. 닫는 것은 Spring 이 추론한 `close` 다([HostFleetPort]).
+     */
+    @Bean
+    @ConditionalOnMissingBean(AmrFleetPort::class)
+    open fun fleetPort(@Value("\${host.fleet.url}") url: String, clock: HostClock): AmrFleetPort = fleetPortOf(url, clock)
 
     /**
      * 미들웨어 보존 상한([MissionHost.RETENTION], 놓은 작업 지시 표시는 `EVICT` 선언). 운영 설정으로 열지 않는다. 시험은 [builder] 로 작은 상한을
@@ -149,6 +164,8 @@ open class MissionHostApplication {
      *
      * [retention] 은 미들웨어 보존 상한이다([hostRetention], 기본 [MissionHost.RETENTION]).
      *
+     * [fleet] 는 플릿 포트다([fleetPort], `host.fleet.url`). 없으면(`AmrFleetPort.None`) 플릿 계획 차단이 그대로다.
+     *
      * [retirements] 는 registry 주소를 설정했을 때만 미들웨어에 넘긴다([RegistryRetirements.declared]).
      *
      * [entitlementsPath]·[exportDir] 는 인시던트 고리다(`host.incident-loop.entitlements`·`.export`, picasso 한계 §15.176). 비우면 선언 없음,
@@ -166,6 +183,7 @@ open class MissionHostApplication {
         json: ObjectMapper,
         retirements: RegistryRetirements,
         retention: Retention,
+        fleet: AmrFleetPort,
         @Value("\${host.work-permit.mapping}") permitMapping: String,
         @Value("\${host.instance.heartbeat-period}") heartbeatPeriod: Duration,
         @Value("\${host.instance.heartbeat-expiry}") heartbeatExpiry: Duration,
@@ -176,7 +194,7 @@ open class MissionHostApplication {
         robots, cellBand, clock, catalog, timings, records, store, json, workPermits(permitMapping, clock),
         HostHeartbeat(heartbeatPeriod, heartbeatExpiry), revisableRetention,
         retirements.takeIf { it.declared },
-        entitlements(entitlementsPath), path(exportDir), retention,
+        entitlements(entitlementsPath), path(exportDir), retention, fleet,
     ).start()
 
     /**
@@ -221,6 +239,24 @@ open class MissionHostApplication {
         /** mimic 에 싣는 클라이언트 id. */
         const val CLIENT_ID = "mission-host"
 
+        /**
+         * 플릿 주소에서 포트를 짓는다. 비어 있으면 [AmrFleetPort.None] 이다(스위치 값 없음 — 주소가 곧 선언). 주소가 있으면 기동 탐침
+         * ([HttpFleetPort.probe])을 한 번 한다 — 4xx 등(예: 다른 서버, `/fleet` 면이 없는 현장의 404·405)이면 오설정이라 기동을 멈춘다. 안 닿거나 5xx 면
+         * 일시 장애로 보아 경고만 남기고 뜬다(현장이 늦게 뜨거나 잠시 아플 수 있다).
+         */
+        fun fleetPortOf(url: String, clock: HostClock): AmrFleetPort {
+            val port = url.trim().takeIf { it.isNotEmpty() }?.let { HttpFleetPort(it) } ?: return AmrFleetPort.None
+            when (val status = port.probe()) {
+                // 안 닿음과 5xx 는 일시 장애일 수 있다(현장이 늦게 뜨거나 잠시 아픔) — 경고만 하고 뜬다. pump 가 다음 라운드에 다시 본다.
+                null -> org.slf4j.LoggerFactory.getLogger(MissionHostApplication::class.java).warn("플릿 세계 면이 아직 안 닿는다(기동은 계속): {}", port.url)
+                200 -> Unit
+                in 500..599 -> org.slf4j.LoggerFactory.getLogger(MissionHostApplication::class.java).warn("플릿 세계 면이 HTTP {} 로 답했다(일시 장애로 보고 기동은 계속): {}", status, port.url)
+                // 그 밖(4xx·3xx 등)은 오설정이 확실하다 — 그 주소에 플릿 세계 면이 없다.
+                else -> throw IllegalArgumentException("플릿 주소(host.fleet.url)가 현장 플릿 세계 면이 아니다: GET ${port.url}/fleet/world → HTTP $status")
+            }
+            return HostFleetPort(port, clock, port.url)
+        }
+
         /** 작업 허가 대응 경로에서 포트를 짓는다. 비어 있으면 `null`(선언하지 않은 현장)이다. 경로는 작업 디렉터리 기준이다. */
         fun workPermits(mapping: String, clock: HostClock): CellWorkPermits? =
             mapping.trim().takeIf { it.isNotEmpty() }?.let { CellWorkPermits(WorkPermitMap.read(Path.of(it).toAbsolutePath().normalize()), clock.now()) }
@@ -237,16 +273,18 @@ open class MissionHostApplication {
          * @param clock 주면 기본 시계 대신 이것을 쓴다(통합 시험이 현장 시계를 넣는다).
          * @param robots 주면 기본 하위 포트 대신 이것을 쓴다(호스트 시험이 기체 스냅숏을 막는 포트를 넣는다).
          * @param retention 주면 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(호스트 시험이 작은 놓은 작업 지시 표시 상한을 넣는다).
+         * @param fleet 주면 `host.fleet.url` 대신 이것을 플릿 포트로 쓴다(호스트 시험이 프로세스 안의 플릿 미믹을 넣는다). 닫지 않는다.
          */
-        fun builder(clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null): SpringApplicationBuilder {
+        fun builder(clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null, fleet: AmrFleetPort? = null): SpringApplicationBuilder {
             val builder = SpringApplicationBuilder(MissionHostApplication::class.java)
                 .properties("spring.config.name=mission-host")
-            if (clock != null || robots != null || retention != null) {
+            if (clock != null || robots != null || retention != null || fleet != null) {
                 builder.initializers(
                     ApplicationContextInitializer<ConfigurableApplicationContext> {
                         clock?.let { c -> it.beanFactory.registerSingleton("hostClock", c) }
                         robots?.let { r -> it.beanFactory.registerSingleton("testRobotPort", r) }
                         retention?.let { r -> it.beanFactory.registerSingleton("hostRetention", r) }
+                        fleet?.let { f -> it.beanFactory.registerSingleton("testFleetPort", f) }
                     },
                 )
             }

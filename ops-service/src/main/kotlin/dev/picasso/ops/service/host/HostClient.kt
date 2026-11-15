@@ -51,8 +51,11 @@ sealed interface HostWrite {
     data class NoResponse(val cause: String) : HostWrite
 }
 
-/** 호스트의 스킬 적합 판정. [UNKNOWN] 은 호스트가 기체 케이퍼빌리티를 못 물어봤다는 뜻이고 적합이 아니다. */
-enum class HostSkillFit { FIT, MISSING, UNKNOWN }
+/**
+ * 호스트의 스킬 적합 판정. [UNKNOWN] 은 호스트가 기체 케이퍼빌리티를 못 물어봤다는 뜻이고 적합이 아니다. [NOT_APPLICABLE] 은 플릿 전용 계획(로봇
+ * 단위 없음)이라 할 스킬이 없다는 뜻이다 — 적합이 아니고 거절 사유도 아니다. 그 기체는 묶인 기체(실행 주체 아님)다([HostEligibility.boundRobot]).
+ */
+enum class HostSkillFit { FIT, MISSING, UNKNOWN, NOT_APPLICABLE }
 
 /**
  * 호스트 판정 한 행(S3a JSON 계약 §2.2). 호스트는 자기 쪽 이유만 보고, 시운전·연결은 운영 서비스가 합친다(T3).
@@ -73,6 +76,8 @@ data class HostEligibility(
     val availableSkills: List<String>? = null,
     /** 관문 확인용으로만 넘기는 기체(남은 이유가 잔여 파지 표시뿐). [passed] 가 참이어도 일반 배정은 서지 않고 조치 제안만 얻는다. 칸이 없던 호스트 본문은 거짓이다. */
     val gateTrial: Boolean = false,
+    /** 플릿 전용 계획의 묶인 기체(실행 주체 아님, picasso 한계 «§15.326 · 기체 묶임»). 칸이 없던 호스트 본문은 거짓이다. */
+    val boundRobot: Boolean = false,
 )
 
 /** `POST /host/eligibility` 의 답. */
@@ -137,6 +142,8 @@ data class HostSubmitOutcome(
     val sourceMissing: HostSourceMissing? = null,
     val sourceUnobserved: HostSourceUnobserved? = null,
     val forgottenJobOrder: Boolean = false,
+    /** 받은 실행이 플릿 전용 계획이라 [robotId] 가 묶인 기체(실행 주체 아님)다. 칸이 없던 호스트 본문은 거짓이다. */
+    val boundRobot: Boolean = false,
 )
 
 /** 출발 결품 거부의 자리. [observed] 가 `null` 이면 빈 자리이고 아니면 거기 있던 다른 식별 정보다. */

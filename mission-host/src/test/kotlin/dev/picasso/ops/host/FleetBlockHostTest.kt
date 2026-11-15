@@ -1,6 +1,7 @@
 package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.node.ObjectNode
+import dev.picasso.fleetmimic.AmrFleetMimic
 import dev.picasso.middleware.DeliverContainer
 import dev.picasso.middleware.PrepareSequencedRack
 import dev.picasso.middleware.mission.DefinedCapability
@@ -55,32 +56,52 @@ class FleetBlockHostTest {
     }
 
     @Test
-    fun `기동 복원은 다시 지을 계획에 플릿 단위가 있으면 다시 짓지 않고 FLEET_PORT_ABSENT 사유로 포기한다`() {
+    fun `기동 복원은 다시 지을 계획에 플릿 단위가 있으면 다시 짓지 않고 FLEET_PORT_ABSENT 사유로 미루고 종결도 받지 않는다`() {
         HostBench().use { bench ->
             bench.awaitPump()
-            val order = """{"jobOrderId":"WT-781","workMasterId":"${DeliverContainer.WORK_MASTER}","version":1,"requiredEvidence":"E2",""" +
-                """"parameters":{},"materialRequirements":[],"equipmentRequirements":[""" +
-                """{"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},""" +
-                """{"id":"SEQ-IN-02","equipmentUse":"destination","properties":{}}]}"""
-            PostgresSupport.execute(
-                """
-                INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
-                VALUES ('WT-781', '$HUMANOID', '$order'::jsonb, '${DeliverContainer.WORK_MASTER}', NULL, 'mw-before', 'exec-9')
-                """.trimIndent(),
-            )
+            insertDeliver("WT-781")
             bench.restartHost()
             val view = bench.get("/host/executions")
             val row = view["restore"]["rows"].single()
-            assertEquals(listOf("WT-781", "GAVE_UP"), listOf(row["jobOrderId"].asText(), row["result"].asText()), row.toString())
+            assertEquals(listOf("WT-781", "DEFERRED"), listOf(row["jobOrderId"].asText(), row["result"].asText()), row.toString())
             assertTrue(row["reason"].asText().startsWith("${HostRequests.FLEET_PORT_ABSENT}: ${HostRequests.FLEET_PORT_ABSENT_DETAIL}"), row.toString())
             assertTrue("HU-1042" in row["reason"].asText(), row.toString())
             assertTrue(row["executionId"].isNull && view["executions"].isEmpty, view.toString())
-            // 포기 이벤트가 일지에 남고(운영자 종결 대상) 기체에는 아무것도 나가지 않았다.
+            // 미룸 이벤트가 일지에 남고(포기 아님 — 다시 시도된다) 기체에는 아무것도 나가지 않았다.
             assertEquals(
-                listOf("GAVE_UP"),
+                listOf("DEFERRED"),
                 PostgresSupport.queryAll("SELECT kind FROM mission.execution_journal_event WHERE job_order_id = 'WT-781' ORDER BY event_id") { it.getString(1) },
             )
             assertEquals(0, bench.mimic.server.exclusive { bench.mimic.instance(HUMANOID)!!.tasks.all.size })
+            // 미룬 동안 그 기체는 판정에서 빠지고, 그 행은 운영자 종결로 닫지 않는다(플릿 포트를 붙인 기동이 다시 짓는다).
+            val judged = bench.post("/host/eligibility", request(rack("JO-2", "RACK-204.S01"), "robotIds", HUMANOID)).body!!["robots"].single()
+            assertTrue(judged["reasons"].any { it.asText().contains("WT-781") }, judged.toString())
+            val unrestored = bench.get("/host/executions?recent=5")["unrestored"].single()
+            assertEquals(false, unrestored["closable"].asBoolean(), unrestored.toString())
+            val closed = bench.post("/host/job-orders/WT-781/close", close("mw-before", "exec-9")).body!!
+            assertEquals("NOT_CLOSABLE", closed["result"].asText(), closed.toString())
+        }
+    }
+
+    @Test
+    fun `플릿 포트 없이 재기동해 미룬 플릿 행은 플릿 포트를 붙여 재기동하면 다시 지어지고 그 운반을 맡긴다`() {
+        val fleet = AmrFleetMimic().apply { place("OUT-07", "HU-1042") }
+        HostBench().use { bench ->
+            bench.awaitPump()
+            insertDeliver("WT-782")
+            bench.restartHost()
+            assertEquals("DEFERRED", bench.get("/host/executions")["restore"]["rows"].single()["result"].asText())
+            bench.idlePumps()
+            assertEquals("DEFERRED", bench.get("/host/executions")["restore"]["rows"].single()["result"].asText(), "포트가 없으면 다시 시도해도 미룬 채다")
+            bench.fleet = fleet
+            bench.restartHost()
+            val row = bench.get("/host/executions")["restore"]["rows"].single()
+            assertEquals("RESTORED", row["result"].asText(), row.toString())
+            bench.eventually("플릿에 맡김") { fleet.dispatches == 1 }
+            assertEquals(
+                listOf("DEFERRED", "RESTORED"),
+                PostgresSupport.queryAll("SELECT kind FROM mission.execution_journal_event WHERE job_order_id = 'WT-782' ORDER BY event_id") { it.getString(1) },
+            )
         }
     }
 
@@ -118,6 +139,26 @@ class FleetBlockHostTest {
             assertTrue(execution["units"].none { it["route"].asText() == "FLEET" }, execution.toString())
         }
     }
+
+    private fun insertDeliver(jobOrderId: String) {
+        val order = """{"jobOrderId":"$jobOrderId","workMasterId":"${DeliverContainer.WORK_MASTER}","version":1,"requiredEvidence":"E2",""" +
+            """"parameters":{},"materialRequirements":[],"equipmentRequirements":[""" +
+            """{"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},""" +
+            """{"id":"SEQ-IN-02","equipmentUse":"destination","properties":{}}]}"""
+        PostgresSupport.execute(
+            """
+            INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
+            VALUES ('$jobOrderId', '$HUMANOID', '$order'::jsonb, '${DeliverContainer.WORK_MASTER}', NULL, 'mw-before', 'exec-9')
+            """.trimIndent(),
+        )
+    }
+
+    private fun close(instanceId: String, executionId: String) = JSON.writeValueAsString(
+        mapOf(
+            "approverId" to "park", "reason" to "현장에서 멈춤 확인", "requestId" to UUID.randomUUID().toString(),
+            "executionInstanceId" to instanceId, "executionId" to executionId, "attestedStopped" to true,
+        ),
+    )
 
     companion object {
         /** picasso `MissionFixtures.DELIVER_CONTAINER` 모양 — 첫 출발 설비의 container 속성이 용기이고 첫 목적지로 운반한다. */

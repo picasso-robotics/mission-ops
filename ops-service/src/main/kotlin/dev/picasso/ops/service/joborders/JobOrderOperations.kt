@@ -87,6 +87,11 @@ class JobOrderOperations(
         judged.hostRefusal?.let { return JobOrderSubmission.HostRefused(it.error, it.detail) }
         val candidates = judged.robots.orEmpty().filter { it.eligible }.map { it.robotId }
         if (candidates.isEmpty()) return JobOrderSubmission.NoEligibleRobot(noEligibleDetail(judged))
+        // 플릿 전용 계획은 요청 후보가 정확히 하나여야 한다(실행 호스트 D2(a)). 운영 서비스는 후보를 고르지 않으므로 둘 이상이면 호스트를 부르지
+        // 않고 호스트와 같은 코드로 거부한다 — 판정 거부(FLEET_PORT_ABSENT)와 같은 표면이다(제출하지 않음, 조작 기록 없음).
+        if (judged.fleetOnly && candidates.size != 1) {
+            return JobOrderSubmission.HostRefused(FLEET_ONLY_CANDIDATES, "$FLEET_ONLY_CANDIDATES_DETAIL: 배정 가능한 기체 ${candidates.size}개(${candidates.joinToString(", ")})")
+        }
 
         val request = json.createObjectNode().put("op", OP)
         if (interfaceRef != null) request.put("interfaceRef", interfaceRef)
@@ -170,7 +175,8 @@ class JobOrderOperations(
 
     /**
      * 호스트가 4xx 로 거부했다. 본문은 `{error, detail}` 이고 제출 결과 모양이 아니므로, 화면이 한 모양으로 읽게 거부 사유에 옮긴다.
-     * 운영 서비스가 폼을 먼저 검사하므로 정상 흐름에서는 나오지 않는다.
+     * 운영 서비스가 폼과 플릿 전용 계획의 후보 수를 먼저 보지만, 판정과 제출 사이에 판정이 바뀌면(예: 그 사이 다른 기체가 배정 가능해져 호스트가
+     * `FLEET_ONLY_CANDIDATES` 로 거부, 그 사이 활성 임무가 바뀜) 여기로 온다. 이때는 제출을 보냈으므로 조작 기록에 거부로 남는다.
      */
     private fun hostRefused(write: HostWrite.Answered): HostSubmitOutcome {
         val body = runCatching { json.readTree(write.body) }.getOrNull()?.takeIf { it.isObject }
@@ -200,6 +206,12 @@ class JobOrderOperations(
 
         /** 실행 호스트의 판정 거부: 플릿 포트가 없어 플릿 운반 단위가 든 계획을 받지 않는다(실행 호스트 `HostRequests.FLEET_PORT_ABSENT`). */
         const val FLEET_PORT_ABSENT = "FLEET_PORT_ABSENT"
+
+        /** 플릿 전용 계획에 배정 가능한 기체가 하나가 아니다(실행 호스트 `HostRequests.FLEET_ONLY_CANDIDATES` 와 같은 코드). */
+        const val FLEET_ONLY_CANDIDATES = "FLEET_ONLY_CANDIDATES"
+
+        /** [FLEET_ONLY_CANDIDATES] 의 문구(실행 호스트와 같은 앞머리). */
+        const val FLEET_ONLY_CANDIDATES_DETAIL = "플릿 전용 계획은 요청 후보 기체가 정확히 하나여야 합니다(묶인 기체, 실행 주체 아님)"
         private val DATE: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMdd")
 
         /**

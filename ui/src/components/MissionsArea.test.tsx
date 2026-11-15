@@ -17,6 +17,7 @@ import type { FakeOps } from '../testing/fakeOps'
 import { mockRunVerdict } from '../labels'
 import { MissionDefinitionEditor as MissionsArea } from './MissionDefinitionEditor'
 import { FLEET_MOCK_NOTE } from './MockRunReport'
+import { FLEET_HOST_NOTE } from '../labels'
 
 const engineer: Session = { mode: 'engineer', user: 'lee' }
 const operator: Session = { mode: 'operator', user: 'kim' }
@@ -393,6 +394,29 @@ describe('임무·정책 영역', () => {
       '-',
     ])
     expect(within(shown).getByRole('note')).toHaveTextContent(FLEET_MOCK_NOTE)
+    // 호스트의 플릿 연결을 모르면(옛 호스트 본문) 활성화 여부를 단정하지 않는다.
+    expect(within(shown).getByRole('note')).toHaveTextContent(FLEET_HOST_NOTE.unknown)
+  })
+
+  it.each([
+    [{ connected: true, url: 'http://127.0.0.1:8784' }, FLEET_HOST_NOTE.present, FLEET_HOST_NOTE.absent],
+    [{ connected: false, url: null }, FLEET_HOST_NOTE.absent, FLEET_HOST_NOTE.present],
+  ])('플릿 운반 모의 실행 안내는 호스트의 플릿 연결 %o 에 따라 활성화 가능 여부를 가른다', async (link, shownText, hiddenText) => {
+    const fake = installFakeOps(emptyList)
+    fake.fleet = link
+    const fleet = mockRunRow({
+      mockRunId: 8,
+      result: {
+        ...mockRunRow().result,
+        units: [{ unitId: 'MOCK-CONTAINER-7', route: 'FLEET', skillType: 'transport', state: 'DONE', reached: 'E2', failureClass: null }],
+      },
+    })
+    fake.answers.set(draftPath(7, 'mock-run'), { status: 200, body: operation({ ...judgment('PASSED'), mockRun: fleet }) })
+    await openDraft(fake)
+    await waitFor(() => expect(fake.calls.some((call) => call.url === '/api/executions/summary')).toBe(true))
+    await click('모의 실행')
+    await waitFor(async () => expect(within(await notice()).getByRole('note')).toHaveTextContent(shownText))
+    expect(within(await notice()).getByRole('note')).not.toHaveTextContent(hiddenText)
   })
 
   it('플릿 포트 없는 실행 호스트의 활성화 막힘은 따로 적고 마지막 모의 실행의 통과를 붙인다', async () => {

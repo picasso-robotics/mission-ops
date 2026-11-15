@@ -413,7 +413,10 @@ export const bindRobot = (session: Session, robotId: string, adapterVersionId: n
 export const recordSiteNames = (session: Session, robotId: string) =>
   send('POST', `/api/robots/${encodeURIComponent(robotId)}/site-names`, session)
 
-/** 작업 지시 폼이 내는 임무(S3a 스펙 §9.1). DeliverContainer 는 실행 호스트에 플릿 포트가 없어(`FLEET_PORT_ABSENT`) 내지 않는다. */
+/**
+ * 작업 지시 폼이 내는 임무(S3a 스펙 §9.1). DeliverContainer(플릿 운반)는 운영 서비스 폼 API 만 받고 화면 폼에는 내지 않는다 — 플릿 전용 계획이라
+ * 실행 호스트가 요청 후보가 정확히 하나일 때만 받고(`FLEET_ONLY_CANDIDATES`), 플릿 포트가 없는 호스트는 `FLEET_PORT_ABSENT` 로 거절한다.
+ */
 export type WorkMasterId = 'InspectAsset' | 'PrepareSequencedRack'
 
 /** InspectAsset 의 점검 대상 하나. `location` 은 기체가 아는 명칭이어야 하나 화면이 검사하지 않는다. */
@@ -430,7 +433,8 @@ export type JobOrderForm =
   | { workMasterId: 'InspectAsset'; targets: InspectionTarget[] }
   | { workMasterId: 'PrepareSequencedRack'; slots: string[]; material: string; presentation: string }
 
-export type SkillFit = 'FIT' | 'MISSING' | 'UNKNOWN'
+/** `NOT_APPLICABLE` 은 플릿 전용 계획(로봇 단위 없음)이라 할 스킬이 없다는 뜻이다. 적합이 아니고 거절 사유도 아니다(묶인 기체). */
+export type SkillFit = 'FIT' | 'MISSING' | 'UNKNOWN' | 'NOT_APPLICABLE'
 
 /** 실행 호스트의 기체 판정(S3a JSON 계약 §2.2). `UNKNOWN` 은 호스트가 기체 케이퍼빌리티를 못 물어본 것이고 모름이다. */
 export interface HostEligibility {
@@ -444,6 +448,8 @@ export interface HostEligibility {
   reasons: string[]
   /** 관문 확인용으로만 넘기는 기체(남은 이유가 잔여 파지 표시뿐). 칸이 없던 본문은 undefined 다. */
   gateTrial?: boolean
+  /** 플릿 전용 계획의 묶인 기체(실행 주체 아님). 칸이 없던 본문은 undefined 다. */
+  boundRobot?: boolean
 }
 
 /**
@@ -476,6 +482,8 @@ export interface EligibilityView {
   host: HostState
   robots: RobotEligibility[] | null
   hostRefusal?: { error: string; detail: string } | null
+  /** 플릿 전용 계획이다 — 배정 가능한 기체가 정확히 하나여야 접수된다(둘 이상이면 FLEET_ONLY_CANDIDATES). 옛 본문은 칸이 없다. */
+  fleetOnly?: boolean
 }
 
 export type HostSubmitResult = 'ACCEPTED' | 'IDEMPOTENT' | 'REJECTED' | 'UNASSIGNED'
@@ -591,6 +599,11 @@ export interface Execution {
   blockedFaults?: FaultDetail[]
   /** 그 작업 지시에 건 운영자 결함 감수(S3a JSON 계약 §5.9). 적은 순서이고 재기동 전 인스턴스의 것도 싣는다. 옛 호스트는 칸을 싣지 않는다. */
   releases?: ReleaseRecord[]
+  /**
+   * 로봇 단위 없이 플릿 운반만 든 실행이다 — `robotId` 는 묶인 기체(실행 주체 아님)다(picasso 한계 «§15.326 · 기체 묶임»). 옛 호스트·옛 정착 본문은
+   * 칸을 싣지 않는다.
+   */
+  boundRobot?: boolean
 }
 
 /** 운영자 결함 감수 한 건(S3a JSON 계약 §5.9). `faults` 는 감수할 때의 `blockedFaults`, `recordedAt` 은 실행 호스트가 적은 시각이다. */
@@ -779,6 +792,8 @@ export interface ExecutionSummary {
   live: number
   states: Record<string, number>
   journalBlockedExecutionIds: string[]
+  /** 이 호스트의 플릿 연결(`host.fleet.url`). 없으면 connected 가 false 이고 url 이 null 이다. 옛 호스트는 칸을 싣지 않는다. */
+  fleet?: { connected: boolean; url: string | null }
 }
 
 /** 셀 대역의 자리 하나(S3a JSON 계약 §1). 제시 자리의 `observedAt` 은 늘 null 이다. */

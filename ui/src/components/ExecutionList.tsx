@@ -16,7 +16,7 @@ import type {
 } from '../api'
 import { appendOlder, catchUp, olderCount, olderCursor, sameExecution } from '../executionHistory'
 import type { ExecutionHistory } from '../executionHistory'
-import { EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, routeLabel, UNRESTORED_TEXT } from '../labels'
+import { BOUND_ROBOT_LABEL, EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, routeLabel, UNRESTORED_TEXT } from '../labels'
 import { CancelExecutionForm, CloseResultStatus, CloseUnrestoredForm, ReleaseFaultForm, ReworkSkippedForm } from './ExecutionControls'
 import { PermitBlockNotice } from './PermitBlockNotice'
 
@@ -192,7 +192,10 @@ function ExecutionRow({ execution, selected, settled, currentInstance }: RowProp
       <td>{execution.jobOrderId}</td>
       <td>{execution.workMasterId}</td>
       <td>{execution.missionVersion === null ? '코드 정의' : `버전 ${execution.missionVersion}`}</td>
-      <td>{execution.robotId}</td>
+      <td>
+        {execution.robotId}
+        {execution.boundRobot === true && <span className="restored"> ({BOUND_ROBOT_LABEL})</span>}
+      </td>
       <td>
         {execution.physicalState}
         {settled !== undefined && <span className="restored"> ({TEXT.settledAt(settled.settledAt)})</span>}

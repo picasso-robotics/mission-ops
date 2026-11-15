@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Execution, Session } from '../api'
 import { EXECUTION_SUMMARY_PATH, EXECUTIONS_RECENT_PATH, settledBeforePath } from '../api'
-import { EXECUTION_LIST_TEXT as TEXT } from '../labels'
+import { BOUND_ROBOT_LABEL, EXECUTION_LIST_TEXT as TEXT } from '../labels'
 import { executionsView, installFakeOps, settledRow } from '../testing/fakeOps'
 import type { FakeOps } from '../testing/fakeOps'
 import { OperationsArea } from './OperationsArea'
@@ -193,6 +193,36 @@ describe('실행 목록 — 활성과 최근 정착, 이력은 페이지', () =>
     expect(screen.getByText('판단·확인 대기').nextElementSibling).toHaveTextContent('2')
     expect(screen.getByText('일지 저장 차단').nextElementSibling).toHaveTextContent('1')
     expect(screen.getByText('인스턴스').nextElementSibling).toHaveTextContent('mw-1')
+    // 칸이 없는 옛 호스트 본문의 플릿 연결은 모름이다.
+    expect(screen.getByText('플릿 연결').nextElementSibling).toHaveTextContent('모름')
     expect(gets(fake).filter((url) => url.startsWith('/api/executions'))).toEqual([EXECUTION_SUMMARY_PATH])
+  })
+
+  it('운영 개요는 호스트의 플릿 연결을 없음 또는 주소로 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.fleet = { connected: false, url: null }
+    const { unmount } = render(<OverviewArea session={operator} />)
+    await waitFor(() => expect(screen.getByText('플릿 연결').nextElementSibling).toHaveTextContent('없음'))
+    unmount()
+    fake.fleet = { connected: true, url: 'http://127.0.0.1:8083' }
+    render(<OverviewArea session={operator} />)
+    await waitFor(() => expect(screen.getByText('플릿 연결').nextElementSibling).toHaveTextContent('http://127.0.0.1:8083'))
+  })
+
+  it('플릿 전용 실행의 기체는 묶인 기체(실행 주체 아님)로 표기하고 다른 실행은 기체 id 만 보인다', async () => {
+    const fake = installFakeOps(emptyList)
+    fake.executions = executionsView({
+      executions: [
+        execution(7, { physicalState: 'RUNNING', workMasterId: 'DeliverContainer', boundRobot: true, units: [{ unitId: 'HU-1042', skillType: 'transport', state: 'RUNNING', reached: 'E0', route: 'FLEET' }] }),
+        execution(8, { physicalState: 'RUNNING' }),
+      ],
+    })
+    open()
+    const table = await within(screen.getByRole('region', { name: '실행' })).findByRole('table', { name: '실행 목록' })
+    const rows = within(table).getAllByRole('row').slice(1)
+    const bound = rows.find((row) => row.textContent?.includes('exec-7'))!
+    const robot = rows.find((row) => row.textContent?.includes('exec-8'))!
+    expect(within(bound).getAllByRole('cell')[4]).toHaveTextContent(`humanoid-01 (${BOUND_ROBOT_LABEL})`)
+    expect(within(robot).getAllByRole('cell')[4]).toHaveTextContent(/^humanoid-01$/)
   })
 })

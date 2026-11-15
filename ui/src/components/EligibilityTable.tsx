@@ -1,5 +1,5 @@
 import type { EligibilityView, PreRejection, RobotEligibility } from '../api'
-import { COMMISSIONING_LABEL, CONNECTION_LABEL, SKILL_FIT_LABEL, kindLabel } from '../labels'
+import { COMMISSIONING_LABEL, CONNECTION_LABEL, FLEET_ONLY_NOTE, SKILL_FIT_LABEL, kindLabel } from '../labels'
 
 /** 배정 가능을 읽은 결과. 못 읽으면 직전 판정을 지우지 않고 [error] 로 직전 값임을 표시한다. */
 export interface EligibilityRead {
@@ -44,6 +44,7 @@ export function EligibilityTable({ read, formKey }: Props) {
           실행 호스트가 거부함({kindLabel(view.hostRefusal.error)}): {view.hostRefusal.detail}
         </p>
       )}
+      {view.fleetOnly === true && <p role="note">{FLEET_ONLY_NOTE}</p>}
       {view.robots === null ? (
         <p>모름: 기체 목록을 아직 읽지 못했습니다</p>
       ) : view.robots.length === 0 ? (

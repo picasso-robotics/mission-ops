@@ -411,6 +411,8 @@ URL 은 해시만 씁니다. `App.tsx` 가 영역을 읽고 씁니다. `WorkRequ
 
 운영 서비스 API 는 `http://127.0.0.1:8782/api/…` 입니다. 외부 주문(Mock MES)을 쓰려면 운영 서비스를 띄우기 전에 `PICASSO_INTEGRATION_TOKEN` 을 비어 있지 않은 값으로 둡니다.
 
+플릿 운반(`DeliverContainer`)을 돌리려면 실행 호스트를 띄우기 전에 `HOST_FLEET_URL=http://127.0.0.1:<SITE_CELL_PORT>`(또는 실행 인자 `--host.fleet.url=…`)를 줍니다. 런처가 같은 셀 대역 서버에 플릿 세계 면(`/fleet`)을 열고 기동 로그에 그 주소를 찍습니다. 비우면(기본) 플릿 포트가 없어 플릿 운반 단위가 든 작업 지시를 `FLEET_PORT_ABSENT` 로 받지 않습니다. 플릿 전용 계획은 요청 후보가 정확히 하나여야 하므로(운영 서비스는 배정 가능한 기체를 모두 싣음) 배정 가능한 기체가 둘이면 `FLEET_ONLY_CANDIDATES` 로 거부됩니다. 세계 채우기는 현장 `POST /fleet/world/{place|clear|block|unblock}` 을 직접 부릅니다.
+
 개발 서버와 preview 는 `/api` 와 `/integration` 을 운영 서비스로 넘깁니다(`vite.config.ts` 의 proxy).
 
 CI(`.github/workflows/ci.yml`, push to main 과 PR)의 job 은 셋입니다.

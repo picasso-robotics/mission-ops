@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
 import dev.picasso.client.PicassoClient
 import dev.picasso.middleware.ClientRobotPort
+import dev.picasso.middleware.AmrFleetPort
 import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.middleware.RobotSnapshot
@@ -52,6 +53,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  * @param retirementInterval 주면 퇴역 읽기 주기를 이것으로 덮는다(`host.retirement.read-interval`).
  * @param incidentLoop 인시던트 고리 설정(`host.incident-loop.<키>`). 키는 `entitlements`·`approval-port`·`export` 다.
  * @param retention 주면 호스트가 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(운영 설정이 아니라 [MissionHostApplication.builder] 로 넣는다).
+ * @param fleet 주면 호스트가 `host.fleet.url` 대신 이것을 플릿 포트로 쓴다(프로세스 안의 플릿 미믹을 [MissionHostApplication.builder] 로 넣는다).
+ * @param fleetUrl 주면 `host.fleet.url` 을 이 값으로 둔다(배선 시험). 안 주면 기본 설정의 빈 값이다(플릿 포트 없음).
  */
 class HostBench(
     private val mockVirtualLimit: Duration? = null,
@@ -64,6 +67,9 @@ class HostBench(
     private val retirementInterval: Duration? = null,
     private val incidentLoop: Map<String, String> = emptyMap(),
     private val retention: Retention? = null,
+    /** 바꾸면 다음 [startHost]·[restartHost] 부터 미친다(플릿 포트 없이 재기동 → 붙여 재기동). */
+    var fleet: AmrFleetPort? = null,
+    private val fleetUrl: String? = null,
 ) : AutoCloseable {
 
     /** [gated] 일 때 스냅숏을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
@@ -94,6 +100,9 @@ class HostBench(
      */
     val hiddenHands: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
+    /** [gated] 일 때 선언(케이퍼빌리티)을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
+    val blindCapabilities: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     /** [gated] 일 때 호스트가 하위에 낸 취소(기체, 태스크 id). */
     val cancels = CopyOnWriteArrayList<Pair<String, String>>()
 
@@ -105,6 +114,8 @@ class HostBench(
 
             override fun cancel(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) =
                 delegate.cancel(robotId, handle).also { cancels += robotId to handle.taskId }
+
+            override fun capabilities(robotId: String) = if (robotId in blindCapabilities) null else delegate.capabilities(robotId)
 
             override fun snapshot(robotId: String): RobotSnapshot? {
                 val read = if (robotId in blockedSnapshots) null else delegate.snapshot(robotId)?.let { if (robotId in hiddenHands) it.copy(hold = null) else it }
@@ -230,7 +241,7 @@ class HostBench(
     fun <T : Any> bean(type: Class<T>): T = context.getBean(type)
 
     /** 이 세트와 같은 인자로 호스트를 하나 띄운다. 기동이 실패하면 예외가 그대로 나간다. */
-    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, if (gated) gatedPort() else null, retention).run(
+    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, if (gated) gatedPort() else null, retention, fleet).run(
         *buildList {
             add("--server.port=0")
             add("--host.mimic.port=${mimic.server.port}")
@@ -244,6 +255,7 @@ class HostBench(
             readInterval?.let { add("--host.site-timings.read-interval=$it") }
             permitMapping?.let { add("--host.work-permit.mapping=$it") }
             add("--host.registry.url=${registryUrl.orEmpty()}")
+            fleetUrl?.let { add("--host.fleet.url=$it") }
             retirementInterval?.let { add("--host.retirement.read-interval=$it") }
             incidentLoop.forEach { (key, value) -> add("--host.incident-loop.$key=$value") }
             heartbeat?.let { (period, expiry) ->
