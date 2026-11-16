@@ -314,7 +314,11 @@ open class MissionHostApplication {
             }
 
         /** 마이그레이션용 연결(풀 없음, 세션 제한 없음). */
-        fun migrationDataSource(url: String, username: String, password: String): DataSource =
+        fun migrationDataSource(
+            url: String,
+            username: String,
+            password: String,
+        ): DataSource =
             org.springframework.jdbc.datasource.DriverManagerDataSource(url, username, password)
 
         /** mimic 에 싣는 클라이언트 id. */
