@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * - 운영 서비스의 주기 작업 셋(스테이션 tick·결과 수집·결과 전달)은 하루 주기로 미뤄 끈다. 하네스가 같은 코드를 직접 불러 잰다.
  *   registry 는 띄우지 않는다(측정 경로가 registry 를 부르지 않는다).
  */
-class LoadStack(val robots: Int, withOps: Boolean = true) : AutoCloseable {
+class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: List<String> = emptyList()) : AutoCloseable {
 
     val pg: PostgreSQLContainer<*> = PostgreSQLContainer("postgres:16-alpine")
         .withDatabaseName("picasso").withUsername("picasso").withPassword("picasso")
@@ -101,7 +101,8 @@ class LoadStack(val robots: Int, withOps: Boolean = true) : AutoCloseable {
 
     fun now(): Instant = mimic.server.exclusive { mimic.instance(robotIds.first())!!.clock.now() }
 
-    val host: ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }).run(
+    /** 실행 호스트 하나를 이 세트의 DB·mimic·셀 대역에 띄운다. [hostArgs] 는 기본 인자 뒤에 붙는다(뒤가 이긴다). */
+    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }).run(
         "--server.port=0",
         "--host.mimic.port=${mimic.server.port}",
         "--host.cell.url=http://127.0.0.1:${cell.address.port}",
@@ -113,8 +114,27 @@ class LoadStack(val robots: Int, withOps: Boolean = true) : AutoCloseable {
         "--host.work-permit.mapping=",
         "--host.registry.url=",
         "--logging.level.root=WARN",
+        *hostArgs.toTypedArray(),
     )
-    val hostUrl = "http://127.0.0.1:${(host as WebServerApplicationContext).webServer.port}"
+
+    /** 지금 뜬 실행 호스트. [killHost] 뒤 [replaceHost] 로 바뀐다. */
+    var host: ConfigurableApplicationContext = startHost()
+        private set
+    val hostUrl: String get() = "http://127.0.0.1:${(host as WebServerApplicationContext).webServer.port}"
+
+    /**
+     * 실행 호스트를 멈춤 기록 없이 죽인다(mission-host `HostBench.killHost` 와 같은 흉내). 커넥션 풀을 먼저 닫아 심장박동과 멈춤 쓰기를 끊고 그 뒤
+     * 컨텍스트를 닫는다. [replaceHost] 전에는 [host] 가 닫힌 컨텍스트다.
+     */
+    fun killHost() {
+        (host.getBean(javax.sql.DataSource::class.java) as AutoCloseable).close()
+        host.close()
+    }
+
+    /** 새 실행 호스트를 같은 인자로 띄워 [host] 로 둔다. */
+    fun replaceHost() {
+        host = startHost()
+    }
     val missionHost: MissionHost get() = host.getBean(MissionHost::class.java)
 
     val ops: ConfigurableApplicationContext? = if (!withOps) null else OpsApplication.builder().run(

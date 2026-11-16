@@ -272,6 +272,19 @@ class HostBench(
         context = startHost()
     }
 
+    /**
+     * 호스트를 멈춤(`stopped_at`) 기록 없이 죽이고 같은 DB 로 다시 띄운다(비정상 종료 흉내). 먼저 그 컨텍스트의 커넥션 풀을 닫아 그
+     * 인스턴스가 더는 DB 에 쓰지 못하게 하고(심장박동이 끊기고 닫기의 멈춤 쓰기가 실패한다), 그 뒤 컨텍스트를 닫아 pump·심장박동 스레드와
+     * mimic 채널을 거둔다. 같은 JVM 안의 흉내라 실제 SIGKILL 과 다른 점이 있다: 스레드가 명령 도중에 멎지 않고 차례로 닫히며, 풀을 닫은 뒤
+     * 컨텍스트를 닫기까지의 짧은 틈에 돈 pump 는 DB 없이 기체 명령을 낼 수 있다(시험은 그 틈에 낼 명령이 없는 자리에서 죽인다).
+     */
+    fun killHost(beforeStart: () -> Unit = {}) {
+        (context.getBean(javax.sql.DataSource::class.java) as AutoCloseable).close()
+        context.close()
+        beforeStart()
+        context = startHost()
+    }
+
     fun now(): Instant = mimic.server.exclusive { mimic.instance(HUMANOID)!!.clock.now() }
 
     fun stopCell() = cell.stop(0)
