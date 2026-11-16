@@ -32,7 +32,16 @@ XML 의 시간은 시험 클래스 안의 시간이라 Spring 문맥·Testcontai
 
 - 잡을 셋으로 나눠 함께 돌림: `:ops-service:build`, `:mission-host:build`, 나머지(`build -x :ops-service:test -x :mission-host:test` — 컴파일·site·e2e·두 모듈의 시험 밖 검사). 셋의 결과를 같은 이름의 `gradle` 잡이 모음.
 - 모듈 안 시험 병렬화는 켜지 않음 — 시험들이 공유 시험 DB 를 쓰고 `HostBench` 가 스키마를 지우므로, DB 격리가 먼저다.
-- 분할 뒤의 벽시계는 그 PR 의 CI 실행으로 잰다(아래에 덧붙임).
+- 분할 뒤의 벽시계는 그 PR 의 CI 실행 `43802465055` 로 쟀다:
+
+| 잡 | 시간 |
+|---|---|
+| gradle (mission-host) | 16분 15초 |
+| gradle (rest) | 13분 58초 |
+| gradle (ops-service) | 4분 55초 |
+| gradle (집계) | 4초 |
+
+  Gradle 쪽 벽시계는 가장 긴 부분인 16분 15초로, 분할 전 한 잡의 33분 43초의 절반 아래다. 제한 45분은 부분마다 그대로 둔다.
 
 ## 재지 못한 것
 
