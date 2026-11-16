@@ -79,10 +79,16 @@ class UnrestoredCloseTest {
         awaitTasks(jobOrderId)
 
         // 2. 판단 기록이 읽히지 않게 된 채 호스트를 다시 띄운다. 호스트는 그 실행을 포기한다.
-        PostgresSupport.execute(
-            "INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record) " +
-                "VALUES ('$jobOrderId', '$instance', '$executionId', '1', '{')",
-        )
+        // 시험이 표에 직접 쓴다: 세션 표식을 세워 쓰기 펜싱 트리거(V19)를 지난다. 운영 경로는 리스를 확인한 트랜잭션에서만 표식을 세운다.
+        PostgresSupport.connection().use { c ->
+            c.createStatement().use { s ->
+                s.execute("SET mission.fenced_generation = 'test'")
+                s.execute(
+                    "INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record) " +
+                        "VALUES ('$jobOrderId', '$instance', '$executionId', '1', '{')",
+                )
+            }
+        }
         stack.restartHost()
         val restore = driver.executions()["restore"]["rows"].single()
         assertEquals(

@@ -567,7 +567,7 @@ class MissionVersionsTest {
             bench.awaitPump()
             assertEquals(1, bench.activated(bench.dataV1()))
             // 트리거는 INSERT 를 막지 않는다. 읽을 수 없는 정의를 버전 2 로 직접 넣는다.
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.mission_version (work_master_id, version, draft_id, definition, activated_by, reason, request_id) " +
                     "SELECT 'PrepareSequencedRack', 2, draft_id, '{\"schemaVersion\": 1}', 'x', 'x', '${UUID.randomUUID()}' FROM mission.draft LIMIT 1",
             )

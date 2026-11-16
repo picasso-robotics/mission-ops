@@ -59,6 +59,13 @@ import dev.picasso.ops.host.cell.CellBandSignals
 import dev.picasso.ops.host.cell.CellSnapshot
 import dev.picasso.ops.host.cell.SourceConfirmation
 import dev.picasso.ops.host.incident.IncidentExport
+import dev.picasso.ops.host.lease.Acquired
+import dev.picasso.ops.host.lease.GatedFleetPort
+import dev.picasso.ops.host.lease.GatedRobotPort
+import dev.picasso.ops.host.lease.HostLeadership
+import dev.picasso.ops.host.lease.LeaderState
+import dev.picasso.ops.host.lease.LeadershipListener
+import dev.picasso.ops.host.lease.SendAuthority
 import dev.picasso.ops.host.mission.MockRunner
 import dev.picasso.middleware.mission.MissionDefinitionParser
 import dev.picasso.middleware.mission.MissionParse
@@ -77,7 +84,9 @@ import dev.picasso.ops.host.store.ApprovalFactWrite
 import dev.picasso.ops.host.store.CopyResolutionRow
 import dev.picasso.ops.host.store.FaultReleaseRow
 import dev.picasso.ops.host.store.HoldObservation
+import dev.picasso.ops.host.store.AuthorityLost
 import dev.picasso.ops.host.store.HostRecords
+import dev.picasso.ops.host.store.NotAuthority
 import dev.picasso.ops.host.store.IncidentCopyRow
 import dev.picasso.ops.host.store.IncidentRevisionWrite
 import dev.picasso.ops.host.store.SearchCopyWrite
@@ -594,11 +603,18 @@ data class HostFootprint(
  * 선언하고, pump 뒤 기록([recordAfterPump])이 줄을 picasso `LedgerExport` 글자 그대로 사본 표에 적어 커밋한 뒤 확인한다. 같은 조치의 승인 횟수의
  * 정본은 승인 사실 표의 합산이다([repeatedRemedies]).
  *
- * ## 인스턴스와 심장박동(HA 설계 기록 §8 단계 0)
+ * ## 리스와 리더 상태(HA 설계 기록 §4·§7, 능동-대기 1단계 기반)
  *
- * [heartbeat] 주기마다 `mission.host_instance` 의 자기 행을 DB 시각으로 고치고, 닫을 때 멈춤을 적는다. 기동 복원은 그 행을 든
- * 인스턴스(바로 앞 RESTORED 이벤트의 인스턴스, 없으면 받은 인스턴스)가 이 인스턴스이거나 심장박동이 끊긴 행만 다시 짓는다. 살아 있는
- * 다른 인스턴스가 든 행은 DEFERRED([HELD_BY_LIVE_INSTANCE])로 미루고 그 기체를 판정에서 빼며, pump 마다 다시 보아 만료되면 다시 짓는다.
+ * [leadership] 이 `mission.host_lease` 를 쥔다. 기동은 심장박동(`mission.host_instance`, 진단용)과 리스 획득 시도만 하고, 복원과 pump 는 리스를
+ * 얻은 뒤에 시작한다([acquired]): 카탈로그·일지·잔여 파지를 DB 에서 다시 읽고 기존 복원을 그대로 다시 쓴다. 복원 권한의 조건은 리스 보유다 — 리스를
+ * 쥔 호스트는 앞 인스턴스의 심장박동과 관계없이 도는 일지 행을 다시 짓는다(살아 있는 인스턴스의 행을 미루던 단계 0 의 DEFERRED 는 더 생기지
+ * 않는다). 앞 세대가 발행을 열었고(리스 기간 행의 발행 표시) 앞 보유자가 정상 종료(멈춤)를 적었으면 곧바로 발행하고([LeaderState.ISSUING]),
+ * 그 밖(만료 인수, 관측 중에 정상 종료한 보유자, 조회로 복구한 획득, 다른 인스턴스가 살아 있는 첫 획득)은 다시 붙어 관측만 하며 운영자 확인 뒤에
+ * 신규 발행을 연다([LeaderState.HOLDING], [Acquired.graceful]).
+ *
+ * 기체·플릿 명령은 미들웨어에 넘기는 포트에서 송신 직전에 리더를 확인한다([GatedRobotPort]·[GatedFleetPort]). DB 쓰기는 기록 저장소의 리스 가드가
+ * 막는다. 리스를 잃으면 pump 와 심장박동을 먼저 멈추고 자기 차단을 (제한 시간 안에) 적는다([lost]). 닫을 때는 리더를 정상 종료 중으로 바꾸고
+ * pump 와 송신 중인 명령이 끝난 것을 본 뒤에만 멈춤을 적으며, 그것을 적었을 때만 리스를 내놓는다([close]).
  *
  * @param robots 하위 포트. 판정의 케이퍼빌리티도 이것으로 묻는다(`PicassoClient` 가 세대별로 캐시한다). 그 캐시는 잠금 밖에서
  *   안전하지 않으므로 케이퍼빌리티는 늘 [lock] 아래에서 묻는다.
@@ -655,14 +671,14 @@ class MissionHost(
     private val store: MissionStore,
     private val json: ObjectMapper,
     private val permits: CellWorkPermits? = null,
-    private val heartbeat: HostHeartbeat = HostHeartbeat.DEFAULT,
+    private val leadership: HostLeadership,
     private val revisableRetention: Duration = DEFAULT_REVISABLE_RETENTION,
     private val retirements: RetirementPort? = null,
     private val entitlements: Entitlements = Entitlements.None,
     export: Path? = null,
     retention: Retention = RETENTION,
     fleet: AmrFleetPort = AmrFleetPort.None,
-) : AutoCloseable {
+) : AutoCloseable, LeadershipListener {
     init {
         require(!revisableRetention.isNegative) { "개정판을 받을 실행을 두는 폭은 음수가 아니어야 한다: $revisableRetention" }
     }
@@ -686,13 +702,15 @@ class MissionHost(
         get() = FleetLinkView(hasFleetPort, (fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort)?.url)
 
     /**
-     * `instanceId` 를 넘기지 않는다 — picasso 기본값(`mw-<UUID>`)이 생성마다 새 값이다. 그 값이 인시던트 열쇠(`incidentKey`)의 유일성을
+     * `instanceId` 는 리스 보유자 id 와 같은 값이다([HostLeadership.instanceId], picasso 기본값과 같은 `mw-<UUID>` 모양으로 프로세스마다 새 값). 그 값이 인시던트 열쇠(`incidentKey`)의 유일성을
      * 진다(picasso §15.322): 인시던트 id 는 재기동마다 `incident-1` 부터 다시 세므로, 고정하면 다른 사건이 같은 열쇠를 얻어 읽는 쪽이
      * 서로 다른 보류를 한 사건으로 접는다. 실행 일지·사본·송신 기록의 인스턴스 칸도 이 값이다.
      */
     private val middleware = Middleware(
-        robots = robots, cell = signals, fleet = fleetPort, now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
-        retirements = retirements, entitlements = entitlements, retention = retention,
+        robots = GatedRobotPort(robots, leadership), cell = signals,
+        fleet = if (fleetPort === AmrFleetPort.None) fleetPort else GatedFleetPort(fleetPort, leadership),
+        now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
+        retirements = retirements, entitlements = entitlements, retention = retention, instanceId = leadership.instanceId,
     )
 
     /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
@@ -853,12 +871,8 @@ class MissionHost(
     /** 증언으로 종결한 행과 그 종결 행. */
     private class Attested(val row: JournalRow, val close: CloseRow)
 
-    /**
-     * 미룬 행. [order]·[mission] 은 [prepare] 가 한 번 읽은 것이고 다시 시도할 때 그대로 쓴다. 행을 든 다른 인스턴스가 살아 있어 미룬 행은
-     * 아직 읽지 않았다(`null`) — 읽지 못하는 행도 그 인스턴스의 것이라 GAVE_UP 으로 적지 않는다. [heldBy] 는 그 동안 그 인스턴스다. 그 심장박동이
-     * 끊긴 것을 보면 `null` 로 두고 보통의 다시 시도로 넘어간다.
-     */
-    private class Deferred(val row: JournalRow, val index: Int, var heldBy: String? = null) {
+    /** 미룬 행. [order]·[mission] 은 [prepare] 가 한 번 읽은 것이고 다시 시도할 때 그대로 쓴다. */
+    private class Deferred(val row: JournalRow, val index: Int) {
         var order: JobOrder? = null
         var mission: ActiveMission? = null
     }
@@ -870,22 +884,59 @@ class MissionHost(
 
     val instanceId: String = middleware.instanceId
 
+    /** 리더 상태(HA 설계 기록 §7). */
+    val leaderState: LeaderState get() = leadership.state
+
+    private var pumpPeriod: Duration = PUMP_PERIOD
+
     /**
-     * 인스턴스 행을 넣고, 실행을 복원하고, pump 와 심장박동을 시작한다. [MissionHostApplication] 이 빈을 만들 때 부른다. 복원이 빈 생성
-     * 안에서 끝나므로 웹 서버가 열리기 전에 판정이 도는 실행을 안다(S4b 스펙 T3). 인스턴스 행이나 복원에서 DB 가 실패하면 예외가 나가
-     * 기동이 멈춘다.
+     * 인스턴스 행을 넣고 심장박동을 시작한 뒤 리스를 얻어 본다([HostLeadership.begin]). [MissionHostApplication] 이 빈을 만들 때 부른다. 곧바로
+     * 얻으면 이 안에서 복원까지 끝나므로 웹 서버가 열리기 전에 판정이 도는 실행을 안다(S4b 스펙 T3). 못 얻으면 대기로 뜨고, 뒤에 얻으면 pump
+     * 스레드에서 복원한다. 인스턴스 행이나 복원에서 DB 가 실패하면 예외가 나가 기동이 멈춘다.
      */
     fun start(period: Duration = PUMP_PERIOD): MissionHost = apply {
-        records.beat(instanceId, heartbeat.expiry)
+        pumpPeriod = period
+        records.beat(instanceId, leadership.timing.expiry)
+        val beat = leadership.timing.period.toMillis()
+        beater.scheduleWithFixedDelay(::beatOnce, beat, beat, TimeUnit.MILLISECONDS)
+        leadership.begin(this) { pumper.execute(it) }
+    }
+
+    /**
+     * 리스를 얻었다([LeaderState.RECONCILING]). 카탈로그(활성 임무 버전)를 DB 에서 다시 읽고, 기존 복원([restore])으로 일지·잔여 파지·포기 행을
+     * 다시 읽어 실행을 다시 짓는다. 그 뒤 리더가 발행([LeaderState.ISSUING]) 또는 관측([LeaderState.HOLDING])에 들고 pump 가 시작한다.
+     */
+    override fun acquired(acquired: Acquired) {
+        lock.withLock { catalog.restore(store.activeVersions()) }
         restore()
-        beater.scheduleWithFixedDelay(::beatOnce, heartbeat.period.toMillis(), heartbeat.period.toMillis(), TimeUnit.MILLISECONDS)
-        pumper.scheduleWithFixedDelay(::pumpOnce, 0, period.toMillis(), TimeUnit.MILLISECONDS)
+        leadership.reconciled()
+        pumper.scheduleWithFixedDelay(::pumpOnce, 0, pumpPeriod.toMillis(), TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * 리스를 잃었다. 송신 확인과 DB 가드는 이미 막혀 있다. pump 와 심장박동을 먼저 멈추고, 자기 차단(가드 밖의 인스턴스 행)은 [FENCE_TIMEOUT] 안에서만
+     * 기다린다 — DB 가 답하지 않아도 종료 훅으로 넘어간다(LOST 인 채 프로세스가 남지 않게).
+     */
+    override fun lost(reason: String) {
+        pumper.shutdownNow()
+        beater.shutdownNow()
+        val fence = Thread({
+            try {
+                records.fence(instanceId, reason)
+            } catch (e: Exception) {
+                log.warn("자기 차단을 적지 못했다: {}", e.toString())
+            }
+        }, "mission-host-fence").apply { isDaemon = true }
+        fence.start()
+        fence.join(FENCE_TIMEOUT.toMillis())
+        if (fence.isAlive) log.warn("자기 차단 기록이 {} 안에 끝나지 않아 기록 없이 종료로 간다", FENCE_TIMEOUT)
     }
 
     /** 심장박동 한 번. 실패는 삼키고 다음 주기에 다시 한다. 만료 폭 안에 다시 적지 못하면 다른 인스턴스가 이 인스턴스를 끊긴 것으로 읽는다. */
     private fun beatOnce() {
+        leadership.stall.pass(HostLeadership.Stall.Part.BEAT)
         try {
-            records.beat(instanceId, heartbeat.expiry)
+            records.beat(instanceId, leadership.timing.expiry)
         } catch (e: Exception) {
             log.warn("심장박동 실패: {}", e.toString())
         }
@@ -896,8 +947,7 @@ class MissionHost(
      * 다시 짓는다. 결과는 일지 이벤트로 남고 복원 보고에 실린다. 그 뒤 포기한 채인 행(이전 기동의 것 포함)을 판정 제외 목록으로, 미해소
      * 잔여 파지 표시를 판정이 읽을 사본으로 읽는다.
      *
-     * 단계 0 범위(HA 설계 기록 §7): 행을 든 인스턴스가 이 인스턴스이거나 심장박동이 끊긴 행만 지금 다시 짓는다. 살아 있는 다른
-     * 인스턴스가 든 행은 DEFERRED 로 미룬다([restoreRow]).
+     * 리스를 쥔 뒤에만 부른다([acquired]). 행을 든 앞 인스턴스의 심장박동은 보지 않는다 — 권한은 리스 보유다(HA 설계 기록 §7).
      */
     private fun restore() = lock.withLock {
         restoredAt = clock.now()
@@ -923,21 +973,8 @@ class MissionHost(
         val previous = previousOf(row)
         val index = restoreRows.size
         restoreRows += RestoreRowView(row.jobOrderId, row.robotId, previous.instanceId, previous.executionId, RestoreResult.GAVE_UP.name, null, null)
-        // 행을 든 인스턴스는 바로 앞 RESTORED 의 인스턴스, 없으면 받은 인스턴스다([previous]). 살아 있으면 가져가지 않는다. 작업 지시를 읽기 전에 본다 —
-        // 읽지 못하는 행을 먼저 GAVE_UP 으로 적으면 살아 있는 인스턴스의 행이 운영자 종결 대상이 된다.
-        val holder = liveHolder(previous)
-        if (holder != null) {
-            val waiting = Deferred(row, index, heldBy = holder)
-            deferred += waiting
-            settleRestore(row, index, previous, RestoreResult.DEFERRED, null, "$HELD_BY_LIVE_INSTANCE: instance=$holder")
-            return
-        }
         attempt(Deferred(row, index), previous, first = true)
     }
-
-    /** 이 일지 행을 든 인스턴스가 이 인스턴스가 아니고 지금 살아 있으면 그 id 다. */
-    private fun liveHolder(previous: RestoredFromView): String? =
-        previous.instanceId.takeIf { it != instanceId && records.instanceLive(it) }
 
     /**
      * 미룬 행의 작업 지시와 임무 버전을 읽어 [Deferred] 에 둔다. 이미 읽었으면 다시 읽지 않는다. 읽지 못하면 GAVE_UP 사유를 돌려준다.
@@ -963,7 +1000,6 @@ class MissionHost(
 
     /**
      * 미룬 행을 다시 시도한다(T3). pump 가 미들웨어 pump 전에 잠금 아래에서 부른다. 이벤트를 못 적으면 다음 pump 에 다시 한다.
-     * 다른 인스턴스가 들어 미룬 행은 그 인스턴스의 심장박동이 끊길 때까지 시도하지 않는다.
      */
     private fun retryDeferred() {
         deferred.toList().forEach { waiting ->
@@ -973,11 +1009,6 @@ class MissionHost(
                 records.closeOf(waiting.row.jobOrderId)?.let { closed ->
                     forgetClosed(waiting.row, closed)
                     return@forEach
-                }
-                val holder = waiting.heldBy
-                if (holder != null) {
-                    if (records.instanceLive(holder)) return@forEach
-                    waiting.heldBy = null
                 }
                 attempt(waiting, previous, first = false)
             } catch (e: Exception) {
@@ -993,7 +1024,7 @@ class MissionHost(
                 deferred += waiting
                 settleRestore(waiting.row, waiting.index, previous, result, null, reason)
             } else if (restoreRows[waiting.index].reason != reason) {
-                // 미룬 까닭이 바뀌었다(다른 인스턴스의 만료 → 스냅숏). 이벤트는 미룬 기동마다 한 번이라 보고 행만 고친다.
+                // 미룬 까닭이 바뀌었다. 이벤트는 미룬 기동마다 한 번이라 보고 행만 고친다.
                 restoreRows[waiting.index] = restoreRows[waiting.index].copy(reason = reason)
             }
             return
@@ -1100,8 +1131,14 @@ class MissionHost(
 
     private fun restoreView(): RestoreView? = restoredAt?.let { RestoreView(it, restoreRows.toList()) }
 
-    /** pump 한 번. 예외를 삼키고 다음 주기에 다시 돈다. 스케줄러는 작업이 예외를 던지면 다음 실행을 멈춘다. */
+    /**
+     * pump 한 번. 예외를 삼키고 다음 주기에 다시 돈다. 스케줄러는 작업이 예외를 던지면 다음 실행을 멈춘다. 리더가 관측([LeaderState.HOLDING])이나
+     * 발행([LeaderState.ISSUING])일 때만 돈다 — 관측 중의 출발·취소는 송신 직전 확인이 보내지 않는다(`CommandNotSent`, 단위는 그대로 기다린다).
+     */
     fun pumpOnce() {
+        leadership.stall.pass(HostLeadership.Stall.Part.PUMP)
+        val state = leadership.state
+        if (state != LeaderState.HOLDING && state != LeaderState.ISSUING) return
         try {
             val cell = cellBand.fetch()
             // 작업 허가 줄의 관측 시각은 이 층이 셀 대역을 읽은 시각이다. 잠금을 기다린 시간은 관측의 나이에 든다.
@@ -1268,6 +1305,10 @@ class MissionHost(
      * 아직 열지 않았다 — 그 보류는 운영자 판단(재작업·완료 확인)이나 운영자 취소로 닫는다.
      */
     fun attemptApproval(attempt: ApprovalAttempt): ApprovalOutcome = lock.withLock {
+        // 승인은 실행을 세우고 로봇 명령으로 이어진다. 발행하는 리더만 받는다(HTTP 의 변경 요청과 같은 규칙, 승인 호스트는 HTTP 필터 밖이다).
+        if (!leadership.mayIssue()) {
+            return@withLock ApprovalOutcome.Refused(ApprovalRefusal.REFUSED_BY_GATE, "${SendAuthority.NOT_ISSUING}: ${leadership.state}")
+        }
         if (middleware.proposalTarget(attempt.robotId, attempt.jobOrderId) is ProposalTarget.Hold) {
             return@withLock approve(middleware, attempt).also {
                 check(it !is ApprovalOutcome.Approved) { "값 없는 문이 회복 제안을 승인했다: ${attempt.robotId} ${attempt.jobOrderId}" }
@@ -1313,10 +1354,10 @@ class MissionHost(
                     journalApproval(execution)
                 } catch (e: Exception) {
                     unjournaledApprovals += execution.executionId
-                    throw JournalWriteFailed(execution.executionId, e)
+                    throw journalFailure(execution.executionId, e)
                 }
             } else {
-                recordReruns()?.let { throw JournalWriteFailed(outcome.executionId, it) }
+                recordReruns()?.let { throw journalFailure(outcome.executionId, it) }
             }
         }
         outcome
@@ -1486,7 +1527,7 @@ class MissionHost(
                     persistRecord(submission.execution.executionId)
                 } else {
                     // 받은 리비전의 개정판 행·판단 기록·리비전 제거 사건을 한 트랜잭션에 적는다([recordReruns]).
-                    recordReruns()?.let { throw JournalWriteFailed(submission.execution.executionId, it) }
+                    recordReruns()?.let { throw journalFailure(submission.execution.executionId, it) }
                 }
                 val removal = if (!existed) null else middleware.revisionRemovals().lastOrNull {
                     it.executionId == submission.execution.executionId && it.toVersion == submission.execution.order.version
@@ -1653,10 +1694,17 @@ class MissionHost(
                 middleware.instanceId, execution.executionId,
             )
         } catch (e: Exception) {
-            throw JournalWriteFailed(execution.executionId, e)
+            throw journalFailure(execution.executionId, e)
         }
         journaled[order.jobOrderId] = order.version
     }
+
+    /**
+     * 일지 쓰기 실패를 요청에 돌려줄 예외로. 리스를 쥐지 않았거나 잃은 쓰기([NotAuthority]·[AuthorityLost])는 감싸지 않는다 — REST 가 500
+     * `JOURNAL_WRITE_FAILED` 가 아니라 503 `NOT_ISSUING` 과 리스 보유자·세대로 답한다.
+     */
+    private fun journalFailure(executionId: String, e: Throwable): RuntimeException =
+        if (e is AuthorityLost || e is NotAuthority) e as RuntimeException else JournalWriteFailed(executionId, e)
 
     /**
      * 표시 기체의 회복 실행(값 없는 승인의 표시 예외, [attemptApproval])을 적는다. 실행 일지, 판단 기록, 표시와 실행의 연결을 **한 트랜잭션**에 둔다.
@@ -1666,7 +1714,7 @@ class MissionHost(
         try {
             journalApproval(execution, markers, approverId)
         } catch (e: Exception) {
-            throw JournalWriteFailed(execution.executionId, e)
+            throw journalFailure(execution.executionId, e)
         }
     }
 
@@ -2832,8 +2880,8 @@ class MissionHost(
      * 3. 일지 행이 없으면 [CloseResult.NOT_FOUND].
      * 4. 마지막이 종결이면 [CloseResult.ALREADY_CLOSED](앞선 종결을 싣는다).
      * 5. picasso 메모리에 그 작업 지시의 실행이 있거나(도는 실행) 마지막이 SETTLED 이면 [CloseResult.NOT_CLOSABLE].
-     * 6. 대상. 종결하지 않은 포기 행([unclosed])이거나, 기체 스냅숏을 못 읽어 미룬 행(`RESUME_SNAPSHOT_UNREADABLE`). 살아 있는 다른 인스턴스가 든
-     *    행([HELD_BY_LIVE_INSTANCE])과 그 밖의 행은 [CloseResult.NOT_CLOSABLE].
+     * 6. 대상. 종결하지 않은 포기 행([unclosed])이거나, 기체 스냅숏을 못 읽어 미룬 행(`RESUME_SNAPSHOT_UNREADABLE`). 그 밖의 행은
+     *    [CloseResult.NOT_CLOSABLE].
      * 7. [seen] 이 지금 일지의 (인스턴스, 실행)과 다르면 [CloseResult.TARGET_CHANGED].
      * 8. 정지 확인. 그 기체의 스냅숏에서 그 작업 지시의 종료하지 않은 태스크를 본다.
      *    - 읽히고 그런 태스크가 없다: 포기 행은 근거 `SNAPSHOT`. 미룬 행은 다음 pump 가 리빌드할 행이라 [CloseResult.NOT_CLOSABLE] 이다
@@ -2842,8 +2890,8 @@ class MissionHost(
      *    - 스냅숏을 못 읽었거나 남은 태스크가 모두 사람을 기다리는 상태다: [attestedStopped] 가 거짓이면 [CloseResult.STOP_UNCONFIRMED], 참이면
      *      근거 `ATTESTED`.
      *
-     * 포기 행([unclosed])도 행을 든 인스턴스(`previous.instanceId`, 이 인스턴스가 아님)가 살아 있으면 [CloseResult.NOT_CLOSABLE] 이다
-     * ([HELD_BY_LIVE_INSTANCE]). 마지막 차례는 메모리가 아니라 DB 에서 읽고, 다른 인스턴스가 종결한 행은 이 인스턴스의 메모리에서도 뺀다([forgetClosed]).
+     * 이 호스트는 리스를 쥐었으므로(종결은 변경 요청이라 발행하는 리더만 받는다) 행을 든 앞 인스턴스의 심장박동은 보지 않는다. 마지막 차례는 메모리가
+     * 아니라 DB 에서 읽고, 다른 인스턴스가 종결한 행은 이 인스턴스의 메모리에서도 뺀다([forgetClosed]).
      *
      * 이 요청 id 는 잠금을 기다리는 동안과 스냅숏을 읽는 동안에도 처리 중이다([CloseInProgress]). 미룬 행의 종결은 기체 스냅숏을 읽는 동안 호스트 잠금을
      * 쥔다 — 스냅숏 읽기가 오래 걸리면 그 동안 pump 와 다른 조작이 기다린다.
@@ -2894,12 +2942,9 @@ class MissionHost(
         if (abandoned != null) {
             restoreReason = abandoned.reason
             previous = abandoned.previous
-            // 이전 기동이 읽지 못해 포기한 행도 살아 있는 다른 인스턴스가 든 채일 수 있다.
-            liveHolder(previous)?.let { return answer(CloseResult.NOT_CLOSABLE, "$HELD_BY_LIVE_INSTANCE: instance=$it") }
         } else if (waiting != null) {
             val row = restoreRows[waiting.index]
             restoreReason = row.reason.orEmpty()
-            if (waiting.heldBy != null || restoreReason.startsWith(HELD_BY_LIVE_INSTANCE)) return answer(CloseResult.NOT_CLOSABLE, restoreReason)
             if (!restoreReason.startsWith(Middleware.RESUME_SNAPSHOT_UNREADABLE)) {
                 return answer(CloseResult.NOT_CLOSABLE, "운영자 종결할 수 없는 미룬 행이다: $restoreReason")
             }
@@ -2976,27 +3021,21 @@ class MissionHost(
     private fun describe(tasks: Map<String, TaskState>): String = tasks.entries.joinToString(", ") { "${it.key}=${it.value.name}" }
 
     /**
-     * 실행 목록 페이지의 `unrestored`(결함 14). 행은 메모리에서 읽는다. 다만 종결하지 않은 포기 행([unclosed])은 행을 든 인스턴스의 심장박동을 행마다
-     * DB 에서 읽는다(살아 있으면 `closable=false`). 포기 행은 재기동을 몇 번 넘어도 남고, 미룬 행과 증언으로 종결했으나 스냅숏이 아직 동의하지 않은
+     * 실행 목록 페이지의 `unrestored`(결함 14). 행은 메모리에서 읽는다. 포기 행은 재기동을 몇 번 넘어도 남고, 미룬 행과 증언으로 종결했으나 스냅숏이 아직 동의하지 않은
      * 행([attested])이 뒤따른다. 호스트 잠금 아래에서 부른다.
      */
     private fun unrestoredRows(): List<UnrestoredRowView> {
         val excluded = gaveUp.mapTo(HashSet()) { it.jobOrderId }
         val abandoned = unclosed.values.map {
-            // 행을 든 인스턴스가 살아 있으면 닫을 수 없다([closeUnrestored]). 심장박동은 DB 에서 읽는다.
-            val holder = liveHolder(it.previous)
             UnrestoredRowView(
                 it.row.jobOrderId, it.row.robotId, it.previous.instanceId, it.previous.executionId, RestoreResult.GAVE_UP.name, it.reason, it.since,
-                closable = holder == null, notClosableReason = holder?.let { id -> "$HELD_BY_LIVE_INSTANCE: instance=$id" }, close = null,
-                robotExcluded = it.row.jobOrderId in excluded,
+                closable = true, notClosableReason = null, close = null, robotExcluded = it.row.jobOrderId in excluded,
             )
         }
         val waiting = deferred.map {
             val row = restoreRows[it.index]
-            // 살아 있는 다른 인스턴스가 든 행과 플릿 포트가 없어 미룬 행은 닫을 수 없다([closeLocked]). 앞의 것은 그 심장박동이 끊기면, 뒤의 것은
-            // 플릿 포트를 붙인 기동에서 다시 지어진다.
-            val held = it.heldBy != null || row.reason?.startsWith(HELD_BY_LIVE_INSTANCE) == true ||
-                row.reason?.startsWith(HostRequests.FLEET_PORT_ABSENT) == true
+            // 플릿 포트가 없어 미룬 행은 닫을 수 없다([closeLocked]). 플릿 포트를 붙인 기동에서 다시 지어진다.
+            val held = row.reason?.startsWith(HostRequests.FLEET_PORT_ABSENT) == true
             UnrestoredRowView(
                 row.jobOrderId, row.robotId, row.previousInstanceId, row.previousExecutionId, RestoreResult.DEFERRED.name, row.reason,
                 restoredAt ?: clock.now(), closable = !held, notClosableReason = row.reason.takeIf { held }, close = null, robotExcluded = true,
@@ -3168,23 +3207,44 @@ class MissionHost(
     )
 
     /**
-     * pump 와 심장박동을 멈추고 멈춤을 적는다. 다음 기동은 이 인스턴스의 행을 만료를 기다리지 않고 가져간다. 멈춤을 못 적으면(DB
-     * 실패) 다음 기동은 만료 폭만큼 그 행을 미룬다.
+     * 닫는다(정상 종료). 멈춤(`stopped_at`)은 «이 프로세스는 더 보내지 않는다» 의 증거여야 한다 — 다음 보유자가 그것(과 이 세대가 발행을 열었다는
+     * 표시)을 보고 곧바로 발행하기 때문이다. 그래서 순서는:
+     * 1. 리더를 [LeaderState.STOPPING] 으로 바꿔 송신 직전 확인·DB 쓰기 가드·변경 HTTP 를 닫는다.
+     * 2. pump·심장박동을 멈추고 pump 가 멈춘 것을 본다.
+     * 3. 송신 직전 확인을 지난 기체·플릿·셀 송신(picasso `IssuingRobotPort`·`IssuingFleetPort` 의 송신 스레드 포함)이 다 끝나기를 기다린다
+     *    ([HostLeadership.awaitQuiet]). 그 포트 빈은 이 빈보다 뒤에 닫히므로 송신 스레드는 아직 살아 있고, 1 뒤에는 새 송신이 확인을 지나지 못한다.
+     * 4. 멈춤을 적고, 적었을 때만 리스를 내놓는다.
+     * 2·3 을 제한 시간 안에 확인하지 못하면 멈춤도 리스 반환도 하지 않는다 — 다음 보유자는 만료를 기다려 관측(HOLDING)으로 든다. 리스를 잃은 뒤에는
+     * 멈춤도 내놓기도 하지 않는다(자기 차단 기록이 이미 있다). 대기(리스 없음)면 멈춤만 적는다.
      */
     override fun close() {
+        val held = leadership.stopping()
         pumper.shutdownNow()
         beater.shutdownNow()
-        pumper.awaitTermination(2, TimeUnit.SECONDS)
+        val pumpStopped = pumper.awaitTermination(2, TimeUnit.SECONDS)
         beater.awaitTermination(2, TimeUnit.SECONDS)
-        try {
+        if (leadership.state == LeaderState.LOST) return
+        val quiet = !held || leadership.awaitQuiet(SEND_QUIET_TIMEOUT.toMillis())
+        if (!quiet) log.warn("송신 중인 명령이 {} 안에 끝나지 않아 멈춤을 적지 않는다(다음 보유자는 만료 인수)", SEND_QUIET_TIMEOUT)
+        val stopped = pumpStopped && quiet
+        val recorded = stopped && try {
             records.stopInstance(instanceId)
+            true
         } catch (e: Exception) {
             log.warn("인스턴스 멈춤을 적지 못했다: {}", e.toString())
+            false
         }
+        if (recorded) leadership.release()
     }
 
     companion object {
         private val log = LoggerFactory.getLogger(MissionHost::class.java)
+
+        /** 정상 종료가 송신 중인 명령이 끝나기를 기다리는 한도([close]). 넘기면 멈춤을 적지 않는다. */
+        val SEND_QUIET_TIMEOUT: Duration = Duration.ofSeconds(5)
+
+        /** 리스를 잃은 뒤 자기 차단 기록을 기다리는 한도([lost]). 넘기면 기록 없이 종료로 간다. */
+        val FENCE_TIMEOUT: Duration = Duration.ofSeconds(2)
 
         /** pump 주기(T5). 셀 대역이 채운 슬롯을 E2 마감(15초)보다 훨씬 짧게 다시 읽는다. */
         val PUMP_PERIOD: Duration = Duration.ofMillis(250)
@@ -3238,12 +3298,6 @@ class MissionHost(
 
         /** 현장 시간값 미적용 동안 판정이 기체마다 더하는 이유(S3c 스펙 T8). 화면에 그대로 보인다. */
         const val UNAPPLIED_REASON = "현장 시간값 미적용: 실행 호스트가 현장 설정을 아직 읽지 못했다"
-
-        /**
-         * 살아 있는 다른 인스턴스가 든 일지 행을 미룬 DEFERRED 사유의 앞부분(HA 설계 기록 §7 단계 0). 뒤에 `: instance=<id>` 가 붙는다.
-         * 그 인스턴스의 심장박동이 끊기면 pump 가 다시 짓는다.
-         */
-        const val HELD_BY_LIVE_INSTANCE = "살아 있는 다른 인스턴스가 든 실행이라 리빌드하지 않는다"
 
         /** 판단 기록을 못 읽은 GAVE_UP 사유의 앞부분. 뒤에 `: record=<기록 행 번호>, <picasso 의 읽기 거부 문장>` 이 붙는다. */
         const val RECORD_UNREADABLE = "판단 기록을 읽지 못해 리빌드하지 않는다"

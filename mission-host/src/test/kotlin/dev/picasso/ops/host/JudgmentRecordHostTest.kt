@@ -279,7 +279,7 @@ class JudgmentRecordHostTest {
                 "DELETE FROM mission.execution_judgment_record",
                 "TRUNCATE mission.execution_judgment_record",
             ).forEach { sql ->
-                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                val e = assertFailsWith<SQLException>(sql) { Fenced.execute(sql) }
                 assertTrue("덧붙이기만" in e.message!!, "$sql: ${e.message}")
             }
         }
@@ -321,7 +321,7 @@ class JudgmentRecordHostTest {
         /** 이전 인스턴스(`mw-before`, 심장박동 행 없음)가 받은 InspectAsset 일지 행을 넣는다. */
         fun insertJournal(jobOrderId: String, robotId: String) {
             val order = JSON.writeValueAsString(JSON.readTree(inspect(jobOrderId, "T1" to "bay-7")))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('$jobOrderId', '$robotId', '$order'::jsonb, 'InspectAsset', NULL, 'mw-before', 'exec-7')
@@ -331,7 +331,7 @@ class JudgmentRecordHostTest {
 
         /** 판단 기록 한 행을 글자 그대로 넣고 행 번호를 낸다. */
         fun insertRecord(jobOrderId: String, instanceId: String, executionId: String, record: String): Long =
-            PostgresSupport.connection().use { c ->
+            Fenced.connection().use { c ->
                 c.prepareStatement(
                     "INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record) VALUES (?, ?, ?, ?, ?) RETURNING record_id",
                 ).use { s ->

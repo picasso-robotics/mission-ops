@@ -211,7 +211,7 @@ class HostRestoreTest {
             ) as ObjectNode
             IDENTITY_FIELDS.forEach { stored.remove(it) }
             stored.put("instanceId", "mw-old")
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail)
                 VALUES ('mw-old', 'incident-1', 'exec-1', 'JO-0', '$WAIT', '${JSON.writeValueAsString(stored).replace("'", "''")}'::json)
@@ -395,7 +395,7 @@ class HostRestoreTest {
 
         fun insertJournal(jobOrderId: String, robotId: String, evidence: String) {
             val order = JSON.writeValueAsString(JSON.readTree(inspect(jobOrderId, "T1" to "bay-7", evidence = evidence)))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('$jobOrderId', '$robotId', '$order'::jsonb, 'InspectAsset', NULL, 'mw-before', 'exec-7')

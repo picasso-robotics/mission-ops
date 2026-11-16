@@ -148,7 +148,7 @@ class DestinationObservationHostTest {
             assertEquals("ENGINEER", refusal["owner"].asText())
 
             // 선언 전에 활성화한 버전이 저장돼 있다(트리거는 INSERT 를 막지 않는다). 채우지 않으면 재기동이 멈춘다.
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.mission_version (work_master_id, version, draft_id, definition, activated_by, reason, request_id) " +
                     "VALUES ('$PSR', 1, $draftId, '${legacy.replace("'", "''")}', 'lee', '선언 전 활성화', '${UUID.randomUUID()}')",
             )

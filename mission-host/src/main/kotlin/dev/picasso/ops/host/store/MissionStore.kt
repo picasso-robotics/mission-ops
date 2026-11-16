@@ -49,10 +49,13 @@ data class RequestRows(val draft: DraftRow?, val mockRun: MockRunRow?, val versi
 /**
  * `mission` 스키마의 표 셋(S3b 스펙 §6.1). 덧붙이기와 읽기만 있다. 고치기·지우기는 스키마의 트리거가 막는다.
  *
- * 문장 하나가 한 트랜잭션이다. 호출은 짧고 연결을 쥔 채 호스트 잠금을 기다리지 않는다(T2). 활성화는 호스트 잠금 아래에서
+ * 문장 하나가 한 트랜잭션이다(쓰기는 리스를 확인하는 트랜잭션). 호출은 짧고 연결을 쥔 채 호스트 잠금을 기다리지 않는다(T2). 활성화는 호스트 잠금 아래에서
  * 이것을 부르므로 잠금 순서는 «호스트 잠금 → DB» 한 방향뿐이다.
  */
-class MissionStore(private val jdbc: JdbcClient) {
+class MissionStore(private val jdbc: JdbcClient, guard: AuthorityGuard) {
+
+    /** 쓰기 문장은 리스 가드를 지난다(V19, [AuthorityGuard]). 리스를 쥔 리더가 아니면 적지 않는다. */
+    private val writes: JdbcClient = guard.writes
 
     /** DB 의 지금 시각. 모의 실행의 시작 시각을 DB 시계로 적으려고 쓴다. */
     fun now(): Instant = jdbc.sql("SELECT clock_timestamp()").query { rs, _ -> instant(rs, 1) }.single()
@@ -61,7 +64,7 @@ class MissionStore(private val jdbc: JdbcClient) {
     fun requestIdUsed(requestId: UUID): Boolean = byRequest(requestId).found
 
     fun saveDraft(workMasterId: String, definition: String, savedBy: String, requestId: UUID,sampleOrder:String?=null): DraftRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.draft (work_master_id, definition, saved_by, request_id,sample_order)
             VALUES (:workMaster, :definition, :savedBy, :requestId,CAST(:sample AS JSONB))
@@ -95,7 +98,7 @@ class MissionStore(private val jdbc: JdbcClient) {
 
     /** 모의 실행 한 건을 남긴다. [startedAt] 은 [now] 로 잰 DB 시각이고 끝 시각은 넣는 순간의 DB 시각이다. */
     fun saveMockRun(draftId: Long, passed: Boolean, resultJson: String, requestId: UUID, startedAt: Instant): MockRunRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.mock_run (draft_id, passed, result, request_id, started_at)
             VALUES (:draftId, :passed, CAST(:result AS jsonb), :requestId, :startedAt)
@@ -130,7 +133,7 @@ class MissionStore(private val jdbc: JdbcClient) {
         reason: String,
         requestId: UUID,
     ): VersionRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.mission_version (work_master_id, version, draft_id, definition, activated_by, reason, request_id)
             SELECT :workMaster, COALESCE(MAX(version), 0) + 1, :draftId, :definition, :activatedBy, :reason, :requestId

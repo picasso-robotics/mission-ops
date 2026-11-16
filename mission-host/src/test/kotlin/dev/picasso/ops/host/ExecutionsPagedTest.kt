@@ -88,13 +88,13 @@ class ExecutionsPagedTest {
     @Test
     fun `정착 기록이 커밋되기 전의 정착 실행은 남은 실행으로 보이고 기록되면 정착 이력으로 옮긴다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_settled() RETURNS trigger AS ${'$'}${'$'} BEGIN
                   IF NEW.kind = 'SETTLED' THEN RAISE EXCEPTION 'settled refused'; END IF; RETURN NEW; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_settled BEFORE INSERT ON mission.execution_journal_event FOR EACH ROW EXECUTE FUNCTION mission.refuse_settled()")
+            Fenced.execute("CREATE TRIGGER refuse_settled BEFORE INSERT ON mission.execution_journal_event FOR EACH ROW EXECUTE FUNCTION mission.refuse_settled()")
             bench.driveUntil(submit(bench, "JO-1"), settledStates)
             bench.idlePumps()
             val unrecorded = bench.get("/host/executions?recent=5")
@@ -103,7 +103,7 @@ class ExecutionsPagedTest {
             assertTrue(unrecorded["settled"].isEmpty)
             assertEquals(1, bench.get("/host/executions/summary")["live"].asInt())
 
-            PostgresSupport.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
+            Fenced.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
             bench.eventually("정착 기록") { settledEvents() == 1 }
             val recorded = bench.get("/host/executions?recent=5")
             assertEquals(emptyList(), ids(recorded))
@@ -160,12 +160,12 @@ class ExecutionsPagedTest {
     @Test
     fun `일지에 막힌 실행은 활성이라 화면 목록에 늘 들고 실행 수의 남은 실행과 막힘에도 든다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_journal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'journal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
+            Fenced.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
             assertEquals(500, bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID)).status)
             val page = bench.get("/host/executions?recent=1")
             assertEquals(listOf("exec-1"), ids(page))

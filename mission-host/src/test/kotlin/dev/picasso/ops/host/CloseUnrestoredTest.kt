@@ -44,7 +44,7 @@ class CloseUnrestoredTest {
                 // V13 의 확인 표가 이 표를 가리키므로 CASCADE 가 없으면 외래 키가 먼저 막는다. CASCADE 는 두 표의 TRUNCATE 트리거를 탄다.
                 "TRUNCATE mission.execution_close CASCADE",
             ).forEach { sql ->
-                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                val e = assertFailsWith<SQLException>(sql) { Fenced.execute(sql) }
                 assertTrue("덧붙이기만" in e.message!!, "$sql: ${e.message}")
             }
             // 승인자는 사람뿐이다.
@@ -59,7 +59,7 @@ class CloseUnrestoredTest {
             assertEquals(1, closeRows())
             // CLOSED 이벤트는 실행 id 를 싣지 않는다(종결한 쌍은 종결 행에 있다).
             assertFailsWith<SQLException>("실행 id 를 실은 CLOSED") {
-                PostgresSupport.execute(
+                Fenced.execute(
                     "INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, execution_id, detail) " +
                         "VALUES ('JO-2', 'CLOSED', 'mw-now', 'exec-7', 'SNAPSHOT')",
                 )
@@ -151,7 +151,7 @@ class CloseUnrestoredTest {
             // 작업 지시 칸이 모자라 GAVE_UP 이 된 일지 행. 종결 응답은 읽히는 칸과 송신 기록만으로 짓는다.
             insertRawJournal("JO-1", HUMANOID)
             insertRawJournal("JO-2", QUADRUPED)
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.job_response_log (instance_id, job_response_id, job_order_id, execution_id, version, physical_state, required_evidence,
                     reached_evidence, completed_units, unverified_units, incomplete_units, in_doubt_units, operator_required, residual_hold, blocked_by, disposition)
@@ -389,76 +389,50 @@ class CloseUnrestoredTest {
     }
 
     @Test
-    fun `살아 있는 다른 인스턴스가 든 미룬 행은 NOT_CLOSABLE 이고 아무것도 적지 않는다`() {
+    fun `심장박동이 살아 있는 다른 인스턴스가 든 행도 리스를 쥔 호스트는 다시 짓고 그 실행은 운영자 종결 대상이 아니다`() {
         HostBench().use { bench ->
             insertJournal("JO-1", HUMANOID, instanceId = "mw-other")
-            PostgresSupport.execute("INSERT INTO mission.host_instance (instance_id, expires_at) VALUES ('mw-other', clock_timestamp() + interval '1 hour')")
+            liveInstance("mw-other")
             bench.restartHost()
-            val watermark = bench.get("/host/result-events")["highWatermark"].asLong()
-            val listed = bench.get("/host/executions?recent=20")["unrestored"].single()
-            assertEquals(listOf("JO-1", "DEFERRED", false), listOf("jobOrderId", "result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
-            assertTrue(listed["notClosableReason"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), listed.toString())
+            val row = bench.get("/host/executions")["restore"]["rows"].single()
+            assertEquals("RESTORED", row["result"].asText(), row.toString())
+            assertTrue(bench.get("/host/executions?recent=20")["unrestored"].isEmpty)
 
             val reply = bench.close("JO-1", seen = "mw-other" to "exec-7", attested = true)
             assertEquals(200, reply.status, reply.body.toString())
             assertEquals("NOT_CLOSABLE", reply.body!!["result"].asText(), reply.body.toString())
-            assertTrue(reply.body["detail"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), reply.body.toString())
-            assertEquals(listOf("DEFERRED"), kinds("JO-1"))
+            assertTrue(reply.body["detail"].asText().startsWith("진행 중인 실행이다"), reply.body.toString())
+            assertEquals(listOf("RESTORED"), kinds("JO-1"))
             assertEquals(0, closeRows())
-            assertEquals(watermark, bench.get("/host/result-events")["highWatermark"].asLong())
         }
     }
 
     @Test
-    fun `살아 있는 다른 인스턴스가 든 행은 작업 지시를 못 읽어도 GAVE_UP 으로 적지 않고 미루며 닫을 수 없고 그 심장박동이 끊기면 포기하고 닫을 수 있다`() {
+    fun `작업 지시를 못 읽는 행은 심장박동이 살아 있는 다른 인스턴스가 들었어도 리스를 쥔 호스트가 곧바로 포기하고 닫을 수 있다`() {
         HostBench().use { bench ->
             insertRawJournal("JO-1", HUMANOID, instanceId = "mw-other")
             liveInstance("mw-other")
             bench.restartHost()
             val row = bench.get("/host/executions")["restore"]["rows"].single()
-            assertEquals("DEFERRED", row["result"].asText(), row.toString())
-            assertTrue(row["reason"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), row.toString())
-            assertEquals(listOf("DEFERRED"), kinds("JO-1"))
+            assertEquals("GAVE_UP", row["result"].asText(), row.toString())
+            assertEquals(listOf("GAVE_UP"), kinds("JO-1"))
             val listed = bench.get("/host/executions?recent=20")["unrestored"].single()
-            assertEquals(listOf("DEFERRED", false), listOf("result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
-            assertTrue(listed["notClosableReason"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), listed.toString())
-
-            val refused = bench.close("JO-1", seen = "mw-other" to "exec-7", attested = true)
-            assertEquals("NOT_CLOSABLE", refused.body!!["result"].asText(), refused.body.toString())
-            assertTrue(refused.body["detail"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), refused.body.toString())
-            assertEquals(0, closeRows())
-            bench.idlePumps()
-            assertEquals(listOf("DEFERRED"), kinds("JO-1"))
-
-            // 심장박동이 끊기면 읽지 못하는 행은 그때 포기하고, 포기한 행은 닫을 수 있다.
-            expireInstance("mw-other")
-            bench.eventually("만료 뒤 포기") { kinds("JO-1") == listOf("DEFERRED", "GAVE_UP") }
-            assertEquals(true, bench.get("/host/executions?recent=20")["unrestored"].single()["closable"].asBoolean())
+            assertEquals(listOf("GAVE_UP", true), listOf("result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
+            assertTrue(listed["notClosableReason"].isNull, listed.toString())
             assertEquals("CLOSED", bench.close("JO-1", seen = "mw-other" to "exec-7").body!!["result"].asText())
         }
     }
 
     @Test
-    fun `이전 기동에서 포기했으나 그 일지 행을 든 인스턴스가 살아 있으면 포기 행도 닫을 수 없다`() {
+    fun `이전 기동에서 포기한 행은 그 일지 행을 든 인스턴스의 심장박동이 살아 있어도 리스를 쥔 호스트가 닫을 수 있다`() {
         HostBench().use { bench ->
             insertRawJournal("JO-1", HUMANOID, instanceId = "mw-other")
             insertGaveUpEvent("JO-1")
             liveInstance("mw-other")
             bench.restartHost()
             val listed = bench.get("/host/executions?recent=20")["unrestored"].single()
-            assertEquals(listOf("GAVE_UP", false), listOf("result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
-            assertTrue(listed["notClosableReason"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), listed.toString())
-
-            val refused = bench.close("JO-1", seen = "mw-other" to "exec-7", attested = true)
-            assertEquals("NOT_CLOSABLE", refused.body!!["result"].asText(), refused.body.toString())
-            assertTrue(refused.body["detail"].asText().startsWith(MissionHost.HELD_BY_LIVE_INSTANCE), refused.body.toString())
-            assertEquals(listOf("GAVE_UP"), kinds("JO-1"))
-            assertEquals(0, closeRows())
-
-            expireInstance("mw-other")
-            val after = bench.get("/host/executions?recent=20")["unrestored"].single()
-            assertEquals(true, after["closable"].asBoolean(), after.toString())
-            assertTrue(after["notClosableReason"].isNull, after.toString())
+            assertEquals(listOf("GAVE_UP", true), listOf("result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
+            assertTrue(listed["notClosableReason"].isNull, listed.toString())
             assertEquals("CLOSED", bench.close("JO-1", seen = "mw-other" to "exec-7").body!!["result"].asText())
         }
     }
@@ -523,7 +497,7 @@ class CloseUnrestoredTest {
 
             // 종결한 작업 지시(SETTLED).
             insertJournal("JO-DONE", QUADRUPED)
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, execution_id, detail) VALUES ('JO-DONE', 'SETTLED', 'mw-before', 'exec-7', 'PHYSICALLY_DONE')",
             )
             val settled = bench.close("JO-DONE").body!!
@@ -588,7 +562,7 @@ class CloseUnrestoredTest {
             gaveUp(bench, "JO-1", HUMANOID)
             val watermark = bench.get("/host/result-events")["highWatermark"].asLong()
             // 결과 아웃박스 쓰기가 마지막이다. 거기서 실패하면 앞의 이벤트·종결 행·송신 기록이 같이 돌아가야 한다.
-            PostgresSupport.execute("ALTER TABLE mission.result_outbox ADD CONSTRAINT refuse_close CHECK (response_id NOT LIKE 'close-%')")
+            Fenced.execute("ALTER TABLE mission.result_outbox ADD CONSTRAINT refuse_close CHECK (response_id NOT LIKE 'close-%')")
             val requestId = UUID.randomUUID().toString()
             val failed = bench.close("JO-1", requestId = requestId)
             assertEquals(500, failed.status, failed.body.toString())
@@ -601,7 +575,7 @@ class CloseUnrestoredTest {
             val listed = bench.get("/host/executions?recent=20")["unrestored"].single()
             assertEquals(listOf("JO-1", "GAVE_UP", true), listOf("jobOrderId", "result", "closable").map { listed[it].let { v -> if (v.isBoolean) v.asBoolean() else v.asText() } }, listed.toString())
 
-            PostgresSupport.execute("ALTER TABLE mission.result_outbox DROP CONSTRAINT refuse_close")
+            Fenced.execute("ALTER TABLE mission.result_outbox DROP CONSTRAINT refuse_close")
             val retried = bench.close("JO-1", requestId = requestId)
             assertEquals("CLOSED", retried.body!!["result"].asText(), retried.body.toString())
             assertEquals(watermark + 1, bench.get("/host/result-events")["highWatermark"].asLong())
@@ -724,21 +698,21 @@ class CloseUnrestoredTest {
             insertJournal("JO-1", HUMANOID)
             insertClose("JO-1", "ATTESTED")
             val closeId = PostgresSupport.queryOne("SELECT close_id FROM mission.execution_close") { it.getLong(1) }
-            PostgresSupport.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-now')")
+            Fenced.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-now')")
             assertEquals(1, confirmedRows())
             listOf(
                 "UPDATE mission.execution_close_confirmed SET instance_id = 'x'",
                 "DELETE FROM mission.execution_close_confirmed",
                 "TRUNCATE mission.execution_close_confirmed",
             ).forEach { sql ->
-                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                val e = assertFailsWith<SQLException>(sql) { Fenced.execute(sql) }
                 assertTrue("덧붙이기만" in e.message!!, "$sql: ${e.message}")
             }
             assertFailsWith<SQLException>("같은 종결 행") {
-                PostgresSupport.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-other')")
+                Fenced.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-other')")
             }
             assertFailsWith<SQLException>("없는 종결 행") {
-                PostgresSupport.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES (${closeId + 1000}, 'mw-now')")
+                Fenced.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES (${closeId + 1000}, 'mw-now')")
             }
             assertEquals(1, confirmedRows())
         }
@@ -750,14 +724,14 @@ class CloseUnrestoredTest {
             val reason = "${MissionHost.CLOSED_UNCONFIRMED_REASON}: JO-1"
             attestedDeferredClose(bench)
             finishTasks(bench)
-            PostgresSupport.execute("ALTER TABLE mission.execution_close_confirmed ADD CONSTRAINT refuse_confirm CHECK (false)")
+            Fenced.execute("ALTER TABLE mission.execution_close_confirmed ADD CONSTRAINT refuse_confirm CHECK (false)")
             // 스냅숏은 동의하지만 확인 행을 못 적는다. 판정은 깨지지 않고 기체는 계속 빠지며 목록에도 남는다.
             assertEquals(listOf(reason), reasons(bench, HUMANOID))
             assertEquals(listOf(reason), reasons(bench, HUMANOID))
             assertEquals(0, confirmedRows())
             assertEquals("CLOSED", bench.get("/host/executions?recent=20")["unrestored"].single()["result"].asText())
 
-            PostgresSupport.execute("ALTER TABLE mission.execution_close_confirmed DROP CONSTRAINT refuse_confirm")
+            Fenced.execute("ALTER TABLE mission.execution_close_confirmed DROP CONSTRAINT refuse_confirm")
             assertEquals(emptyList(), reasons(bench, HUMANOID))
             assertEquals(1, confirmedRows())
             assertTrue(bench.get("/host/executions?recent=20")["unrestored"].isEmpty)
@@ -770,7 +744,7 @@ class CloseUnrestoredTest {
             attestedDeferredClose(bench)
             finishTasks(bench)
             val closeId = PostgresSupport.queryOne("SELECT close_id FROM mission.execution_close") { it.getLong(1) }
-            PostgresSupport.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-other')")
+            Fenced.execute("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES ($closeId, 'mw-other')")
             assertEquals(emptyList(), reasons(bench, HUMANOID))
             assertEquals(listOf("mw-other"), PostgresSupport.queryAll("SELECT instance_id FROM mission.execution_close_confirmed") { it.getString(1) })
             assertTrue(bench.get("/host/executions?recent=20")["unrestored"].isEmpty)
@@ -851,7 +825,7 @@ class CloseUnrestoredTest {
         /** 앞 인스턴스([instanceId], 심장박동 행 없음)가 받은 InspectAsset 일지 행을 넣는다. */
         fun insertJournal(jobOrderId: String, robotId: String, instanceId: String = "mw-before", evidence: String = "E0") {
             val order = JSON.writeValueAsString(JSON.readTree(inspect(jobOrderId, "T1" to "bay-7", evidence = evidence)))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('$jobOrderId', '$robotId', '$order'::jsonb, 'InspectAsset', NULL, '$instanceId', 'exec-7')
@@ -862,7 +836,7 @@ class CloseUnrestoredTest {
         fun insertJournal(jobOrderId: String, robotId: String, evidence: String) = insertJournal(jobOrderId, robotId, "mw-before", evidence)
 
         /** 작업 지시 칸이 `jobOrderId` 뿐이라 `HostRequests.jobOrder` 가 읽지 못하는 일지 행을 넣는다. */
-        fun insertRawJournal(jobOrderId: String, robotId: String, instanceId: String = "mw-before") = PostgresSupport.execute(
+        fun insertRawJournal(jobOrderId: String, robotId: String, instanceId: String = "mw-before") = Fenced.execute(
             """
             INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
             VALUES ('$jobOrderId', '$robotId', '{"jobOrderId":"$jobOrderId"}'::jsonb, 'InspectAsset', NULL, '$instanceId', 'exec-7')
@@ -871,21 +845,16 @@ class CloseUnrestoredTest {
 
         /** 심장박동이 한 시간 뒤까지 살아 있는 다른 인스턴스 행을 넣는다. */
         fun liveInstance(id: String) =
-            PostgresSupport.execute("INSERT INTO mission.host_instance (instance_id, expires_at) VALUES ('$id', clock_timestamp() + interval '1 hour')")
-
-        /** 그 인스턴스의 심장박동이 끊긴 것으로 만든다. */
-        fun expireInstance(id: String) =
-            // last_seen_at 도 함께 앞으로 당긴다: expires_at >= last_seen_at(V7) 을 행을 넣은 직후에도 지킨다.
-            PostgresSupport.execute("UPDATE mission.host_instance SET last_seen_at = clock_timestamp() - interval '2 seconds', expires_at = clock_timestamp() - interval '1 second' WHERE instance_id = '$id'")
+            Fenced.execute("INSERT INTO mission.host_instance (instance_id, expires_at) VALUES ('$id', clock_timestamp() + interval '1 hour')")
 
         /** 다른 인스턴스(`mw-writer`)가 적은 GAVE_UP 이벤트를 넣는다. */
-        fun insertGaveUpEvent(jobOrderId: String) = PostgresSupport.execute(
+        fun insertGaveUpEvent(jobOrderId: String) = Fenced.execute(
             "INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, detail) VALUES ('$jobOrderId', 'GAVE_UP', 'mw-writer', '일지의 작업 지시를 읽지 못했다: x')",
         )
 
         /** 판단 기록 한 행을 글자 그대로 넣는다. */
         fun insertRecord(jobOrderId: String, instanceId: String, executionId: String, record: String) {
-            PostgresSupport.connection().use { c ->
+            Fenced.connection().use { c ->
                 c.prepareStatement(
                     "INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record) VALUES (?, ?, ?, ?, ?)",
                 ).use { s ->
@@ -907,7 +876,7 @@ class CloseUnrestoredTest {
             requestId: String = UUID.randomUUID().toString(),
             reason: String = "r",
         ): String {
-            PostgresSupport.connection().use { c ->
+            Fenced.connection().use { c ->
                 c.autoCommit = false
                 try {
                     val eventId = c.prepareStatement(

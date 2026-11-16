@@ -120,13 +120,13 @@ class ForgetSettledTest {
     @Test
     fun `정착 기록이 실패하는 동안은 놓지 않고 기록이 커밋된 다음 pump 에 놓는다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_settled() RETURNS trigger AS ${'$'}${'$'}
                 BEGIN IF NEW.kind = 'SETTLED' THEN RAISE EXCEPTION 'settled refused'; END IF; RETURN NEW; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE TRIGGER refuse_settled BEFORE INSERT ON mission.execution_journal_event FOR EACH ROW EXECUTE FUNCTION mission.refuse_settled()",
             )
             val executionId = bench.submitInspect("JO-1")
@@ -139,7 +139,7 @@ class ForgetSettledTest {
             // 기록이 실패한 pump 는 ack 하지 않는다. 확인되지 않은 통보가 아웃박스에 있다.
             assertTrue(held.responses > 0, held.toString())
 
-            PostgresSupport.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
+            Fenced.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
             bench.eventually("놓기") { bench.host.footprint() == empty }
             assertEquals(1, count("execution_journal_event WHERE kind = 'SETTLED'"))
         }
@@ -297,7 +297,7 @@ class ForgetSettledTest {
         HostBench().use { bench ->
             bench.awaitPump()
             val order = JSON.writeValueAsString(JSON.readTree(inspect("JO-9", "T1" to "bay-7")))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('JO-9', '$HUMANOID', '$order'::jsonb, 'InspectAsset', NULL, 'mw-before', 'exec-7')

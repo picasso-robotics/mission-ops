@@ -14,12 +14,21 @@ import dev.picasso.ops.host.cell.CellBandClient
 import dev.picasso.ops.host.fleet.HostFleetPort
 import dev.picasso.ops.host.fleet.HttpFleetPort
 import dev.picasso.ops.host.incident.ApprovalWindow
+import dev.picasso.ops.host.lease.GatedFleetPort
+import dev.picasso.ops.host.lease.GatedRobotPort
+import dev.picasso.ops.host.lease.HostExit
+import dev.picasso.ops.host.lease.HostLease
+import dev.picasso.ops.host.lease.HostLeadership
+import dev.picasso.ops.host.lease.LeaseConnections
+import dev.picasso.ops.host.lease.LeaseTiming
+import dev.picasso.ops.host.lease.SendAuthority
 import dev.picasso.ops.host.mission.MissionVersions
 import dev.picasso.ops.host.mission.MockRunner
 import dev.picasso.ops.host.mission.StoredMissionCatalog
 import dev.picasso.ops.host.permit.CellWorkPermits
 import dev.picasso.ops.host.permit.WorkPermitMap
 import dev.picasso.ops.host.retire.RegistryRetirements
+import dev.picasso.ops.host.store.AuthorityGuard
 import dev.picasso.ops.host.store.HostSchema
 import dev.picasso.ops.host.store.HostRecords
 import dev.picasso.ops.host.store.HostSchemaMigrated
@@ -55,6 +64,42 @@ open class MissionHostApplication {
     @ConditionalOnMissingBean(HostClock::class)
     open fun hostClock(): HostClock = HostClock.SYSTEM
 
+    /** 기본은 프로세스 종료다(리스를 잃으면 감독자가 새 인스턴스로 다시 띄운다). 시험은 [builder] 로 기록만 하는 훅을 넣는다. */
+    @Bean
+    @ConditionalOnMissingBean(HostExit::class)
+    open fun hostExit(): HostExit = HostExit.PROCESS
+
+    /** 리스·심장박동 시간 폭(`host.lease.*`, [LeaseTiming]). 규칙에 어긋나면 기동이 멈춘다. */
+    @Bean
+    open fun leaseTiming(
+        @Value("\${host.lease.period}") period: Duration,
+        @Value("\${host.lease.expiry}") expiry: Duration,
+        @Value("\${host.lease.margin}") margin: Duration,
+        @Value("\${host.lease.idle-in-transaction-timeout}") idleInTransaction: Duration,
+        @Value("\${host.lease.statement-timeout}") statementTimeout: Duration,
+    ): LeaseTiming = LeaseTiming(period, expiry, margin, idleInTransaction, statementTimeout)
+
+    /**
+     * 리더 상태기계와 리스(HA 설계 기록 §4·§7). 인스턴스 id(`mw-<UUID>`)는 프로세스마다 새 값이고 미들웨어·일지·리스 보유자가 같은 값을 쓴다.
+     * 리스는 공용 커넥션 풀과 분리한 전용 연결로 획득·갱신한다(같은 DB 주소·계정).
+     */
+    @Bean
+    open fun hostLeadership(
+        timing: LeaseTiming,
+        exit: HostExit,
+        @Value("\${spring.datasource.url}") url: String,
+        @Value("\${spring.datasource.username}") username: String,
+        @Value("\${spring.datasource.password}") password: String,
+    ): HostLeadership = HostLeadership(
+        HostLease("mw-${java.util.UUID.randomUUID()}", timing, LeaseConnections.direct(url, username, password, timing)), timing, exit,
+    )
+
+    /** DB 쓰기 펜싱(V19). 기록 저장소 둘의 쓰기가 이것을 지난다. 리스 불일치를 보면 리더를 잃음으로 넘긴다. */
+    @Bean
+    open fun authorityGuard(jdbc: JdbcClient, dataSource: DataSource, leadership: HostLeadership): AuthorityGuard = AuthorityGuard(
+        jdbc, TransactionTemplate(DataSourceTransactionManager(dataSource)), leadership::claim, leadership::lost,
+    )
+
     /** 같은 기계의 현장 mimic gRPC 에 평문으로 붙는다(S3a 스펙 §7.2). */
     @Bean(destroyMethod = "shutdownNow")
     open fun mimicChannel(@Value("\${host.mimic.port}") port: Int): ManagedChannel {
@@ -68,12 +113,14 @@ open class MissionHostApplication {
      * 않게 하고, [IssuingRobotPort] 는 출발·취소 명령을 잠금 밖으로 보낸다. 미리 읽은 값은 받은 지 `maxAge`(기본 2초) 안에서만 쓴다.
      * 두 데코레이터의 시계는 미들웨어와 같은 [HostClock] 이다.
      *
+     * 출발·취소는 [IssuingRobotPort] 의 송신 스레드에서 gRPC 호출 바로 앞에 리더를 확인한다([GatedRobotPort], 송신 직전 로컬 권위 확인).
+     *
      * 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다.
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean(RobotPort::class)
-    open fun robotPort(channel: ManagedChannel, clock: HostClock): RobotPort =
-        HostRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), clock)
+    open fun robotPort(channel: ManagedChannel, clock: HostClock, leadership: HostLeadership): RobotPort =
+        HostRobotPort(GatedRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), leadership), clock)
 
     /**
      * 플릿 포트(`host.fleet.url`). 비우면 `AmrFleetPort.None` 이다 — 플릿 운반 단위가 든 계획을 받지 않는다(`FLEET_PORT_ABSENT`). 값이 있으면 현장
@@ -85,7 +132,8 @@ open class MissionHostApplication {
      */
     @Bean
     @ConditionalOnMissingBean(AmrFleetPort::class)
-    open fun fleetPort(@Value("\${host.fleet.url}") url: String, clock: HostClock): AmrFleetPort = fleetPortOf(url, clock)
+    open fun fleetPort(@Value("\${host.fleet.url}") url: String, clock: HostClock, leadership: HostLeadership): AmrFleetPort =
+        fleetPortOf(url, clock, leadership)
 
     /**
      * 미들웨어 보존 상한([MissionHost.RETENTION], 놓은 작업 지시 표시는 `EVICT` 선언). 운영 설정으로 열지 않는다. 시험은 [builder] 로 작은 상한을
@@ -95,19 +143,30 @@ open class MissionHostApplication {
     @ConditionalOnMissingBean(Retention::class)
     open fun hostRetention(): Retention = MissionHost.RETENTION
 
+    /** 셀 대역. 신호 쓰기와 결함 주입 중계는 보내기 직전에 리더를 확인한다. */
     @Bean
-    open fun cellBand(@Value("\${host.cell.url}") url: String): CellBandClient = CellBandClient(url)
+    open fun cellBand(@Value("\${host.cell.url}") url: String, leadership: HostLeadership): CellBandClient =
+        CellBandClient(url, authority = leadership)
 
+    /**
+     * `mission` 마이그레이션. 공용 풀이 아니라 같은 DB 주소·계정의 따로 연 연결로 돈다([migrationDataSource]) — 풀 연결에는 리스용 세션 제한
+     * (`statement_timeout`·`idle_in_transaction_session_timeout`, [leaseSessionSettings])이 걸려 있어 데이터가 쌓인 뒤의 색인·백필 마이그레이션이
+     * 그 제한에 끊길 수 있다.
+     */
     @Bean
-    open fun hostSchemaMigrated(dataSource: DataSource): HostSchemaMigrated =
-        HostSchemaMigrated(HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+    open fun hostSchemaMigrated(
+        @Value("\${spring.datasource.url}") url: String,
+        @Value("\${spring.datasource.username}") username: String,
+        @Value("\${spring.datasource.password}") password: String,
+    ): HostSchemaMigrated = HostSchemaMigrated(HostSchema.flyway(migrationDataSource(url, username, password)).migrate().migrationsExecuted)
 
     /** [migrated] 는 쓰지 않는다. 받는 것만으로 mission 마이그레이션 뒤에 이 빈이 만들어진다. */
     @Bean
     open fun missionStore(
         jdbc: JdbcClient,
+        guard: AuthorityGuard,
         @Suppress("UNUSED_PARAMETER") migrated: HostSchemaMigrated,
-    ): MissionStore = MissionStore(jdbc)
+    ): MissionStore = MissionStore(jdbc, guard)
 
     /**
      * 기동 때 DB 의 활성 버전으로 카탈로그를 세운다(S3b 스펙 §6.2, T1). 다시 검증하지 않는다. 저장된 정의를 파싱하지 못하면
@@ -140,24 +199,24 @@ open class MissionHostApplication {
         @Value("\${host.retirement.read-interval}") interval: Duration,
     ): RegistryRetirements = RegistryRetirements(url, clock).start(interval)
 
-    /** 실행 일지, 송신 기록, 인시던트 사본(S4b 스펙 §6.1). pump 뒤 기록은 이 데이터 소스의 트랜잭션 하나로 묶는다. */
+    /** 실행 일지, 송신 기록, 인시던트 사본(S4b 스펙 §6.1). pump 뒤 기록은 이 데이터 소스의 트랜잭션 하나로 묶는다(리스 가드 안). */
     @Bean
     open fun hostRecords(
         jdbc: JdbcClient,
-        dataSource: DataSource,
+        guard: AuthorityGuard,
         json: ObjectMapper,
         @Suppress("UNUSED_PARAMETER") migrated: HostSchemaMigrated,
-    ): HostRecords = HostRecords(jdbc, TransactionTemplate(DataSourceTransactionManager(dataSource)), json)
+    ): HostRecords = HostRecords(jdbc, guard, json)
 
     /**
-     * 빈을 만들 때 일지로 실행을 복원하고 pump 를 켠다(S4b 스펙 T3). 웹 서버는 그 뒤에 열린다.
+     * 빈을 만들 때 리스를 얻어 보고, 얻으면 일지로 실행을 복원하고 pump 를 켠다(S4b 스펙 T3). 웹 서버는 그 뒤에 열린다. 못 얻으면 대기로 뜬다
+     * ([HostLeadership], 심장박동과 획득 시도만).
      *
      * [permitMapping] 은 현장이 선언한 작업 허가 대응 파일의 경로다(`host.work-permit.mapping`, ADR 52). 비어 있으면 선언하지 않은 현장이고
      * 미들웨어에 허가 포트를 붙이지 않는다. 경로가 있는데 파일을 못 읽거나 모양이 틀리면 기동이 멈춘다 — 선언한 현장을 조용히 선언 안 한
      * 현장으로 띄우지 않는다.
      *
-     * [heartbeatPeriod]·[heartbeatExpiry] 는 인스턴스 심장박동이다(`host.instance.heartbeat-period`·`-expiry`, HA 설계 기록 §8 단계 0).
-     * 만료가 주기의 세 배보다 짧으면 기동이 멈춘다([HostHeartbeat]).
+     * [leadership] 은 리더 상태기계다([hostLeadership]). 인스턴스 심장박동도 그 시간 폭(`host.lease.period`·`expiry`)으로 돈다.
      *
      * [revisableRetention] 은 `FAILED`·`UNVERIFIED` 로 정착한 실행을 picasso 메모리에서 놓기 전에 두는 폭이다(`host.settled.revisable-retention`,
      * [MissionHost.DEFAULT_REVISABLE_RETENTION]). 음수면 기동이 멈춘다.
@@ -185,14 +244,13 @@ open class MissionHostApplication {
         retention: Retention,
         fleet: AmrFleetPort,
         @Value("\${host.work-permit.mapping}") permitMapping: String,
-        @Value("\${host.instance.heartbeat-period}") heartbeatPeriod: Duration,
-        @Value("\${host.instance.heartbeat-expiry}") heartbeatExpiry: Duration,
+        leadership: HostLeadership,
         @Value("\${host.settled.revisable-retention}") revisableRetention: Duration,
         @Value("\${host.incident-loop.entitlements}") entitlementsPath: String,
         @Value("\${host.incident-loop.export}") exportDir: String,
     ): MissionHost = MissionHost(
         robots, cellBand, clock, catalog, timings, records, store, json, workPermits(permitMapping, clock),
-        HostHeartbeat(heartbeatPeriod, heartbeatExpiry), revisableRetention,
+        leadership, revisableRetention,
         retirements.takeIf { it.declared },
         entitlements(entitlementsPath), path(exportDir), retention, fleet,
     ).start()
@@ -236,15 +294,39 @@ open class MissionHostApplication {
     ): MissionVersions = MissionVersions(host, store, catalog, runner, clock, json)
 
     companion object {
+        /**
+         * 공용 풀(Hikari)의 연결마다 세션 설정을 연결을 열 때 건다(JDBC `options`): `idle_in_transaction_session_timeout`·`statement_timeout`
+         * ([LeaseTiming]). 쓰기 가드가 리스 보유자 행을 잠그기 전부터 걸려 있어 잠근 직후 멎은 세션도 DB 가 끊는다. 값은 `host.lease.*` 에서 읽는다.
+         */
+        @Bean
+        @JvmStatic
+        fun leaseSessionSettings(environment: org.springframework.core.env.Environment): org.springframework.beans.factory.config.BeanPostProcessor =
+            object : org.springframework.beans.factory.config.BeanPostProcessor {
+                override fun postProcessBeforeInitialization(bean: Any, beanName: String): Any {
+                    if (bean is com.zaxxer.hikari.HikariDataSource) {
+                        fun millis(key: String) = Duration.parse(environment.getRequiredProperty(key)).toMillis()
+                        val options = "-c idle_in_transaction_session_timeout=${millis("host.lease.idle-in-transaction-timeout")}" +
+                            " -c statement_timeout=${millis("host.lease.statement-timeout")}"
+                        bean.addDataSourceProperty("options", options)
+                    }
+                    return bean
+                }
+            }
+
+        /** 마이그레이션용 연결(풀 없음, 세션 제한 없음). */
+        fun migrationDataSource(url: String, username: String, password: String): DataSource =
+            org.springframework.jdbc.datasource.DriverManagerDataSource(url, username, password)
+
         /** mimic 에 싣는 클라이언트 id. */
         const val CLIENT_ID = "mission-host"
 
         /**
          * 플릿 주소에서 포트를 짓는다. 비어 있으면 [AmrFleetPort.None] 이다(스위치 값 없음 — 주소가 곧 선언). 주소가 있으면 기동 탐침
          * ([HttpFleetPort.probe])을 한 번 한다 — 4xx 등(예: 다른 서버, `/fleet` 면이 없는 현장의 404·405)이면 오설정이라 기동을 멈춘다. 안 닿거나 5xx 면
-         * 일시 장애로 보아 경고만 남기고 뜬다(현장이 늦게 뜨거나 잠시 아플 수 있다).
+         * 일시 장애로 보아 경고만 남기고 뜬다(현장이 늦게 뜨거나 잠시 아플 수 있다). 맡기기·취소는 송신 스레드에서 [authority] 를 확인한다
+         * ([GatedFleetPort]).
          */
-        fun fleetPortOf(url: String, clock: HostClock): AmrFleetPort {
+        fun fleetPortOf(url: String, clock: HostClock, authority: SendAuthority = SendAuthority.ALWAYS): AmrFleetPort {
             val port = url.trim().takeIf { it.isNotEmpty() }?.let { HttpFleetPort(it) } ?: return AmrFleetPort.None
             when (val status = port.probe()) {
                 // 안 닿음과 5xx 는 일시 장애일 수 있다(현장이 늦게 뜨거나 잠시 아픔) — 경고만 하고 뜬다. pump 가 다음 라운드에 다시 본다.
@@ -254,7 +336,7 @@ open class MissionHostApplication {
                 // 그 밖(4xx·3xx 등)은 오설정이 확실하다 — 그 주소에 플릿 세계 면이 없다.
                 else -> throw IllegalArgumentException("플릿 주소(host.fleet.url)가 현장 플릿 세계 면이 아니다: GET ${port.url}/fleet/world → HTTP $status")
             }
-            return HostFleetPort(port, clock, port.url)
+            return HostFleetPort(GatedFleetPort(port, authority), clock, port.url)
         }
 
         /** 작업 허가 대응 경로에서 포트를 짓는다. 비어 있으면 `null`(선언하지 않은 현장)이다. 경로는 작업 디렉터리 기준이다. */
@@ -274,17 +356,21 @@ open class MissionHostApplication {
          * @param robots 주면 기본 하위 포트 대신 이것을 쓴다(호스트 시험이 기체 스냅숏을 막는 포트를 넣는다).
          * @param retention 주면 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(호스트 시험이 작은 놓은 작업 지시 표시 상한을 넣는다).
          * @param fleet 주면 `host.fleet.url` 대신 이것을 플릿 포트로 쓴다(호스트 시험이 프로세스 안의 플릿 미믹을 넣는다). 닫지 않는다.
+         * @param exit 주면 리스를 잃었을 때 프로세스를 끝내는 대신 이것을 부른다(시험이 같은 JVM 에서 잃음을 본다).
          */
-        fun builder(clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null, fleet: AmrFleetPort? = null): SpringApplicationBuilder {
+        fun builder(
+            clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null, fleet: AmrFleetPort? = null, exit: HostExit? = null,
+        ): SpringApplicationBuilder {
             val builder = SpringApplicationBuilder(MissionHostApplication::class.java)
                 .properties("spring.config.name=mission-host")
-            if (clock != null || robots != null || retention != null || fleet != null) {
+            if (clock != null || robots != null || retention != null || fleet != null || exit != null) {
                 builder.initializers(
                     ApplicationContextInitializer<ConfigurableApplicationContext> {
                         clock?.let { c -> it.beanFactory.registerSingleton("hostClock", c) }
                         robots?.let { r -> it.beanFactory.registerSingleton("testRobotPort", r) }
                         retention?.let { r -> it.beanFactory.registerSingleton("hostRetention", r) }
                         fleet?.let { f -> it.beanFactory.registerSingleton("testFleetPort", f) }
+                        exit?.let { e -> it.beanFactory.registerSingleton("hostExit", e) }
                     },
                 )
             }

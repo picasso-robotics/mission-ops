@@ -59,12 +59,12 @@ class ExecutionsNarrowedTest {
     @Test
     fun `일지에 막힌 실행은 좁힌 목록에 그 실행이 들 때만 막힘으로 나온다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_journal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'journal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
+            Fenced.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
             assertEquals(500, bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID)).status)
             for (path in listOf("/host/executions", "/host/executions?jobOrderId=JO-1", "/host/executions?executionId=exec-1")) {
                 val view = bench.get(path)

@@ -7,6 +7,7 @@ import dev.picasso.mimic.cli.MimicCli
 import dev.picasso.ops.host.HostClock
 import dev.picasso.ops.host.MissionHost
 import dev.picasso.ops.host.MissionHostApplication
+import dev.picasso.ops.host.lease.HostExit
 import dev.picasso.ops.service.OpsApplication
 import dev.picasso.ops.service.store.OpsSchema
 import org.springframework.boot.web.context.WebServerApplicationContext
@@ -102,7 +103,7 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
     fun now(): Instant = mimic.server.exclusive { mimic.instance(robotIds.first())!!.clock.now() }
 
     /** 실행 호스트 하나를 이 세트의 DB·mimic·셀 대역에 띄운다. [hostArgs] 는 기본 인자 뒤에 붙는다(뒤가 이긴다). */
-    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }).run(
+    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, exit = LOST).run(
         "--server.port=0",
         "--host.mimic.port=${mimic.server.port}",
         "--host.cell.url=http://127.0.0.1:${cell.address.port}",
@@ -129,6 +130,16 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
     fun killHost() {
         (host.getBean(javax.sql.DataSource::class.java) as AutoCloseable).close()
         host.close()
+    }
+
+    /**
+     * 지금 호스트의 주기 pump 만 멈춘다(하네스가 `pumpOnce()` 를 직접 부를 때). 리스와 심장박동은 그대로다 — 호스트를 닫으면 리스를 내놓아
+     * pump 의 기록이 리스 가드에 막힌다. 운영 코드는 그대로 두고 반사로 pump 실행기를 내린다.
+     */
+    fun stopPump() {
+        val pumper = MissionHost::class.java.getDeclaredField("pumper").apply { isAccessible = true }.get(missionHost) as java.util.concurrent.ExecutorService
+        pumper.shutdownNow()
+        check(pumper.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) { "pump 가 멈추지 않았다" }
     }
 
     /** 새 실행 호스트를 같은 인자로 띄워 [host] 로 둔다. */
@@ -216,6 +227,9 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
         val ROOT: Path = Path.of("").toAbsolutePath().normalize()
         val HTTP: HttpClient = HttpClient.newHttpClient()
         val JSON = ObjectMapper()
+
+        /** 리스를 잃으면 하네스 JVM 을 끝내지 않고 알린다(하네스는 잃을 일이 없어야 한다 — 잃으면 그 회차 수치는 쓰지 않는다). */
+        val LOST = HostExit { reason -> System.err.println("실행 호스트가 리스를 잃었다(이 회차 수치는 쓰지 않는다): $reason") }
 
         /**
          * `HostBench.STANDARD_CELL` 모양에 스테이션 [stations] 개의 신호 쌍(준비 참·완료 거짓, 일반 BOOLEAN)을 더한다.

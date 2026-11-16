@@ -7,9 +7,7 @@ import dev.picasso.ops.host.store.JournalEventKind
 import dev.picasso.ops.host.store.SettledRow
 import dev.picasso.registry.PostgresSupport
 import org.springframework.jdbc.core.simple.JdbcClient
-import org.springframework.jdbc.datasource.DataSourceTransactionManager
 import org.springframework.jdbc.datasource.DriverManagerDataSource
-import org.springframework.transaction.support.TransactionTemplate
 import kotlin.random.Random
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -25,12 +23,12 @@ class SettledHistoryTest {
 
     private val ds = DriverManagerDataSource(PostgresSupport.jdbcUrl, PostgresSupport.username, PostgresSupport.password)
     private val jdbc = JdbcClient.create(ds)
-    private val records = HostRecords(jdbc, TransactionTemplate(DataSourceTransactionManager(ds)), ObjectMapper())
+    private val records = HostRecords(jdbc, TestLease.guard(ds), ObjectMapper())
     private var orders = 0
 
     @BeforeTest
     fun fresh() {
-        PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
+        Fenced.execute("DROP SCHEMA IF EXISTS mission CASCADE")
         HostSchema.flyway(ds).migrate()
     }
 

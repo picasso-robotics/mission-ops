@@ -471,12 +471,12 @@ class IncidentLoopHostTest {
             assertEquals(listOf(409, "REQUEST_ID_REUSED"), listOf(reused.status, reused.body!!["error"].asText()), reused.body.toString())
             assertEquals(0, withdrawals("JO-V"))
 
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_journal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'journal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
+            Fenced.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
             assertEquals(500, bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID)).status)
             listOf("JO-1", "JO-9").forEach { job ->
                 val blocked = withdraw(bench, job)

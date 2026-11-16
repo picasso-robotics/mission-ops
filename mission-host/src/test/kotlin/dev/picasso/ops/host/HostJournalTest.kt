@@ -121,12 +121,12 @@ class HostJournalTest {
     @Test
     fun `일지 쓰기가 실패하면 제출은 500이고 pump와 신규 제출을 차단해 로봇 태스크를 시작하지 않는다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_journal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'journal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
+            Fenced.execute("CREATE TRIGGER refuse_journal BEFORE INSERT ON mission.execution_journal FOR EACH ROW EXECUTE FUNCTION mission.refuse_journal()")
             val failed = bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID))
             assertEquals(500, failed.status, failed.body.toString())
             assertEquals(HostController.JOURNAL_WRITE_FAILED, failed.body!!["error"].asText(), failed.body.toString())
@@ -148,12 +148,12 @@ class HostJournalTest {
     @Test
     fun `pump 뒤 기록은 한 트랜잭션이라 사본 쓰기가 실패하면 송신 기록도 남지 않고 ack 하지 않아 다음 pump 에 한 번씩 적는다`() {
         HostBench().use { bench ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_copy() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'copy refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_copy BEFORE INSERT ON mission.incident_copy FOR EACH ROW EXECUTE FUNCTION mission.refuse_copy()")
+            Fenced.execute("CREATE TRIGGER refuse_copy BEFORE INSERT ON mission.incident_copy FOR EACH ROW EXECUTE FUNCTION mission.refuse_copy()")
             val executionId = bench.submitHeldOrder("JO-1")
             bench.driveToHold(executionId)
             bench.idlePumps()
@@ -161,7 +161,7 @@ class HostJournalTest {
             assertEquals(0, count("result_outbox"))
             assertEquals(0, count("incident_copy"))
 
-            PostgresSupport.execute("DROP TRIGGER refuse_copy ON mission.incident_copy")
+            Fenced.execute("DROP TRIGGER refuse_copy ON mission.incident_copy")
             bench.eventually("사본") { count("incident_copy") == 1 }
             val incidentId = bench.get("/host/incidents")["incidents"].single()["incidentId"].asText()
             val copy = PostgresSupport.queryAll("SELECT instance_id, incident_id, execution_id, job_order_id, unit_id, detail::text FROM mission.incident_copy") {
@@ -344,7 +344,7 @@ class HostJournalTest {
         /** 이전 인스턴스가 받은 일지 행을 직접 넣는다. 작업 지시는 InspectAsset 하나다. */
         fun insertJournal(jobOrderId: String, robotId: String, missionVersion: Int?, evidence: String = "E0") {
             val order = JSON.writeValueAsString(JSON.readTree(inspect(jobOrderId, "T1" to "bay-7", evidence = evidence)))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('$jobOrderId', '$robotId', '$order'::jsonb, 'InspectAsset', ${missionVersion ?: "NULL"}, 'mw-before', 'exec-7')
