@@ -192,6 +192,14 @@
 - 기대하는 결과: 원인을 고친 뒤 경고가 그치고 `pending` 이 0 으로 돌아오며 밀린 송신 기록이 적힙니다.
 - 다르면: 보장 문서 «두 대장 사본의 범위» 의 DB 거부 줄 항목입니다.
 
+### D1-9 리비전이 거부되거나 범위를 줄였을 때
+- 사전 조건: 실행 호스트 `POST /host/job-orders` 에 이미 도는 작업 지시의 더 높은 버전(리비전)이 들어왔습니다(화면의 작업 지시 폼은 버전 1 만 내므로 상위 시스템이나 실행 호스트 직접 호출입니다).
+- 거부일 때: 작업 지시 응답이 `result: REJECTED` 이고 `rejectionReason` 이 «리비전이 손댄 단위를 뺀다: <단위>(<상태>)…», «리비전이 뺀 단위를 남는 단위가 선행으로 기다린다: …», «리비전이 작업 지시의 항목을 모두 뺀다: …», «리비전 뒤 선행이 의존 단위보다 뒤에 선다: …» 가운데 하나로 시작합니다(picasso 문장 그대로, 작업 요청 상세의 거부 사유는 «호스트 제출 거부: <사유>»). 화면은 그 아래에 «새 작업 지시로 내십시오» 또는 «운영자 취소를 쓰십시오» 안내를 붙입니다. 이 리비전은 적용되지 않았습니다 — 개정판 행·판단 기록·제거 사건이 없고 실행은 옛 버전 그대로 돕니다. 같은 버전을 다시 내도 같은 거부이므로, 이미 낸 항목을 빼야 하면 운영자 취소 뒤 새 작업 지시로, 아직 안 낸 항목만 빼려면 그 항목만 빼서 다시 냅니다.
+- 받았을 때: 작업 지시 응답의 `revisionRemoval`(`fromVersion`·`toVersion`·`removed`)과 실행 목록 단위 칸의 «리비전 N 이 범위에서 뺌: <단위>(내기 전)…» 이 뺀 단위를 보입니다. 이것은 실패·취소·완료가 아닙니다 — 그 단위는 기체에 나가지 않았고 작업 응답의 완료·미완료 목록에 없습니다. 남은 단위가 모두 끝나 있었으면 실행이 그 자리에서 종결로 정산되고 그 버전의 작업 응답이 한 번 나갑니다.
+- 확인할 곳: `SELECT instance_id, execution_id, from_version, to_version, removed, recorded_at FROM mission.revision_removal WHERE job_order_id='<id>' ORDER BY removal_id;`(같은 트랜잭션의 개정판 행은 `mission.execution_journal_revision`), `GET /host/executions/summary` 의 `ledgerCopy.revisionRemovals`(`copied`·`pending`·`evictedBeforeCopy`), 인시던트 고리 내보내기의 `revision-removals.jsonl`.
+- 다르면: `ledgerCopy.revisionRemovals.pending` 이 0 이 아닌 채 남거나 `journalBlockedExecutionIds` 에 그 실행이 있으면 개정판 행·판단 기록·제거 사건 트랜잭션이 실패하고 있습니다 — 실행 호스트 로그 «다시 돈 실행을 적지 못했다» 를 보고 DB 를 복구합니다(다음 pump 가 함께 다시 적음). `evictedBeforeCopy` 가 0 이 아니거나 경고 «리비전 제거 사건을 사본 표에 적기 전에 레지스터가 내렸다» 가 나면 그만큼 사본 표와 내보내기에서 빠졌습니다(사고 기록). 재기동 뒤 복원 보고가 `RESUME_RECORD_MISMATCH` 로 `GAVE_UP` 이고 그 작업 지시가 `6c4143d` 전에 항목을 빼는 리비전을 받은 것이면 구제되지 않습니다(보장 문서 «리비전 범위 축소의 범위») — 위 «복원 못 한 실행 종결» 뒤 새 작업 지시로 냅니다.
+- 근거 시험: `RevisionRemovalHostTest` 의 다섯 시험, `MissionStoreTest` 의 `V18 리비전 제거 사건 표는 덧붙이기만 하고 실행의 한 버전을 한 번만 받으며 줄과 칸이 같아야 한다`.
+
 ### D1 에서 확인하는 기록
 | 기록 | 화면 | API | 알 수 있는 것 |
 |---|---|---|---|

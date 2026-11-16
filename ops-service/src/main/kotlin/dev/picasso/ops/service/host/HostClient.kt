@@ -144,6 +144,11 @@ data class HostSubmitOutcome(
     val forgottenJobOrder: Boolean = false,
     /** 받은 실행이 플릿 전용 계획이라 [robotId] 가 묶인 기체(실행 주체 아님)다. 칸이 없던 호스트 본문은 거짓이다. */
     val boundRobot: Boolean = false,
+    /**
+     * 받은 리비전이 작업 지시에서 항목을 빼 손대지 않은 단위를 지웠으면 그 사건(picasso §15.329, S3a JSON 계약 §4 `revisionRemoval`). 운영 서비스는
+     * 해석하지 않고 그대로 옮긴다. 실패·취소·완료가 아니다(«리비전 N 이 범위에서 뺌»). 없거나 칸이 없던 호스트 본문은 `null` 이다.
+     */
+    val revisionRemoval: JsonNode? = null,
 )
 
 /** 출발 결품 거부의 자리. [observed] 가 `null` 이면 빈 자리이고 아니면 거기 있던 다른 식별 정보다. */

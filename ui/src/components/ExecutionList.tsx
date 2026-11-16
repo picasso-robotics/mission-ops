@@ -16,7 +16,7 @@ import type {
 } from '../api'
 import { appendOlder, catchUp, olderCount, olderCursor, sameExecution } from '../executionHistory'
 import type { ExecutionHistory } from '../executionHistory'
-import { BOUND_ROBOT_LABEL, EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, routeLabel, UNRESTORED_TEXT } from '../labels'
+import { BOUND_ROBOT_LABEL, EXECUTION_CONTROL_TEXT, EXECUTION_LIST_TEXT as TEXT, revisionRemovalLabel, routeLabel, UNRESTORED_TEXT } from '../labels'
 import { CancelExecutionForm, CloseResultStatus, CloseUnrestoredForm, ReleaseFaultForm, ReworkSkippedForm } from './ExecutionControls'
 import { PermitBlockNotice } from './PermitBlockNotice'
 
@@ -222,6 +222,11 @@ function ExecutionRow({ execution, selected, settled, currentInstance }: RowProp
             ))}
           </ul>
         )}
+        {(execution.revisionRemovals ?? []).map((removal) => (
+          <p key={`${removal.instanceId}/${removal.toVersion}`} className="restored">
+            {revisionRemovalLabel(removal)}
+          </p>
+        ))}
       </td>
       <td>{execution.jobResponse === null ? '없음' : <JobResponseCell response={execution.jobResponse} />}</td>
     </tr>

@@ -258,6 +258,30 @@ export function choiceRefusalNote(reason: string | null): string | null {
   return null
 }
 
+/**
+ * 리비전 범위 축소 거부 사유(picasso §15.329 `scopeCut`)에 붙이는 안내. 사유 문장은 picasso 가 낸 그대로 보이고, 이 안내는 다음 걸음을 말한다 — 손댄
+ * 항목·끊긴 선행·선행 순서는 새 작업 지시로, 항목을 모두 빼는 것은 취소로. 무관한 사유는 null 이다.
+ */
+export function scopeCutRefusalNote(reason: string | null): string | null {
+  if (reason === null) return null
+  if (reason.startsWith(SCOPE_CUT_EMPTY)) return SCOPE_CUT_EMPTY_NOTE
+  if (SCOPE_CUT_REFUSALS.some((prefix) => reason.startsWith(prefix))) return SCOPE_CUT_NOTE
+  return null
+}
+
+/** 리비전 범위 축소 거부 사유 앞머리(picasso `scopeCut`): 손댄 단위, 끊긴 선행, 선행 순서. */
+export const SCOPE_CUT_REFUSALS = ['리비전이 손댄 단위를 뺀다', '리비전이 뺀 단위를 남는 단위가 선행으로 기다린다', '리비전 뒤 선행이 의존 단위보다 뒤에 선다']
+/** 항목을 모두 빼는 리비전 거부 사유 앞머리. */
+export const SCOPE_CUT_EMPTY = '리비전이 작업 지시의 항목을 모두 뺀다'
+export const SCOPE_CUT_NOTE =
+  '리비전은 아직 내지 않은 항목만 뺄 수 있습니다. 발행했거나 끝난 항목을 빼거나 남는 항목의 선행을 바꾸려면 새 작업 지시로 내십시오. 이 리비전은 적용되지 않았고 실행은 그대로입니다.'
+export const SCOPE_CUT_EMPTY_NOTE = '항목을 모두 빼는 리비전은 받지 않습니다. 실행을 멈추려면 운영자 취소를 쓰십시오. 이 리비전은 적용되지 않았습니다.'
+
+/** 리비전 제거 사건 한 줄 — 실패·취소·완료가 아니라 범위에서 뺀 것이다(picasso §15.329). */
+export function revisionRemovalLabel(removal: { toVersion: number; removed: { unitId: string; state: string }[] }): string {
+  return `리비전 ${removal.toVersion} 이 범위에서 뺌: ${removal.removed.map((unit) => `${unit.unitId}(${unit.state === 'PENDING' ? '내기 전' : '시작하지 못한 채'})`).join(', ')}`
+}
+
 /** 분기가 든 실행의 리비전 거부 사유 앞머리(picasso `choiceRefusal`). 리비전은 분기 자리를 더하기만 한다. */
 export const CHOICE_REVISION_REFUSALS = ['리비전이 분기 자리를 없앤다', '리비전이 분기의 가지를 바꾼다', '리비전이 분기 자리의 단위 id 를 바꾼다']
 /** 분기 자리 겹침 거부 사유 앞머리(picasso `DefinedCapability.planRefusal`). 작업 수락과 리비전 둘 다다. */

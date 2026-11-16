@@ -525,6 +525,8 @@ export interface HostSubmitOutcome {
   sourceUnobserved?: SourceUnobserved | null
   /** 이미 끝나 이빅션한 작업 지시라 받지 않은 REJECTED 면 참이다. 칸이 없던 호스트 본문은 undefined 다. */
   forgottenJobOrder?: boolean
+  /** 받은 리비전이 항목을 빼 손대지 않은 단위를 지웠으면 그 사건(picasso §15.329). 아니면 null, 칸이 없던 호스트 본문은 undefined 다. */
+  revisionRemoval?: RevisionRemoval | null
 }
 
 /**
@@ -604,6 +606,31 @@ export interface Execution {
    * 칸을 싣지 않는다.
    */
   boundRobot?: boolean
+  /**
+   * 리비전이 작업 지시에서 항목을 빼 손대지 않은 단위를 지운 사건(picasso §15.329, S3a JSON 계약 §5). 적은 순서이고 재기동 전 인스턴스의 것도 싣는다.
+   * 실패·취소·완료가 아니다 — «리비전 N 이 범위에서 뺌». 옛 호스트·옛 정착 본문은 칸을 싣지 않는다.
+   */
+  revisionRemovals?: RevisionRemoval[]
+}
+
+/** 리비전이 뺀 단위 하나와 뺄 때의 상태(`PENDING` 또는 태스크 없는 계획 실패 `FAILED`). */
+export interface RemovedUnit {
+  unitId: string
+  state: string
+}
+
+/**
+ * 리비전 제거 사건 하나(picasso §15.329). 리비전 `toVersion` 이 손대지 않은 단위 `removed` 를 실행에서 지웠다 — 그 단위는 발행되지 않고 작업 응답의
+ * 완료·미완료 목록에서 빠진다. `instanceId`·`executionId` 는 그 리비전을 받은 인스턴스와 실행이다.
+ */
+export interface RevisionRemoval {
+  instanceId: string
+  executionId: string
+  fromVersion: number
+  toVersion: number
+  removed: RemovedUnit[]
+  at: string
+  wallClockAt: string
 }
 
 /** 운영자 결함 감수 한 건(S3a JSON 계약 §5.9). `faults` 는 감수할 때의 `blockedFaults`, `recordedAt` 은 실행 호스트가 적은 시각이다. */
