@@ -12,15 +12,33 @@ import dev.picasso.ops.host.store.SearchCopyRow
  * @param declared 사본 선언(`Retention.copyAck`)이 켜져 있는가. 이 호스트는 늘 켠다([MissionHost.RETENTION])
  * @param incidents 인시던트 대장 — 인시던트 id 로 확인한다
  * @param remedySearches 조치 탐색 대장 — 탐색 id 로 확인한다
+ * @param revisionRemovals 리비전 제거 사건(picasso §15.329, V18) — 사본 선언의 보호 밖이라 확인 입구가 없고 호스트가 센다
  */
-data class LedgerCopyView(val declared: Boolean, val incidents: CopyLedgerView, val remedySearches: CopyLedgerView) {
+data class LedgerCopyView(
+    val declared: Boolean,
+    val incidents: CopyLedgerView,
+    val remedySearches: CopyLedgerView,
+    val revisionRemovals: RemovalCopyView = RemovalCopyView(0, 0, 0),
+) {
     companion object {
-        fun of(state: CopyAckState) = LedgerCopyView(state.declared != null, CopyLedgerView.of(state.incidents), CopyLedgerView.of(state.remedySearches))
+        fun of(state: CopyAckState, removals: RemovalCopyView) =
+            LedgerCopyView(state.declared != null, CopyLedgerView.of(state.incidents), CopyLedgerView.of(state.remedySearches), removals)
 
         /** 상태를 읽지 않은 자리의 기본값. */
         val UNREAD = LedgerCopyView(false, CopyLedgerView(0, 0, 0, 0), CopyLedgerView(0, 0, 0, 0))
     }
 }
+
+/**
+ * 리비전 제거 사건 사본의 상태(V18 `mission.revision_removal`). picasso 레지스터(`Middleware.revisionRemovals`)는 사본 선언(`copyAck`)의 보호를 받지
+ * 않는다 — 보존 상한(`Retention.revisionRemovals`, 기본 10,000)에 차면 확인과 무관하게 앞 사건을 내린다. 그래서 호스트가 식별자(실행, `toVersion`)로
+ * 모으고 셈한다. 셈은 그 인스턴스가 뜬 뒤로다.
+ *
+ * @param copied 사본 표에 커밋한 사건의 누계
+ * @param pending 레지스터에 있고 아직 커밋하지 않은 사건의 수. 받은 리비전은 그 개정판 행과 같은 트랜잭션에 적으므로 보통 0 이다
+ * @param evictedBeforeCopy 커밋하기 전에 레지스터가 내린 사건의 누계. 0 이 아니면 그만큼 사본 표와 내보내기에서 빠졌다(경고 로그)
+ */
+data class RemovalCopyView(val copied: Long, val pending: Int, val evictedBeforeCopy: Long)
 
 /**
  * 한 대장의 사본 확인 상태. 셈은 그 인스턴스가 뜬 뒤로다.

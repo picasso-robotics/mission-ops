@@ -155,6 +155,45 @@ data class IncidentRevisionWrite(val incidentId: String, val revision: Int, val 
 /** 적을 탐색 사본 하나. [outcome] 은 줄의 `outcome` 이다(줄에서 읽은 것). */
 data class SearchCopyWrite(val searchId: String, val jobOrderId: String, val robotId: String, val outcome: String, val line: String)
 
+/** 리비전이 뺀 단위 하나와 뺄 때의 상태(picasso `RemovedUnit`). 상태는 `PENDING` 이거나 계획 실패 `FAILED` 다. */
+data class RemovedUnitRow(val unitId: String, val state: String)
+
+/**
+ * 적을 리비전 제거 사건 하나(V18, picasso §15.329). [line] 은 picasso `LedgerExport.revisionRemovalLine` 의 글자 그대로이고 나머지 칸은 그 줄과 같은
+ * 사건(picasso `RevisionRemoval`)에서 읽는다 — DB 가 줄과 칸이 같은지 본다.
+ */
+data class RemovalCopyWrite(
+    val executionId: String,
+    val jobOrderId: String,
+    val robotId: String,
+    val fromVersion: Int,
+    val toVersion: Int,
+    val removed: List<RemovedUnitRow>,
+    val at: Instant,
+    val wallClockAt: Instant,
+    val line: String,
+)
+
+/**
+ * 리비전 제거 사건 한 행(V18). 한 사본은 ([instanceId], [executionId], [toVersion])이 가리킨다. [at] 은 미들웨어 시각(호스트 시계), [wallClockAt] 은
+ * 실제 시각이다. 실패·취소·완료가 아니다 — «리비전 [toVersion] 이 범위에서 뺌» 이다.
+ */
+data class RemovalCopyRow(
+    val removalId: Long,
+    val instanceId: String,
+    val executionId: String,
+    val jobOrderId: String,
+    val robotId: String,
+    val fromVersion: Int,
+    val toVersion: Int,
+    val removed: List<RemovedUnitRow>,
+    val at: Instant,
+    val wallClockAt: Instant,
+    val wireVersion: String,
+    val line: String,
+    val recordedAt: Instant,
+)
+
 /**
  * 조치 탐색 사본 한 행(V17). [line] 은 picasso `LedgerExport.remedySearchLine` 의 글자 그대로다 — `WITHHELD` 줄에는 `steps` 키가 없다.
  * 실행 일지와 무관하다(거절은 실행이 없다).
@@ -811,6 +850,63 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         jdbc.sql("SELECT $SEARCH_COLUMNS FROM mission.remedy_search_copy WHERE instance_id = :instanceId ORDER BY copy_id")
             .param("instanceId", instanceId)
             .query { rs, _ -> searchRow(rs) }
+            .list()
+
+    // ── 리비전 제거 사건(V18)
+
+    /**
+     * 리비전 제거 사건을 덧붙인다. 받은 리비전의 개정판 행·판단 기록과 같은 트랜잭션 안에서 부른다. 같은 (인스턴스, 실행, `toVersion`)이 이미 있으면
+     * 그 행은 건너뛴다(재시도가 두 번 적지 않는다). 줄은 picasso 글자 그대로다.
+     */
+    fun copyRevisionRemovals(instanceId: String, wireVersion: String, rows: List<RemovalCopyWrite>) {
+        if (rows.isEmpty()) return
+        jdbc.sql(
+            """
+            INSERT INTO mission.revision_removal
+                (instance_id, execution_id, job_order_id, robot_id, from_version, to_version, removed, removed_at, wall_clock_at, wire_version, line)
+            SELECT :instanceId, x.execution_id, x.job_order_id, x.robot_id, x.from_version, x.to_version, x.removed,
+                   CAST(x.removed_at AS timestamptz), CAST(x.wall_clock_at AS timestamptz), :wireVersion, x.line
+            FROM ROWS FROM (jsonb_to_recordset(CAST(:rows AS jsonb)) AS (
+                execution_id text, job_order_id text, robot_id text, from_version int, to_version int, removed jsonb,
+                removed_at text, wall_clock_at text, line text))
+                WITH ORDINALITY AS x(execution_id, job_order_id, robot_id, from_version, to_version, removed, removed_at, wall_clock_at, line, ord)
+            ORDER BY x.ord
+            ON CONFLICT (instance_id, execution_id, to_version) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .param("wireVersion", wireVersion)
+            .param(
+                "rows",
+                json.writeValueAsString(
+                    rows.map {
+                        linkedMapOf(
+                            "execution_id" to it.executionId, "job_order_id" to it.jobOrderId, "robot_id" to it.robotId,
+                            "from_version" to it.fromVersion, "to_version" to it.toVersion,
+                            "removed" to it.removed.map { u -> linkedMapOf("unitId" to u.unitId, "state" to u.state) },
+                            "removed_at" to it.at.toString(), "wall_clock_at" to it.wallClockAt.toString(), "line" to it.line,
+                        )
+                    },
+                ),
+            )
+            .update()
+    }
+
+    /** 그 작업 지시들의 리비전 제거 사건 전부(모든 인스턴스). 적은 순서다. */
+    fun revisionRemovals(jobOrderIds: Collection<String>): List<RemovalCopyRow> {
+        if (jobOrderIds.isEmpty()) return emptyList()
+        return jdbc.sql("SELECT $REMOVAL_COLUMNS FROM mission.revision_removal WHERE job_order_id IN (:ids) ORDER BY removal_id")
+            .param("ids", jobOrderIds.toList())
+            .query { rs, _ -> removalRow(rs) }
+            .list()
+    }
+
+    /** 그 인스턴스의 리비전 제거 사건 가운데 행 번호가 [after] 보다 큰 것. 적은 순서다. 내보내기 게시가 커밋된 행에서 모은다. */
+    fun revisionRemovalsOf(instanceId: String, after: Long = 0): List<RemovalCopyRow> =
+        jdbc.sql("SELECT $REMOVAL_COLUMNS FROM mission.revision_removal WHERE instance_id = :instanceId AND removal_id > :after ORDER BY removal_id")
+            .param("instanceId", instanceId)
+            .param("after", after)
+            .query { rs, _ -> removalRow(rs) }
             .list()
 
     // ── 같은 조치 승인 사실(V17)
@@ -1529,6 +1625,22 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         recordedAt = instant(rs, "recorded_at"),
     )
 
+    private fun removalRow(rs: ResultSet) = RemovalCopyRow(
+        removalId = rs.getLong("removal_id"),
+        instanceId = rs.getString("instance_id"),
+        executionId = rs.getString("execution_id"),
+        jobOrderId = rs.getString("job_order_id"),
+        robotId = rs.getString("robot_id"),
+        fromVersion = rs.getInt("from_version"),
+        toVersion = rs.getInt("to_version"),
+        removed = json.readTree(rs.getString("removed")).map { RemovedUnitRow(it.path("unitId").asText(), it.path("state").asText()) },
+        at = instant(rs, "removed_at"),
+        wallClockAt = instant(rs, "wall_clock_at"),
+        wireVersion = rs.getString("wire_version"),
+        line = rs.getString("line"),
+        recordedAt = instant(rs, "recorded_at"),
+    )
+
     private fun searchRow(rs: ResultSet) = SearchCopyRow(
         copyId = rs.getLong("copy_id"),
         instanceId = rs.getString("instance_id"),
@@ -1586,7 +1698,9 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             "conflict_request_id, acknowledged_mismatch"
         const val CONFLICT_COLUMNS = "request_id, marker_id, approver_id, approver_kind, reason, $OBSERVATION_COLUMNS, refused_at"
         const val RECORD_COLUMNS = "record_id, job_order_id, instance_id, execution_id, wire_version, record, recorded_at"
-        const val SEARCH_COLUMNS = "copy_id, instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line, recorded_at"
+        const val REMOVAL_COLUMNS = "removal_id, instance_id, execution_id, job_order_id, robot_id, from_version, to_version, removed, " +
+            "removed_at, wall_clock_at, wire_version, line, recorded_at"
+        const val SEARCH_COLUMNS ="copy_id, instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line, recorded_at"
         const val COPY_SELECT =
             "SELECT c.copy_id, c.instance_id, c.incident_id, c.detail, r.decision, r.decided_at, r.wall_clock_at, r.decided_by_id, r.decided_by_kind " +
                 "FROM mission.incident_copy c LEFT JOIN mission.incident_copy_resolution r " +

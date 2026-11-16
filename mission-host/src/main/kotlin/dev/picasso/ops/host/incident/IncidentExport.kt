@@ -4,6 +4,7 @@ import dev.picasso.host.BundleWriter
 import dev.picasso.middleware.IncidentBundle
 import dev.picasso.middleware.JobResponse
 import dev.picasso.middleware.RemedySearchRecord
+import dev.picasso.middleware.RevisionRemoval
 import java.nio.file.Path
 import java.time.Instant
 
@@ -23,8 +24,12 @@ import java.time.Instant
  * 사본은 이 프로세스 메모리에만 있고 상한이 없다. 재기동하면 새 인스턴스의 것부터 다시 쌓인다(작업 응답 줄은 인스턴스 id 를 든다).
  * 개념 증명 범위다.
  *
- * 안내(`manifest.json`)는 [instanceId] 를 싣는다(내보내기 판 8, picasso §15.322). 한 벌은 한 인스턴스의 것이고, 인시던트 줄의
+ * 안내(`manifest.json`)는 [instanceId] 를 싣는다(내보내기 버전 8, picasso §15.322). 한 벌은 한 인스턴스의 것이고, 인시던트 줄의
  * `incidentKey` 가 재기동 앞 인스턴스의 벌과 같은 사건을 잇는다. [instanceId] 는 미들웨어의 것(기동마다 새 값)이다.
+ *
+ * 내보내기 버전 10(picasso §15.329)부터 셋째 레지스터 `revision-removals.jsonl` 이 놓이고 안내의 `counts` 에 `revisionRemovals` 가 붙는다(빈 파일일 수
+ * 있다). 리비전 제거 사건도 (실행 id, `toVersion`)마다 한 줄을 들고 덧붙이기만 한다 — 레지스터는 보존 상한에 차면 앞 사건을 내린다. 호스트는 picasso 레지스터가
+ * 아니라 사본 표(V18)의 커밋된 행에서 모아 넘긴다.
  *
  * 호스트 잠금 아래에서만 부른다. [BundleWriter] 는 부르는 쪽이 직렬화한다.
  */
@@ -33,18 +38,21 @@ class IncidentExport(dir: Path, private val instanceId: String) {
     private val incidents = LinkedHashMap<String, IncidentBundle>()
     private val searches = LinkedHashMap<String, RemedySearchRecord>()
     private val responses = LinkedHashMap<String, JobResponse>()
+    private val removals = LinkedHashMap<Pair<String, Int>, RevisionRemoval>()
 
-    /** 새로 본 줄을 사본에 더하고, 늘었으면 파일을 다시 쓴다. [virtualNow] 는 안내에 싣는 시각이다. */
+    /** 새로 본 줄을 사본에 더하고, 늘었으면 파일을 다시 쓴다. [virtualNow] 는 안내에 싣는 시각이다. [removals] 는 리비전 제거 사건(버전 10)이다. */
     fun observe(
         incidents: List<IncidentBundle>,
         searches: List<RemedySearchRecord>,
         responses: List<JobResponse>,
         virtualNow: Instant,
+        removals: List<RevisionRemoval> = emptyList(),
     ) {
         incidents.forEach { this.incidents[it.incidentId] = it }
         searches.forEach { this.searches.putIfAbsent(it.searchId, it) }
         responses.forEach { this.responses.putIfAbsent(it.jobResponseId, it) }
-        writer.snapshot(this.incidents.values.toList(), this.searches.values.toList(), virtualNow)
+        removals.forEach { this.removals.putIfAbsent(it.executionId to it.toVersion, it) }
+        writer.snapshot(this.incidents.values.toList(), this.searches.values.toList(), virtualNow, this.removals.values.toList())
         writer.carry(this.responses.values.toList(), instanceId)
     }
 }

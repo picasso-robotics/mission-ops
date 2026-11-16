@@ -1,5 +1,15 @@
 import type { Delivered, JobOrderOutcome } from '../api'
-import { FORGOTTEN_JOB_ORDER_TEXT, SUBMIT_RESULT_LABEL, alternativesLabel, choiceRefusalNote, kindLabel, sourceMissingLabel, sourceUnobservedLabel } from '../labels'
+import {
+  FORGOTTEN_JOB_ORDER_TEXT,
+  SUBMIT_RESULT_LABEL,
+  alternativesLabel,
+  choiceRefusalNote,
+  kindLabel,
+  revisionRemovalLabel,
+  scopeCutRefusalNote,
+  sourceMissingLabel,
+  sourceUnobservedLabel,
+} from '../labels'
 import { UnassignedRemedies } from './RejectionSummary'
 
 interface Props {
@@ -76,6 +86,8 @@ export function JobOrderNotice({ what, sent }: Props) {
         )}
       </dl>
       {choiceRefusalNote(outcome.rejectionReason) !== null && <p role="note">{choiceRefusalNote(outcome.rejectionReason)}</p>}
+      {scopeCutRefusalNote(outcome.rejectionReason) !== null && <p role="note">{scopeCutRefusalNote(outcome.rejectionReason)}</p>}
+      {outcome.revisionRemoval != null && <p>{revisionRemovalLabel(outcome.revisionRemoval)}</p>}
       {outcome.forgottenJobOrder === true && <p>{FORGOTTEN_JOB_ORDER_TEXT}</p>}
       {outcome.sourceUnobserved && <p>{sourceUnobservedLabel(outcome.sourceUnobserved)}</p>}
       {outcome.refusals.length > 0 && (

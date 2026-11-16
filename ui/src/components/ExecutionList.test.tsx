@@ -225,4 +225,26 @@ describe('실행 목록 — 활성과 최근 정착, 이력은 페이지', () =>
     expect(within(bound).getAllByRole('cell')[4]).toHaveTextContent(`humanoid-01 (${BOUND_ROBOT_LABEL})`)
     expect(within(robot).getAllByRole('cell')[4]).toHaveTextContent(/^humanoid-01$/)
   })
+
+  it('리비전이 범위에서 뺀 단위는 단위 칸에 «리비전 N 이 범위에서 뺌» 으로 보이고 물리 상태는 실패·취소로 바뀌지 않는다', async () => {
+    const fake = installFakeOps(emptyList)
+    const removal = {
+      instanceId: 'mw-1', executionId: 'exec-9', fromVersion: 1, toVersion: 2,
+      removed: [{ unitId: 'T2.travel', state: 'PENDING' }, { unitId: 'T2', state: 'FAILED' }], at: 't1', wallClockAt: 't1',
+    }
+    fake.executions = executionsView({
+      executions: [execution(9, { physicalState: 'RUNNING', revisionRemovals: [removal] }), execution(10, { physicalState: 'RUNNING' })],
+    })
+    open()
+    const table = await within(screen.getByRole('region', { name: '실행' })).findByRole('table', { name: '실행 목록' })
+    const rows = within(table).getAllByRole('row').slice(1)
+    const cut = rows.find((row) => row.textContent?.includes('exec-9'))!
+    const plain = rows.find((row) => row.textContent?.includes('exec-10'))!
+    // 열은 그대로 여덟이고 단위 칸(일곱째)에만 붙는다.
+    expect(within(cut).getAllByRole('cell')).toHaveLength(8)
+    expect(within(cut).getAllByRole('cell')[6]).toHaveTextContent('리비전 2 이 범위에서 뺌: T2.travel(내기 전), T2(시작하지 못한 채)')
+    expect(within(cut).getAllByRole('cell')[5]).toHaveTextContent(/^RUNNING$/)
+    expect(within(cut).getAllByRole('cell')[6]).not.toHaveTextContent(/실패|취소|완료/)
+    expect(within(plain).queryByText(/범위에서 뺌/)).toBeNull()
+  })
 })

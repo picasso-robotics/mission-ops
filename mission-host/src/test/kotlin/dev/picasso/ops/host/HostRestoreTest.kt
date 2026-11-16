@@ -365,7 +365,7 @@ class HostRestoreTest {
 
         val EXECUTION_FIELDS = listOf(
             "executionId", "jobOrderId", "workMasterId", "missionVersion", "robotId", "physicalState", "units", "jobResponse", "restoredFrom", "cancel",
-            "permitBlock", "blockedFaults", "releases", "boundRobot",
+            "permitBlock", "blockedFaults", "releases", "boundRobot", "revisionRemovals",
         )
 
         /** 인시던트 목록 줄과 상세의 끝 네 칸(picasso §15.322). */

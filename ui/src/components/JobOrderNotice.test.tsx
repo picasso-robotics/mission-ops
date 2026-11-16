@@ -1,7 +1,17 @@
 import { render, screen, within } from '@testing-library/react'
 import { expect, it } from 'vitest'
 import type { UnassignedRefusal } from '../api'
-import { CHOICE_CLASH_NOTE, CHOICE_REVISION_NOTE, CHOICE_REVISION_REFUSALS, FORGOTTEN_JOB_ORDER_TEXT, choiceRefusalNote } from '../labels'
+import {
+  CHOICE_CLASH_NOTE,
+  CHOICE_REVISION_NOTE,
+  CHOICE_REVISION_REFUSALS,
+  FORGOTTEN_JOB_ORDER_TEXT,
+  SCOPE_CUT_EMPTY_NOTE,
+  SCOPE_CUT_NOTE,
+  SCOPE_CUT_REFUSALS,
+  choiceRefusalNote,
+  scopeCutRefusalNote,
+} from '../labels'
 import { JobOrderNotice } from './JobOrderNotice'
 
 const missing = { material: 'ENGINE-COVER-A', source: 'SEQ-IN-02.BIN-A', observed: null }
@@ -106,4 +116,27 @@ it('분기 자리 겹침 거부는 설비 id 겹침 안내를 붙이고 분기�
   expect(choiceRefusalNote('자재 선언과 배정이 어긋난다: 선언={}, 배정={}')).toBeNull()
   expect(choiceRefusalNote(null)).toBeNull()
   expect(CHOICE_REVISION_REFUSALS.map(choiceRefusalNote)).toEqual(CHOICE_REVISION_REFUSALS.map(() => CHOICE_REVISION_NOTE))
+})
+
+it('손댄 항목을 빼는 리비전 거부는 picasso 사유를 그대로 보이고 새 작업 지시로 내라는 안내를 붙인다', () => {
+  const reason = '리비전이 손댄 단위를 뺀다: T1.travel(RUNNING) — 발행했거나 끝난 단위가 든 항목은 뺄 수 없다. 새 작업 지시로 낸다'
+  rejected(reason)
+  expect(screen.getByText(reason)).toBeVisible()
+  expect(screen.getByRole('note')).toHaveTextContent(SCOPE_CUT_NOTE)
+  expect(SCOPE_CUT_REFUSALS.map(scopeCutRefusalNote)).toEqual(SCOPE_CUT_REFUSALS.map(() => SCOPE_CUT_NOTE))
+  expect(scopeCutRefusalNote('리비전이 작업 지시의 항목을 모두 뺀다: T1 — 실행을 멈추려면 취소한다')).toBe(SCOPE_CUT_EMPTY_NOTE)
+  expect(scopeCutRefusalNote('리비전이 분기의 가지를 바꾼다: how[T2]')).toBeNull()
+  expect(choiceRefusalNote(reason)).toBeNull()
+  expect(scopeCutRefusalNote(null)).toBeNull()
+})
+
+it('항목을 뺀 리비전을 받으면 수락과 함께 리비전이 범위에서 뺀 단위를 보인다', () => {
+  render(<JobOrderNotice what="InspectAsset 작업 지시" sent={{ kind: 'outcome', outcome: {
+    requestId: 'q3', jobOrderId: 'JO-1', result: 'SUCCEEDED', confirmation: null,
+    outcome: { result: 'ACCEPTED', executionId: 'exec-1', robotId: 'humanoid-01', rejectionReason: null, refusals: [], excluded: [],
+      revisionRemoval: { instanceId: 'mw-1', executionId: 'exec-1', fromVersion: 1, toVersion: 2,
+        removed: [{ unitId: 'T2.travel', state: 'PENDING' }, { unitId: 'T2', state: 'PENDING' }], at: 't', wallClockAt: 't' } },
+  } }} />)
+  expect(screen.getByText('리비전 2 이 범위에서 뺌: T2.travel(내기 전), T2(내기 전)')).toBeVisible()
+  expect(screen.queryByRole('note')).toBeNull()
 })

@@ -23,7 +23,7 @@ class MissionStoreTest {
     @BeforeTest
     fun freshSchema() {
         PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        assertEquals(17, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+        assertEquals(18, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
     }
 
     private fun draft(workMaster: String = PSR) = store.saveDraft(workMaster, "{}", "lee", UUID.randomUUID())
@@ -41,7 +41,7 @@ class MissionStoreTest {
                 "flyway_schema_history",
                 "host_instance", "incident_copy", "incident_copy_resolution", "incident_copy_revision", "job_order_withdrawal", "job_response_log", "mission_version",
                 "mock_run", "remedy_approval", "remedy_search_copy", "result_outbox",
-                "result_producer", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
+                "result_producer", "revision_removal", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
             ),
             placed,
         )
@@ -148,6 +148,37 @@ class MissionStoreTest {
         assertEquals(listOf(1, 1, 1), listOf("incident_copy_revision", "remedy_search_copy", "remedy_approval").map { table ->
             PostgresSupport.queryOne("SELECT count(*) FROM mission.$table") { it.getInt(1) }
         })
+    }
+
+    @Test
+    fun `V18 리비전 제거 사건 표는 덧붙이기만 하고 실행의 한 버전을 한 번만 받으며 줄과 칸이 같아야 한다`() {
+        PostgresSupport.execute(
+            "INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, instance_id, execution_id) " +
+                "VALUES ('JO-1', 'r', '{}', 'InspectAsset', 'mw-1', 'exec-1')",
+        )
+        val removed = """[{"unitId":"T2","state":"PENDING"}]"""
+        val line = """{"executionId":"exec-1","jobOrderId":"JO-1","robotId":"r","fromVersion":1,"toVersion":2,"removed":$removed,"at":"x","wallClockAt":"y"}"""
+        val insert = "INSERT INTO mission.revision_removal (instance_id, execution_id, job_order_id, robot_id, from_version, to_version, removed, removed_at, " +
+            "wall_clock_at, wire_version, line) VALUES ('mw-1', 'exec-1', 'JO-1', 'r', 1, 2, '$removed', now(), now(), '10', '$line')"
+        PostgresSupport.execute(insert)
+        listOf("UPDATE mission.revision_removal SET robot_id = 'x'", "DELETE FROM mission.revision_removal", "TRUNCATE mission.revision_removal CASCADE").forEach { sql ->
+            val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+            assertTrue("덧붙이기만 한다" in e.message!!, "$sql: ${e.message}")
+        }
+        listOf(
+            // 한 사본은 (인스턴스, 실행, toVersion)이다.
+            insert,
+            // 일지에 없는 작업 지시의 사건은 없다.
+            insert.replace("'JO-1', 'r'", "'JO-X', 'r'").replace("'mw-1'", "'mw-2'"),
+            // 버전은 오르기만 하고 뺀 단위는 하나 이상이다.
+            insert.replace("'mw-1'", "'mw-3'").replace("1, 2,", "2, 2,"),
+            insert.replace("'mw-1'", "'mw-4'").replace("'$removed'", "'[]'"),
+            // 줄과 칸이 어긋나면 받지 않는다(실행, 버전, 뺀 단위).
+            insert.replace("'mw-1', 'exec-1'", "'mw-5', 'exec-9'"),
+            insert.replace("'mw-1'", "'mw-6'").replace("1, 2,", "1, 3,"),
+            insert.replace("'mw-1'", "'mw-7'").replace("'$removed'", "'[{\"unitId\":\"T1\",\"state\":\"PENDING\"}]'"),
+        ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+        assertEquals(1, PostgresSupport.queryOne("SELECT count(*) FROM mission.revision_removal") { it.getInt(1) })
     }
 
     @Test

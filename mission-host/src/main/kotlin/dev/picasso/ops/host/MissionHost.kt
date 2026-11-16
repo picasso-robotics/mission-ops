@@ -44,6 +44,8 @@ import dev.picasso.middleware.RemedySearchRecord
 import dev.picasso.middleware.Route
 import dev.picasso.middleware.ResolveOutcome
 import dev.picasso.middleware.Retention
+import dev.picasso.middleware.RemovedUnit
+import dev.picasso.middleware.RevisionRemoval
 import dev.picasso.middleware.RetentionEvictions
 import dev.picasso.middleware.RetirementPort
 import dev.picasso.middleware.RobotPort
@@ -79,6 +81,9 @@ import dev.picasso.ops.host.store.HostRecords
 import dev.picasso.ops.host.store.IncidentCopyRow
 import dev.picasso.ops.host.store.IncidentRevisionWrite
 import dev.picasso.ops.host.store.SearchCopyWrite
+import dev.picasso.ops.host.store.RemovalCopyRow
+import dev.picasso.ops.host.store.RemovalCopyWrite
+import dev.picasso.ops.host.store.RemovedUnitRow
 import dev.picasso.ops.host.store.JournalEvent
 import dev.picasso.ops.host.store.JournalRow
 import dev.picasso.ops.host.store.JournalEventKind
@@ -93,6 +98,7 @@ import org.slf4j.LoggerFactory
 import java.nio.file.Path
 import java.time.Duration
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -206,6 +212,9 @@ data class Refusal(
  * @param forgottenJobOrder 이미 끝나 이빅션한 작업 지시라 받지 않은 REJECTED 다. 사유가 picasso `Middleware.FORGOTTEN_JOB_ORDER` 로 시작한다.
  *   이 인스턴스가 picasso 메모리에서 놓은 실행이면 picasso 가, 재기동 뒤라 picasso 가 모르는 정착한 작업 지시면 실행 일지가 거부한다
  *   ([MissionHost.submit]). 다시 해도 같다 — 다시 할 일은 새 작업 지시 id 로 낸다. 그 밖에는 거짓이다
+ * @param revisionRemoval 이 제출이 받은 리비전이 작업 지시에서 항목을 빼 손대지 않은 단위를 지웠으면 그 사건(picasso §15.329). 개정판 행·판단
+ *   기록과 같은 트랜잭션으로 커밋한 뒤에 싣는다. 빼는 것이 없었거나 리비전이 아니면 `null` 이다. 손댄 단위를 빼는 리비전은 REJECTED 이고 사유가
+ *   [rejectionReason] 에 picasso 문장 그대로 있다 — 아무것도 저장하지 않는다
  */
 data class SubmitOutcome(
     val result: SubmitResult,
@@ -221,6 +230,7 @@ data class SubmitOutcome(
     val sourceUnobserved: SourceUnobservedView? = null,
     val forgottenJobOrder: Boolean = false,
     val boundRobot: Boolean = false,
+    val revisionRemoval: RevisionRemovalView? = null,
 ) {
     companion object {
         /**
@@ -371,7 +381,39 @@ data class ExecutionView(
     val blockedFaults: List<FaultDetailView> = emptyList(),
     val releases: List<FaultReleaseView> = emptyList(),
     val boundRobot: Boolean = false,
+    val revisionRemovals: List<RevisionRemovalView> = emptyList(),
 )
+
+/** 리비전이 뺀 단위 하나와 뺄 때의 상태(picasso `RemovedUnit`). 상태는 `PENDING` 이거나 태스크 없는 계획 실패 `FAILED` 다. */
+data class RemovedUnitView(val unitId: String, val state: String)
+
+/**
+ * 리비전 제거 사건 하나(picasso §15.329 `RevisionRemoval`, V18 `mission.revision_removal`). 리비전 [toVersion] 이 작업 지시에서 항목을 빼며 손대지 않은
+ * 단위([removed])를 실행에서 지웠다. **실패·취소·완료가 아니다** — 그 단위는 발행되지 않고 작업 응답의 완료·미완료 목록에서 빠진다(«리비전 N 이
+ * 범위에서 뺌»). [instanceId]·[executionId] 는 그 리비전을 받은 인스턴스와 실행이다 — 재기동 뒤 다시 지은 실행에는 앞 인스턴스의 사건이 그대로
+ * 실린다. [at] 은 미들웨어 시각(호스트 시계), [wallClockAt] 은 실제 시각이다. [fromVersion] 은 지우기 전 작업 지시 버전이다(건너뛰면 차가 1 이 아니다).
+ */
+data class RevisionRemovalView(
+    val instanceId: String,
+    val executionId: String,
+    val fromVersion: Int,
+    val toVersion: Int,
+    val removed: List<RemovedUnitView>,
+    val at: Instant,
+    val wallClockAt: Instant,
+) {
+    companion object {
+        fun of(row: RemovalCopyRow) = RevisionRemovalView(
+            row.instanceId, row.executionId, row.fromVersion, row.toVersion, row.removed.map { RemovedUnitView(it.unitId, it.state) }, row.at, row.wallClockAt,
+        )
+
+        /** 미들웨어의 사건에서. 시각은 사본 표(`timestamptz`)와 같은 마이크로초로 자른다 — 제출 결과와 실행 본문이 같은 값을 싣는다. */
+        fun of(instanceId: String, removal: RevisionRemoval) = RevisionRemovalView(
+            instanceId, removal.executionId, removal.fromVersion, removal.toVersion, removal.removed.map { RemovedUnitView(it.unitId, it.state.name) },
+            removal.at.truncatedTo(ChronoUnit.MICROS), removal.wallClockAt.truncatedTo(ChronoUnit.MICROS),
+        )
+    }
+}
 
 /** 다시 지은 실행의 이전 실행(S4b 스펙 §6.3). 바로 앞 인스턴스에서 그 작업 지시를 들었던 실행이다. */
 data class RestoredFromView(val instanceId: String, val executionId: String)
@@ -692,6 +734,25 @@ class MissionHost(
 
     /** 사본에 적은 탐색 id. 대장에 남은 id 만 든다. 탐색 기록은 적힌 뒤 바뀌지 않는다. */
     private val copiedSearches = mutableSetOf<String>()
+
+    /**
+     * 사본 표(V18)에 커밋한 리비전 제거 사건의 열쇠(실행 id, `toVersion`) — 한 사본은 (인스턴스, 실행, `toVersion`)이 가리킨다(picasso §15.329). 레지스터에
+     * 남은 열쇠만 든다. **개수가 아니라 식별자로 고른다** — 레지스터는 보존 상한(`Retention.revisionRemovals`)에 차면 수가 그대로인 채 앞 사건을 내리고
+     * 새 사건을 받는다. 이 레지스터는 사본 선언(`copyAck`)의 보호 밖이라 확인 입구가 없다 — 대신 [removalsCopied]·[removalsLost] 로 누락을 센다.
+     */
+    private val copiedRemovals = mutableSetOf<Pair<String, Int>>()
+
+    /** 이 인스턴스가 사본 표에 커밋한 리비전 제거 사건의 누계. */
+    private var removalsCopied = 0L
+
+    /**
+     * 사본 표에 적기 전에 레지스터가 내린 리비전 제거 사건의 누계([watchRemovals]). 레지스터가 받은 수(내린 수 + 남은 수)에서 커밋한 수와 남은 미커밋
+     * 수를 뺀 것이다. 0 이 아니면 그만큼 사본 표와 내보내기에서 빠졌다.
+     */
+    private var removalsLost = 0L
+
+    /** 내보내기에 넘긴 마지막 리비전 제거 사본 행 번호(V18 `removal_id`). 게시는 그 뒤의 커밋된 행만 읽는다. */
+    private var publishedRemovalId = 0L
 
     /**
      * 값 없는 승인으로 섰는데 실행 일지·판단 기록·승인 사실을 적지 못한 실행 id([attemptApproval] 일반 경로). 일지에 없으므로 [journalBlocked] 에 들어
@@ -1064,6 +1125,7 @@ class MissionHost(
                 // 기록이 커밋된 뒤 사본을 확인하고 파일을 게시하며, 그 뒤에 정착한 실행을 놓는다([recordAfterPump]).
                 recordAfterPump()
                 watchCopyAcks()
+                watchRemovals()
             }
         } catch (e: Exception) {
             log.warn("pump 실패: {}", e.toString())
@@ -1079,7 +1141,11 @@ class MissionHost(
     private fun publish(incidents: List<IncidentBundle>, searches: List<RemedySearchRecord>, responses: List<JobResponse>) {
         val export = exported ?: return
         try {
-            export.observe(incidents, searches, responses, clock.now())
+            // 리비전 제거 사건(내보내기 버전 10)은 picasso 레지스터가 아니라 **커밋된 사본 행**(이 인스턴스)에서 모은다 — 파일이 DB 보다 앞서지 않고,
+            // 게시가 늦는 동안 레지스터가 보존 상한으로 사건을 내려도 이미 커밋한 사건은 파일에서 빠지지 않는다. 앞서 모은 행 뒤의 것만 읽는다.
+            val rows = records.revisionRemovalsOf(instanceId, publishedRemovalId)
+            export.observe(incidents, searches, responses, clock.now(), rows.map(::removalOf))
+            rows.lastOrNull()?.let { publishedRemovalId = it.removalId }
         } catch (e: Exception) {
             log.warn("인시던트 고리 내보내기 실패, 다음 pump 에 다시 쓴다: {}", e.toString())
         }
@@ -1100,6 +1166,60 @@ class MissionHost(
         }
         evictedBeforeCopy = now
     }
+
+    /** 아직 사본 표에 적지 않은 리비전 제거 사건(식별자로 고른다)과 그 사본 행. 줄은 picasso `LedgerExport.revisionRemovalLine` 글자 그대로다. */
+    private fun freshRemovals(): List<Pair<RevisionRemoval, RemovalCopyWrite>> =
+        middleware.revisionRemovals().filter { (it.executionId to it.toVersion) !in copiedRemovals }.map { r ->
+            r to RemovalCopyWrite(
+                r.executionId, r.jobOrderId, r.robotId, r.fromVersion, r.toVersion, r.removed.map { RemovedUnitRow(it.unitId, it.state.name) },
+                // 칸의 시각은 마이크로초로 잘라 적는다(Postgres 는 반올림한다) — 줄은 picasso 글자 그대로라 나노초가 남을 수 있다.
+                r.at.truncatedTo(ChronoUnit.MICROS), r.wallClockAt.truncatedTo(ChronoUnit.MICROS), LedgerExport.revisionRemovalLine(r),
+            )
+        }
+
+    /** [freshRemovals] 의 사본 행을 지금 트랜잭션에 적는다. 트랜잭션 안에서 부른다. */
+    private fun writeRemovals(fresh: List<Pair<RevisionRemoval, RemovalCopyWrite>>) =
+        records.copyRevisionRemovals(instanceId, LedgerExport.LINE_SCHEMA_VERSION, fresh.map { it.second })
+
+    /** 커밋한 뒤에만 부른다 — 커밋한 사건을 든다([copiedRemovals]). 레지스터에 남은 열쇠만 남긴다. */
+    private fun removalsCommitted(fresh: List<Pair<RevisionRemoval, RemovalCopyWrite>>) {
+        fresh.forEach { (r, _) -> if (copiedRemovals.add(r.executionId to r.toVersion)) removalsCopied += 1 }
+        val present = middleware.revisionRemovals().mapTo(HashSet()) { it.executionId to it.toVersion }
+        copiedRemovals.retainAll(present)
+    }
+
+    /**
+     * 리비전 제거 사건의 누락을 센다. 이 레지스터는 사본 선언(`copyAck`)의 보호 밖이라 picasso 가 «확인 전 내림» 을 세지 않는다 — 받은 수(내린 수 + 남은
+     * 수)에서 커밋한 수와 남은 미커밋 수를 빼 사본 표에 적기 전에 내린 수를 구하고, 오르면 경고를 남긴다. 받은 리비전은 그 실행의 개정판 행과 같은
+     * 트랜잭션에 적고 그 트랜잭션이 실패하면 pump·제출이 막히므로 보통 0 이다. pump 마다 잠금 아래에서 부른다.
+     */
+    private fun watchRemovals() {
+        val present = middleware.revisionRemovals()
+        val produced = middleware.retentionEvictions().revisionRemovals + present.size
+        val uncopied = present.count { (it.executionId to it.toVersion) !in copiedRemovals }
+        val lost = (produced - removalsCopied - uncopied).coerceAtLeast(0)
+        if (lost > removalsLost) {
+            log.warn("리비전 제거 사건을 사본 표에 적기 전에 레지스터가 내렸다 — 사본 표와 내보내기에서 빠졌다: {}→{} (미커밋 {})", removalsLost, lost, uncopied)
+        }
+        removalsLost = lost
+    }
+
+    /**
+     * 사본 행을 picasso 사건으로 되돌린다(내보내기 게시용). 두 시각은 칸(마이크로초)이 아니라 picasso 글자 그대로인 줄에서 읽는다 — 다시 인코딩한 줄이
+     * 사본 행의 `line` 과 같다.
+     */
+    private fun removalOf(row: RemovalCopyRow): RevisionRemoval {
+        val line = json.readTree(row.line)
+        return RevisionRemoval(
+            row.executionId, row.jobOrderId, row.robotId, row.fromVersion, row.toVersion,
+            row.removed.map { RemovedUnit(it.unitId, UnitState.valueOf(it.state)) },
+            Instant.parse(line.path("at").asText()), Instant.parse(line.path("wallClockAt").asText()),
+        )
+    }
+
+    /** 리비전 제거 사건 사본의 지금 상태. 호스트 상태 응답이 싣는다. 호스트 잠금 아래에서 부른다. */
+    private fun removalCopyView(): RemovalCopyView =
+        RemovalCopyView(removalsCopied, middleware.revisionRemovals().count { (it.executionId to it.toVersion) !in copiedRemovals }, removalsLost)
 
     /**
      * 줄 글자가 같은 새 번들([recordAfterPump] 의 `unchanged`)을 든 것으로 바꾸고 그 id 를 다시 확인한다. 그 줄은 앞 트랜잭션에서 이미 커밋됐다 —
@@ -1365,11 +1485,16 @@ class MissionHost(
                     journal(submission.execution)
                     persistRecord(submission.execution.executionId)
                 } else {
+                    // 받은 리비전의 개정판 행·판단 기록·리비전 제거 사건을 한 트랜잭션에 적는다([recordReruns]).
                     recordReruns()?.let { throw JournalWriteFailed(submission.execution.executionId, it) }
+                }
+                val removal = if (!existed) null else middleware.revisionRemovals().lastOrNull {
+                    it.executionId == submission.execution.executionId && it.toVersion == submission.execution.order.version
                 }
                 SubmitOutcome(
                     SubmitResult.ACCEPTED, submission.execution.executionId, submission.execution.robotId, null, emptyList(), excluded,
                     boundRobot = fleetOnly(submission.execution.units),
+                    revisionRemoval = removal?.let { RevisionRemovalView.of(instanceId, it) },
                 )
             }
             is Middleware.Submission.Idempotent -> SubmitOutcome(
@@ -1694,7 +1819,7 @@ class MissionHost(
             states = states,
             journalBlockedExecutionIds = journalBlocked(),
             fleet = fleetLink,
-            ledgerCopy = LedgerCopyView.of(middleware.copyAcks()),
+            ledgerCopy = LedgerCopyView.of(middleware.copyAcks(), removalCopyView()),
         )
     }
 
@@ -1769,6 +1894,8 @@ class MissionHost(
     private fun view(chosen: List<Middleware.Execution>): ExecutionsView {
         val responses = latestResponses(middleware.responses())
         val released = records.releases(chosen.map { it.order.jobOrderId }).groupBy { it.jobOrderId }
+        // 리비전 제거 사건은 사본 표(V18)에서 읽는다 — 재기동 뒤 다시 지은 실행에도 앞 인스턴스가 받은 제거가 실린다.
+        val removed = records.revisionRemovals(chosen.map { it.order.jobOrderId }).groupBy { it.jobOrderId }
         return ExecutionsView(
             instanceId = middleware.instanceId,
             pumpedAt = pumpedAt,
@@ -1794,6 +1921,7 @@ class MissionHost(
                     blockedFaults = execution.blockedBy.map(FaultDetailView::fromContract),
                     releases = released[execution.order.jobOrderId].orEmpty().map(::releaseView),
                     boundRobot = fleetOnly(execution.units),
+                    revisionRemovals = removed[execution.order.jobOrderId].orEmpty().map(RevisionRemovalView::of),
                 )
             },
             restore = restoreView(),
@@ -1952,9 +2080,11 @@ class MissionHost(
             !it.physicalState.pumps && it.order.jobOrderId in journaled && !settleRecorded(it, latest)
         }
         val judgments = changedRecords(latest)
+        // 받은 리비전의 제거 사건은 보통 [recordReruns] 가 개정판 행과 함께 적었다. 남은 것(그 트랜잭션 밖에서 선 것)이 있으면 여기서 적는다.
+        val freshRemovals = freshRemovals()
         if (
             pending.isEmpty() && fresh.isEmpty() && revised.isEmpty() && freshSearches.isEmpty() && resolved.isEmpty() &&
-            settled.isEmpty() && judgments.isEmpty()
+            settled.isEmpty() && judgments.isEmpty() && freshRemovals.isEmpty()
         ) {
             reackUnchanged(unchanged)
             publish(incidents, searches, responses)
@@ -1993,6 +2123,7 @@ class MissionHost(
                     revised.map { IncidentRevisionWrite(it.bundle.incidentId, it.revision, it.line) },
                 )
                 records.copySearches(instanceId, LedgerExport.LINE_SCHEMA_VERSION, searchRows)
+                writeRemovals(freshRemovals)
                 resolved.forEach { bundle ->
                     val resolution = bundle.resolution!!
                     records.copyResolution(
@@ -2017,6 +2148,7 @@ class MissionHost(
         fresh.forEach { copiedLines[it.incidentId] = CopiedLine(it, 1, freshLines.getValue(it.incidentId)) }
         revised.forEach { copiedLines[it.bundle.incidentId] = it }
         copiedSearches += freshSearches.map { it.searchId }
+        removalsCommitted(freshRemovals)
         judgments.forEach { (execution, text) -> recorded[execution.order.jobOrderId] = text }
         copiedResolutions += resolved.map { it.incidentId }
         // 대장에서 내린 id 는 다시 오지 않는다(인스턴스 안의 셈) — 남은 id 만 든다.
@@ -2557,6 +2689,8 @@ class MissionHost(
         val judgments = changedRecords().filter { it.first.executionId in ids }
         // 값 없는 승인이 이미 선 실행에 조치 열을 실으면 개정판으로 다시 돈다. 그 승인 사실도 같은 트랜잭션에 적는다(같은 승인은 열쇠가 한 번만 받는다).
         val facts = reruns.filter { it.revised }.mapNotNull { approvalFact(it.execution) }
+        // 받은 리비전이 손대지 않은 단위를 지웠으면 그 사건(picasso §15.329)도 같은 트랜잭션에 적는다 — 판단 기록은 지운 사실을 싣지 않는다.
+        val removals = freshRemovals()
         try {
             records.inTransaction {
                 facts.forEach { records.approvalFact(instanceId, it) }
@@ -2567,11 +2701,13 @@ class MissionHost(
                     if (rerun.reopened) records.event(jobOrderId, JournalEventKind.REOPENED, instanceId, execution.executionId, execution.physicalState.name)
                 }
                 judgments.forEach { (execution, text) -> writeRecord(execution, text) }
+                writeRemovals(removals)
             }
         } catch (e: Exception) {
             log.warn("다시 돈 실행을 적지 못했다, 적을 때까지 pump 를 막는다: {} {}", ids, e.toString())
             return e
         }
+        removalsCommitted(removals)
         reruns.forEach { rerun ->
             val execution = rerun.execution
             journaled[execution.order.jobOrderId] = execution.order.version

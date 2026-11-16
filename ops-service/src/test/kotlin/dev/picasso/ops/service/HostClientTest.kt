@@ -137,6 +137,23 @@ class HostClientTest {
     }
 
     @Test
+    fun `받은 리비전의 제거 사건은 해석하지 않고 그대로 옮기며 손댄 항목 거부 사유도 호스트 문장 그대로다`() {
+        val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+        val type = dev.picasso.ops.service.host.HostSubmitOutcome::class.java
+        val removal = """{"instanceId":"mw-1","executionId":"exec-1","fromVersion":1,"toVersion":2,"removed":[{"unitId":"T2.travel","state":"PENDING"},""" +
+            """{"unitId":"T2","state":"PENDING"}],"at":"2026-01-01T00:00:00Z","wallClockAt":"2026-01-01T00:00:01Z"}"""
+        val accepted = mapper.readValue("""{"result":"ACCEPTED","executionId":"exec-1","robotId":"r1","revisionRemoval":$removal}""", type)
+        assertEquals(mapper.readTree(removal), accepted.revisionRemoval)
+        // 화면으로 다시 낼 때도 칸이 그대로다.
+        assertEquals(mapper.readTree(removal), mapper.readTree(mapper.writeValueAsString(accepted))["revisionRemoval"])
+        assertEquals(null, mapper.readValue("""{"result":"ACCEPTED","executionId":"exec-1","robotId":"r1"}""", type).revisionRemoval)
+        val reason = "리비전이 손댄 단위를 뺀다: T1(DONE) — 발행했거나 끝난 단위가 든 항목은 뺄 수 없다. 새 작업 지시로 낸다"
+        val refused = mapper.readValue("""{"result":"REJECTED","rejectionReason":"$reason"}""", type)
+        assertEquals(reason, refused.rejectionReason)
+        assertEquals("호스트 제출 거부: $reason", dev.picasso.ops.service.requests.rejectedDetail(refused))
+    }
+
+    @Test
     fun `닿지 않는 호스트는 판정과 조회가 모름이고 제출이 응답 없음이다`() {
         val client = serve()
         stop()
