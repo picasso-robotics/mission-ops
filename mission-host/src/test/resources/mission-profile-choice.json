@@ -1,0 +1,175 @@
+{
+  "workMasterId": "AssetInspectByItem",
+  "name": "대상마다 이동 뒤 종류별 점검",
+  "description": "대상마다 그 위치로 이동한 뒤 대상의 점검 종류(item)로 점검을 고릅니다.",
+  "requiredEvidence": "E0",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "targets": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 20,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "location": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "item": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "required": [
+            "id",
+            "location",
+            "item"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "targets"
+    ],
+    "additionalProperties": false
+  },
+  "orderMapping": {
+    "equipment": [
+      {
+        "input": "targets",
+        "equipmentUse": "mission_target",
+        "id": "id",
+        "properties": {
+          "location": "location",
+          "item": "item"
+        }
+      }
+    ],
+    "materials": []
+  },
+  "sample": {
+    "targets": [
+      {
+        "id": "T1",
+        "location": "bay-7",
+        "item": "thermal"
+      },
+      {
+        "id": "T2",
+        "location": "dock-3",
+        "item": "visual"
+      }
+    ]
+  },
+  "definition": {
+    "schemaVersion": 1,
+    "workMasterId": "AssetInspectByItem",
+    "maxEvidence": "E0",
+    "preferredOptionals": {},
+    "steps": [
+      {
+        "kind": "each",
+        "id": "visit",
+        "forEach": "mission_target",
+        "steps": [
+          {
+            "kind": "unit",
+            "id": "travel",
+            "skill": "navigate_to",
+            "unitId": {
+              "from": "ITEM_ID",
+              "suffix": ".travel"
+            },
+            "parameters": {
+              "location": {
+                "from": "ITEM_PROPERTY",
+                "property": "location"
+              }
+            },
+            "destination": {
+              "from": "ITEM_PROPERTY",
+              "property": "location"
+            }
+          },
+          {
+            "kind": "choice",
+            "id": "how",
+            "on": {
+              "from": "ITEM_PROPERTY",
+              "property": "item"
+            },
+            "arms": [
+              {
+                "equals": "thermal",
+                "steps": [
+                  {
+                    "kind": "unit",
+                    "id": "thermal",
+                    "skill": "inspect",
+                    "after": "travel",
+                    "unitId": {
+                      "from": "ITEM_ID"
+                    },
+                    "parameters": {
+                      "target": {
+                        "from": "ITEM_ID"
+                      }
+                    },
+                    "destination": {
+                      "from": "ITEM_PROPERTY",
+                      "property": "location"
+                    }
+                  }
+                ]
+              },
+              {
+                "equals": "visual",
+                "steps": [
+                  {
+                    "kind": "unit",
+                    "id": "look",
+                    "skill": "inspect",
+                    "after": "travel",
+                    "unitId": {
+                      "from": "ITEM_ID",
+                      "suffix": ".look"
+                    },
+                    "parameters": {
+                      "target": {
+                        "from": "ITEM_ID"
+                      }
+                    },
+                    "destination": {
+                      "from": "ITEM_PROPERTY",
+                      "property": "location"
+                    }
+                  }
+                ]
+              }
+            ],
+            "otherwise": {
+              "steps": []
+            },
+            "whenMissing": {
+              "failureClass": "NO_ITEM_FOR_TARGET",
+              "unit": "thermal",
+              "parameters": [
+                "target"
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,7 +1,7 @@
 import { render, screen, within } from '@testing-library/react'
 import { expect, it } from 'vitest'
 import type { UnassignedRefusal } from '../api'
-import { FORGOTTEN_JOB_ORDER_TEXT } from '../labels'
+import { CHOICE_CLASH_NOTE, CHOICE_REVISION_NOTE, CHOICE_REVISION_REFUSALS, FORGOTTEN_JOB_ORDER_TEXT, choiceRefusalNote } from '../labels'
 import { JobOrderNotice } from './JobOrderNotice'
 
 const missing = { material: 'ENGINE-COVER-A', source: 'SEQ-IN-02.BIN-A', observed: null }
@@ -84,4 +84,26 @@ it('미배정의 기체별 조치 제안을 보이고 관문 확인으로 얻은
   expect(within(list).getByText('조치 제안 1단계: pick_place')).toBeTruthy()
   expect(within(list).getByText(/잔여 파지 표시 7 · 관문 확인으로 얻은 제안/)).toBeTruthy()
   expect(within(list).queryByText('quadruped-01')).toBeNull()
+})
+
+function rejected(reason: string) {
+  render(<JobOrderNotice what="AssetInspectByItem 작업 지시" sent={{ kind: 'outcome', outcome: {
+    requestId: 'q2', jobOrderId: 'JO-1', result: 'REJECTED', confirmation: null,
+    outcome: { result: 'REJECTED', executionId: null, robotId: null, rejectionReason: reason, refusals: [], excluded: [] },
+  } }} />)
+}
+
+it('분기가 든 실행의 리비전 거부는 picasso 사유를 그대로 보이고 새 작업 지시로 내라는 안내를 붙인다', () => {
+  const reason = '리비전이 분기의 가지를 바꾼다: how[T2] 받은 값=arms[0], 현재=arms[1] — 새 작업 지시로 낸다'
+  rejected(reason)
+  expect(screen.getByText(reason)).toBeVisible()
+  expect(screen.getByRole('note')).toHaveTextContent(CHOICE_REVISION_NOTE)
+})
+
+it('분기 자리 겹침 거부는 설비 id 겹침 안내를 붙이고 분기와 무관한 거부에는 안내를 붙이지 않는다', () => {
+  rejected('분기 자리가 겹쳐 받지 않는다: how[T1] — 분기가 든 반복 그룹의 설비 id 가 같은 쓰임 안에서 겹친다')
+  expect(screen.getByRole('note')).toHaveTextContent(CHOICE_CLASH_NOTE)
+  expect(choiceRefusalNote('자재 선언과 배정이 어긋난다: 선언={}, 배정={}')).toBeNull()
+  expect(choiceRefusalNote(null)).toBeNull()
+  expect(CHOICE_REVISION_REFUSALS.map(choiceRefusalNote)).toEqual(CHOICE_REVISION_REFUSALS.map(() => CHOICE_REVISION_NOTE))
 })

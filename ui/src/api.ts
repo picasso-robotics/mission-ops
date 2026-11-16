@@ -898,6 +898,21 @@ export interface MockRunUnit {
   failureClass: string | null
 }
 
+/**
+ * 모의 실행의 분기 자리 하나(S3b JSON 계약 §4.5, picasso §15.328). 분기는 표본 작업 지시의 값으로 가지 하나를 고르고 그 가지만 돈다 —
+ * `notRun` 의 가지는 이 모의 실행으로 검증되지 않았다. `site` 는 최상위 분기면 분기 id, 반복 그룹 안 분기면 `분기 id[설비 id]` 다.
+ * 표본이 그 분기에 자리를 열지 않았으면 `chosen` 이 null 이고 `notRun` 이 모든 가지다.
+ */
+export interface MockRunBranch {
+  site: string
+  choiceId: string
+  /** `arms[i]`·`otherwise`·`whenMissing`(값이 없어 접힘). */
+  chosen: string | null
+  notRun: string[]
+  /** 가지 `arms[i]` 마다 맞는 값(`equals`·`in`). */
+  armValues: Record<string, string[]>
+}
+
 /** 모의 실행 실패의 하위 범주(S3b JSON 계약 §4.5). 통과면 null 이다. */
 export type MockRunFailure = 'DEFINITION' | 'SUBMISSION_REJECTED' | 'NOT_SETTLED' | 'WALL_CLOCK_LIMIT' | 'EXECUTION_FAILED'
 
@@ -921,6 +936,8 @@ export interface MockRunResult {
   units: MockRunUnit[]
   virtualElapsedSeconds: number
   wallElapsedMillis: number
+  /** 분기 자리마다 돈 가지와 안 돈 가지. 분기가 없는 정의는 빈 목록이고, 이 칸이 생기기 전의 옛 행에는 없다. */
+  branches?: MockRunBranch[]
 }
 
 /** 모의 실행 한 행(S3b JSON 계약 §3.3). 시각은 DB 시각이다. */

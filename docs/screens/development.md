@@ -132,7 +132,7 @@ PR #23은 층 이름 통일입니다.
 | `src/jobOrderDraft.ts` | 작업 지시 폼의 초안과 보내기 전 검사 |
 | `src/manualRequests.ts` | 수동 작업 요청의 sessionStorage 보관 |
 | `src/executionHistory.ts` | 5초 조회에 불러온 이전 실행 페이지 결합 |
-| `src/missionTemplates.ts` | 새 임무 생성의 시작 템플릿 셋(대상 점검, 지정 위치 이동, 대상마다 이동 뒤 점검 반복 그룹) |
+| `src/missionTemplates.ts` | 새 임무 생성의 시작 템플릿 넷(대상 점검, 지정 위치 이동, 대상마다 이동 뒤 점검 반복 그룹, 대상마다 이동 뒤 종류별 점검 그룹 안 분기) |
 | `src/styles.css` | 스타일 한 파일(257행), `:root` 토큰, 반응형 |
 | `public/fonts/` | Pretendard Variable 과 라이선스 고지 |
 | `src/setupTests.ts`, `src/testing/fakeOps.ts` | vitest 설정과 운영 서비스 가짜 응답 |
