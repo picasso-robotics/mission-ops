@@ -1,5 +1,5 @@
 import type { ExecutionSummary, MockRunView } from '../api'
-import { fleetHostNote, mockRunVerdict, routeLabel } from '../labels'
+import { branchArmLabel, fleetHostNote, mockRunVerdict, routeLabel, unrunBranches } from '../labels'
 
 /**
  * 모의 실행 하나의 결과(S3b 스펙 §8). 통과 여부, 실패 이유, 표본 작업 지시와 단위별 표다. 모의 실행은 이상적 현장에서 정의가 끝까지
@@ -9,6 +9,7 @@ import { fleetHostNote, mockRunVerdict, routeLabel } from '../labels'
 export function MockRunReport({ run, fleet: link }: { run: MockRunView; fleet?: ExecutionSummary['fleet'] }) {
   const { result } = run
   const fleet = result.units.some((unit) => unit.route === 'FLEET')
+  const branches = result.branches ?? []
   return (
     <>
       <p>
@@ -16,6 +17,7 @@ export function MockRunReport({ run, fleet: link }: { run: MockRunView; fleet?: 
         {result.detail !== null && `. ${result.detail}`}
       </p>
       {fleet && <p role="note">{FLEET_MOCK_NOTE} {fleetHostNote(link)}</p>}
+      {unrunBranches(branches) && <p role="note">{BRANCH_MOCK_NOTE}</p>}
       <dl>
         <dt>표본 작업 지시</dt>
         <dd>
@@ -54,6 +56,26 @@ export function MockRunReport({ run, fleet: link }: { run: MockRunView; fleet?: 
           </tbody>
         </table></div>
       )}
+      {branches.length > 0 && (
+        <div className="table-scroll" tabIndex={0} role="group" aria-label="표 가로 스크롤"><table aria-label={`모의 실행 ${run.mockRunId} 분기`}>
+          <thead>
+            <tr>
+              <th>분기 자리</th>
+              <th>표본이 고른 가지(돈 가지)</th>
+              <th>돌지 않은 가지(검증 안 됨)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {branches.map((branch) => (
+              <tr key={`${branch.choiceId}|${branch.site}`}>
+                <td>{branch.site}</td>
+                <td>{branch.chosen === null ? '자리 없음(표본이 이 분기를 열지 않음)' : branchArmLabel(branch.chosen, branch.armValues)}</td>
+                <td>{branch.notRun.length === 0 ? '없음' : branch.notRun.map((name) => branchArmLabel(name, branch.armValues)).join(', ')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table></div>
+      )}
     </>
   )
 }
@@ -61,3 +83,10 @@ export function MockRunReport({ run, fleet: link }: { run: MockRunView; fleet?: 
 /** 플릿 운반 단위가 든 모의 실행의 안내. 통과는 정의가 맞다는 것이지 이 실행 호스트에서 돈다는 것이 아니다. */
 export const FLEET_MOCK_NOTE =
   '플릿 운반 단위는 모의 실행 안의 플릿 미믹으로 돌았습니다. 통과는 정의가 끝까지 돈다는 뜻이며 이 실행 호스트에서 돈다는 뜻이 아닙니다.'
+
+/**
+ * 돌지 않은 분기 가지가 든 모의 실행의 안내(picasso §15.328). 분기는 표본 작업 지시의 값으로 가지 하나를 고르므로 통과는 고른 가지의 것이다.
+ * 활성화는 가지마다 표본을 요구하지 않는다.
+ */
+export const BRANCH_MOCK_NOTE =
+  '분기는 표본 작업 지시의 값으로 가지 하나만 골라 돌았습니다. 돌지 않은 가지는 이 모의 실행으로 검증되지 않았습니다. 그 가지를 보려면 그 가지를 고르는 표본으로 다시 돌리십시오.'

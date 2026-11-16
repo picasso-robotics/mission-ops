@@ -390,13 +390,14 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
     {"unitId": "RACK-204.S02", "route": "ROBOT", "skillType": "pick_place", "state": "DONE", "reached": "E2", "failureClass": null}
   ],
   "virtualElapsedSeconds": 105,
-  "wallElapsedMillis": 812
+  "wallElapsedMillis": 812,
+  "branches": []
 }
 ```
 
 | 칸 | 값 |
 |---|---|
-| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(돌리기 전 검사에서 걸림, 돌지 않음: 표본으로 세운 계획이 비었거나 단위 id 가 겹침, 표본 작업 지시에 없는 반복 대상(최상위 단위 노드·반복 그룹의 `forEach`), 플릿 경로 단위의 용기·출발지·목적지를 표본이 채우지 못함(`detail` 은 «표본이 플릿 운반 단위를 채우지 못했습니다: <단위 id>(용기 없음, …)»), 같은 신호를 기대 값이 다른 대기 노드 둘이 씀. 어느 것인지는 `detail` 이 말함) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님). 옛 행에만 `FLEET_ROUTE`(플릿 경로 노드를 돌리지 않던 때의 실패)가 남아 있을 수 있고 지금 호스트는 내지 않는다. 플릿 경로 노드는 요청마다 새 인프로세스 플릿 미믹(picasso `fleet-mimic` 의 `AmrFleetMimic`)으로 돈다 |
+| `failure` | 통과면 null. 실패 하위 범주: `DEFINITION`(돌리기 전 검사에서 걸림, 돌지 않음: 표본으로 세운 계획이 비었거나 단위 id 가 겹침, 표본 작업 지시에 없는 반복 대상(최상위 단위 노드·반복 그룹의 `forEach`), 플릿 경로 단위의 용기·출발지·목적지를 표본이 채우지 못함(`detail` 은 «표본이 플릿 운반 단위를 채우지 못했습니다: <단위 id>(용기 없음, …)»), 표본의 계획에 든 대기 단위 둘이 같은 신호를 다른 기대 값으로 기다림(고르지 않은 분기 가지의 대기 노드는 보지 않음), 표본이 고른 분기 가지가 모두 비어 돌릴 단위가 없음(`detail` 은 «표본이 고른 분기 가지가 비어 돌릴 단위가 없습니다(…): <자리>=<가지>»). 반복 대상 검사는 분기 밖 노드와 최상위 분기의 표본이 고른 가지 안 단위 노드만 봄(고르지 않은 가지는 `branches` 의 `notRun` 으로만 보임). 어느 것인지는 `detail` 이 말함) · `SUBMISSION_REJECTED`(표본 작업 지시를 미들웨어가 받지 않음, 예: 정의의 `maxEvidence` 가 E2 미만) · `NOT_SETTLED`(가상 시간 상한 안에 종결하지 않음) · `WALL_CLOCK_LIMIT`(실제 시간 30초 초과) · `EXECUTION_FAILED`(종결했으나 모든 단위 완료가 아님). 옛 행에만 `FLEET_ROUTE`(플릿 경로 노드를 돌리지 않던 때의 실패)가 남아 있을 수 있고 지금 호스트는 내지 않는다. 플릿 경로 노드는 요청마다 새 인프로세스 플릿 미믹(picasso `fleet-mimic` 의 `AmrFleetMimic`)으로 돈다 |
 | `detail` | 실패의 화면용 한국어. 통과면 null |
 | `robotId` | 모의 실행 기체 id `mock-01`(현장 기체와 겹치지 않음) |
 | `sample` | 표본 작업 지시: 마지막 셀 스냅숏의 슬롯 앞 둘, 자재를 든 첫 제시 자리, 자재 수 = 슬롯 수, 요구 근거 E2. id 는 `MOCK-<draftId>` |
@@ -404,8 +405,9 @@ S3a 의 §2~§5(작업 지시 REST)와 §9.1~§9.4 는 그대로다.
 | `units` | 단위별 상태와 근거 등급. 실행이 서지 않았으면 `[]`. `route` 는 `ROBOT`·`FLEET`(플릿 미믹에 맡긴 운반, `skillType` 은 `transport`)·`SIGNAL`(대기 단위, `skillType` 은 `equipment_wait`), `state`·`reached` 는 S3a §5 의 단위 칸과 같은 이름이다 |
 | `virtualElapsedSeconds` | 표본 작업 지시 뒤 흐른 가상 시간(정수 초) |
 | `wallElapsedMillis` | 실제로 걸린 시간 |
+| `branches` | 접수 시점 분기(picasso §15.328)의 자리마다 표본이 고른 가지와 돌지 않은 가지. 분기가 없는 정의는 `[]`, 이 칸이 생기기 전의 옛 행에는 칸이 없음(화면은 `[]` 로 읽음). 한 줄은 `{"site", "choiceId", "chosen", "notRun", "armValues"}` — `site` 는 최상위 분기면 분기 id, 반복 그룹 안 분기면 `분기 id[설비 id]`(picasso `DefinedCapability.choices` 의 열쇠, 접두사가 아니라 정확한 열쇠로 가름), `chosen` 은 `arms[i]`·`otherwise`·`whenMissing`(값이 없어 접힘), `notRun` 은 고르지 않아 돌지 않은 가지(`arms[i]`·`otherwise`, 선언 순서), `armValues` 는 `arms[i]` 마다 맞는 값(`equals`·`in`). 표본이 그 분기에 자리를 하나도 열지 않았으면(그룹의 대상이 표본에 없음 등) 한 줄이 `site` = 분기 id, `chosen` = null, `notRun` = 모든 가지다. 정의 실패로 돌리지 않았어도 표본의 계획이 고른 가지를 싣는다. **통과(`passed: true`)는 `chosen` 가지만의 것이고 `notRun` 의 가지는 검증되지 않았다.** 활성화는 가지마다 표본을 요구하지 않는다 |
 
-이상적 현장(T8): 목적지 슬롯은 처음부터 점유이고 기대 자재를 내며(관측 시각 null), 표본 작업 지시의 출발 자리(`source` 장비 요구)는 점유이고 그 자재를 내며, 그래서 출발 관측을 요구한(`REQUIRED`) 단위도 모의 실행을 지난다. 그 밖의 자리는 침묵, 이름 있는 신호는 대기 노드의 기대 값을 낸다. 기체 프로파일은 현장 humanoid 프로파일에서 실패 모드를 뺀 사본(`mission-host/mock-run/humanoid-a.json`)이다. 현장 기체·현장 셀 대역·registry 에 아무것도 닿지 않는다.
+이상적 현장(T8): 목적지 슬롯은 처음부터 점유이고 기대 자재를 내며(관측 시각 null), 표본 작업 지시의 출발 자리(`source` 장비 요구)는 점유이고 그 자재를 내며, 그래서 출발 관측을 요구한(`REQUIRED`) 단위도 모의 실행을 지난다. 그 밖의 자리는 침묵, 이름 있는 신호는 표본의 계획에 든 대기 단위(`route: SIGNAL`)의 기대 값을 낸다(고르지 않은 분기 가지의 대기 노드는 보지 않는다 — 배타 가지가 같은 신호를 다른 기대 값으로 기다려도 한 계획에 함께 나지 않으므로 충돌이 아니다). 기체 프로파일은 현장 humanoid 프로파일에서 실패 모드를 뺀 사본(`mission-host/mock-run/humanoid-a.json`)이다. 현장 기체·현장 셀 대역·registry 에 아무것도 닿지 않는다.
 
 ### 4.6 `POST /host/missions/drafts/{draftId}/activate`
 

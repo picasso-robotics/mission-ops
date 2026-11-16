@@ -10,6 +10,8 @@ import { missionTemplate } from '../missionTemplates'
 import type { MissionInterfaceView,MissionProfile } from '../api'
 // 실행 호스트 시험 자원. MissionDefinitionGroupsHostTest 가 이 글자를 검증·모의 실행·활성화한다. ui 밖이라 Vite 가져오기가 아니라 파일로 읽는다(작업 디렉터리 ui 기준).
 const visitProfileText=readFileSync(resolve(process.cwd(),'../mission-host/src/test/resources/mission-profile-visit.json'),'utf-8')
+// 그룹 안 분기 시험 자원. MissionDefinitionGroupsHostTest·MockRunnerTest 가 이 글자를 검증·모의 실행·활성화·접수한다.
+const choiceProfileText=readFileSync(resolve(process.cwd(),'../mission-host/src/test/resources/mission-profile-choice.json'),'utf-8')
 afterEach(()=>vi.unstubAllGlobals())
 it('새 미션 ID와 입력 스키마 및 실행 단계가 함께 등록된다',async()=>{
  const created=vi.fn();const requests:unknown[]=[]
@@ -50,6 +52,19 @@ it('대상마다 이동 뒤 점검 템플릿은 반복 그룹 하나에 이동�
  await userEvent.selectOptions(screen.getByLabelText('시작 템플릿'),'대상마다 이동 뒤 점검 · E0')
  await userEvent.click(screen.getByRole('button',{name:'임무 등록 후 실행 정의 열기'}))
  expect(requests[0]).toMatchObject({definition:{steps:[{kind:'each',forEach:'mission_target',steps:[{id:'travel'},{id:'inspect',after:'travel'}]}]}})
+})
+
+it('대상마다 이동 뒤 종류별 점검 템플릿은 그룹 안 분기로 대상의 item 에 따라 점검을 고르고 화면에서 고를 수 있다',async()=>{
+ const resource=JSON.parse(choiceProfileText) as MissionProfile
+ // 템플릿과 시험 자원이 갈리면 호스트가 검증·접수한 정의와 화면이 내는 정의가 달라진다. 칸 전부를 맞댄다.
+ expect(missionTemplate('choice',resource.workMasterId,resource.name,resource.description)).toEqual(resource)
+ const requests:unknown[]=[]
+ vi.stubGlobal('fetch',vi.fn(async(_url:string,init:RequestInit)=>{const body=JSON.parse(init.body as string);requests.push(body);return new Response(JSON.stringify(body),{status:200})}))
+ render(<MissionCreator session={{mode:'engineer',user:'lee'}} onCreated={()=>undefined} onClose={()=>undefined}/> )
+ await userEvent.selectOptions(screen.getByLabelText('시작 템플릿'),'대상마다 이동 뒤 종류별 점검(분기) · E0')
+ await userEvent.click(screen.getByRole('button',{name:'임무 등록 후 실행 정의 열기'}))
+ expect(requests[0]).toMatchObject({orderMapping:{equipment:[{properties:{location:'location',item:'item'}}]},definition:{steps:[{kind:'each',steps:[{id:'travel'},{kind:'choice',id:'how',
+  arms:[{equals:'thermal',steps:[{id:'thermal',after:'travel'}]},{equals:'visual',steps:[{id:'look',after:'travel'}]}],otherwise:{steps:[]},whenMissing:{unit:'thermal'}}]}]}})
 })
 
 it('등록 응답 유실 뒤 화면을 다시 열어도 같은 미션 ID와 원본 입력으로 확인한다',async()=>{

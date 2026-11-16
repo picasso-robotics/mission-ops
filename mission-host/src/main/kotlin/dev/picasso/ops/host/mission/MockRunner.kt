@@ -18,12 +18,13 @@ import dev.picasso.middleware.Route
 import dev.picasso.middleware.SlotSignal
 import dev.picasso.middleware.UnitState
 import dev.picasso.middleware.Unassigned
+import dev.picasso.middleware.WaitSpec
+import dev.picasso.middleware.mission.ChoiceStep
 import dev.picasso.middleware.mission.DefinedCapability
 import dev.picasso.middleware.mission.EachStep
 import dev.picasso.middleware.mission.MissionDefinition
 import dev.picasso.middleware.mission.MissionValidator
 import dev.picasso.middleware.mission.UnitStep
-import dev.picasso.middleware.mission.WaitStep
 import dev.picasso.ops.host.cell.CellSnapshot
 import java.nio.file.Files
 import java.nio.file.Path
@@ -35,9 +36,9 @@ import java.time.Duration
 enum class MockRunFailure {
     /**
      * 정의: 돌리기 전 검사에서 걸렸다. 표본으로 세운 계획이 비었거나 단위 id 가 겹친다, 표본 작업 지시에 없는 반복 대상(최상위 단위
-     * 노드·반복 그룹의 `forEach`)이 있다, 플릿 경로 단위의 용기·출발지·목적지를 표본이 채우지 못했다(표본에 용기 속성이 없다 등),
-     * 같은 신호를 기대 값이 다른 대기 노드 둘이 써 이상적 현장의 신호 값을 하나로 정할 수 없다. 어느 것인지는 [MockRunResult.detail] 이
-     * 말한다.
+     * 노드·반복 그룹의 `forEach`, 최상위 분기는 표본이 고른 가지 안 노드)이 있다, 플릿 경로 단위의 용기·출발지·목적지를 표본이 채우지 못했다(표본에
+     * 용기 속성이 없다 등), 표본의 계획에 든 대기 단위 둘이 같은 신호를 다른 기대 값으로 기다려 이상적 현장의 신호 값을 하나로 정할 수 없다,
+     * 표본이 고른 분기 가지가 모두 비어 돌릴 단위가 없다(picasso §15.328). 어느 것인지는 [MockRunResult.detail] 이 말한다.
      */
     DEFINITION,
 
@@ -75,6 +76,25 @@ data class MockSample(
 )
 
 /**
+ * 모의 실행의 분기 자리 하나(picasso §15.328). 분기는 계획 때 표본 작업 지시의 값으로 가지 하나를 고르고 **고른 가지만** 돈다. 그래서
+ * 모의 실행의 통과는 [chosen] 가지의 것이고 [notRun] 의 가지는 이 모의 실행으로 검증되지 않았다.
+ *
+ * @param site 분기 자리 — 최상위 분기는 분기 id, 반복 그룹 안 분기는 `분기 id[설비 id]`(picasso `DefinedCapability.choices`). 표본이 그
+ *   분기에 자리를 하나도 열지 않았으면(그룹의 대상이 표본에 없다, 그룹이 조건부 포함으로 접혔다) 분기 id 이고 [chosen] 이 널이다.
+ * @param choiceId 분기 노드 id.
+ * @param chosen 표본이 고른 가지 — `arms[i]`·`otherwise`·`whenMissing`(값이 없어 접힘). 자리가 없으면 널.
+ * @param notRun 표본이 고르지 않아 돌지 않은 가지(`arms[i]`·`otherwise`, 선언 순서). 검증되지 않은 가지다.
+ * @param armValues 가지 `arms[i]` 마다 맞는 값(`equals`·`in`). 화면이 가지를 사람이 읽게 적는 데 쓴다.
+ */
+data class MockBranch(
+    val site: String,
+    val choiceId: String,
+    val chosen: String?,
+    val notRun: List<String>,
+    val armValues: Map<String, List<String>>,
+)
+
+/**
  * 모의 실행 결과(S3b 스펙 §6.4). 모의 실행 표의 `result` 칸에 이 모양 그대로 JSON 으로 남는다.
  *
  * @param passed 실행이 모든 단위 완료로 정착했다.
@@ -83,6 +103,8 @@ data class MockSample(
  * @param physicalState 실행의 마지막 물리 상태. 실행이 서지 않았으면 `null`.
  * @param virtualElapsedSeconds 표본 작업 지시를 낸 뒤 흐른 가상 시간(초).
  * @param wallElapsedMillis 실제로 걸린 시간(밀리초).
+ * @param branches 정의의 분기 자리마다 표본이 고른 가지와 돌지 않은 가지(picasso §15.328). 분기가 없는 정의는 빈 목록이다. 정의 실패로
+ *   돌리지 않았어도 표본의 계획이 고른 가지를 싣는다. 이 칸이 없던 옛 행은 빈 목록으로 읽는다.
  */
 data class MockRunResult(
     val passed: Boolean,
@@ -94,6 +116,7 @@ data class MockRunResult(
     val units: List<MockUnit>,
     val virtualElapsedSeconds: Long,
     val wallElapsedMillis: Long,
+    val branches: List<MockBranch> = emptyList(),
 )
 
 /**
@@ -106,12 +129,15 @@ data class MockRunResult(
  * - **시계**: 미들웨어의 `now` 는 하네스의 가상 시계다. 어긋나면 E2 시간 윈도우가 갈린다.
  * - **이상적 현장**(T8): 목적지 슬롯은 작업 지시를 받기 전에는 비었고 받은 뒤에는 점유이며 기대 자재를 내고 관측 시각은
  *   `null`(읽은 순간)이다. 출발 자리는 점유이고 그 자리의 자재를 낸다. 그 밖의 자리는 `null`(침묵)이다. 이름 있는 신호는
- *   대기 노드의 기대 값을 낸다. 그래서 대기 노드는 첫 pump 에서 완료된다. 기체 프로파일은 현장 humanoid 프로파일에서 실패
+ *   표본의 계획에 든 대기 단위의 기대 값을 낸다(고르지 않은 분기 가지의 대기 노드는 보지 않는다). 그래서 대기 단위는 첫 pump 에서 완료된다. 기체 프로파일은 현장 humanoid 프로파일에서 실패
  *   모드를 뺀 사본이다.
  * - **플릿 경로**: 계획의 플릿 단위마다 그 출발지에 기대 용기를 둔다(표본의 출발 설비 속성, 정의의 `FIRST_PROPERTY source container`
  *   등이 채운 값). 플릿 단위의 출발지·목적지는 이상적 현장이 플릿 세계를 그대로 본다([AmrFleetMimic.observe]) — 목적지에 용기가
  *   놓이면 놓인 시각과 함께 그 용기를 말하므로 플릿의 완료(E1)에 인계 설비의 근거(E2)가 선다. 표본이 용기·출발지·목적지를 채우지
  *   못한 플릿 단위가 있으면 돌리지 않고 [MockRunFailure.DEFINITION] 이다.
+ * - **분기**(picasso §15.328): 표본의 계획이 고른 가지만 돈다. 결과의 [MockRunResult.branches] 가 분기 자리마다 돈 가지와 돌지 않은 가지를
+ *   싣는다 — 통과는 돈 가지의 것이고 돌지 않은 가지는 검증되지 않았다. 표본 검사도 고른 가지의 반복 대상만 요구한다. 활성화 관문은
+ *   가지별 표본을 요구하지 않는다.
  * - **진행 루프**: pump → 정착했으면 끝 → 상한 확인 → 가상 시계를 [STEP] 민다 → 플릿 미믹을 한 걸음 민다 → 스트림 갱신이 닿을
  *   틈([PAUSE]) → 다시 pump.
  *
@@ -142,24 +168,28 @@ class MockRunner(
         val wallStart = System.nanoTime()
         fun wall(): Duration = Duration.ofNanos(System.nanoTime() - wallStart)
 
-        val planned=DefinedCapability(definition).plan(order)
-        val missing = repeatedUses(definition).filter { use -> order.equipmentRequirements.none { it.equipmentUse == use } }
-        if(planned.isEmpty() || planned.map{it.unitId}.distinct().size!=planned.size || missing.isNotEmpty())
-            return MockRunResult(false,MockRunFailure.DEFINITION,"샘플 입력에서 실행 단계가 비거나 단위 ID가 겹칩니다"+(if(missing.isEmpty()) "" else ": 표본에 없는 반복 대상 ${missing.joinToString(", ")}"),ROBOT_ID,sample,null,emptyList(),0,wall().toMillis())
+        // 계획은 한 번만 짓는다 — 표본 검사·이상적 신호·신호 충돌·분기 표시가 모두 이 계획 하나를 본다(picasso §15.328). 분기는 계획 때
+        // 가지 하나를 고르므로 정의의 노드가 아니라 계획된 단위가 이 표본으로 도는 것이다.
+        val capability = DefinedCapability(definition)
+        val planned = capability.plan(order)
+        val choices = capability.choices(order)
+        val branches = branches(definition, choices, order)
+        fun refused(detail: String) = MockRunResult(
+            passed = false, failure = MockRunFailure.DEFINITION, detail = detail, robotId = ROBOT_ID, sample = sample, physicalState = null,
+            units = emptyList(), virtualElapsedSeconds = 0, wallElapsedMillis = wall().toMillis(), branches = branches,
+        )
+        val missing = repeatedUses(definition, choices).filter { use -> order.equipmentRequirements.none { it.equipmentUse == use } }
+        if (planned.isEmpty() && branches.any { it.chosen != null } && missing.isEmpty()) {
+            return refused("$EMPTY_BRANCH_DETAIL: ${branches.filter { it.chosen != null }.joinToString(", ") { "${it.site}=${it.chosen}" }}")
+        }
+        if (planned.isEmpty() || planned.map { it.unitId }.distinct().size != planned.size || missing.isNotEmpty()) {
+            return refused("샘플 입력에서 실행 단계가 비거나 단위 ID가 겹칩니다" + if (missing.isEmpty()) "" else ": 표본에 없는 반복 대상 ${missing.joinToString(", ")}")
+        }
         val fleetUnits = planned.filter { it.route == Route.FLEET }
         val unfilled = fleetUnits.filter { it.expectedIdentity == null || it.source == null || it.destination == null }
-        if (unfilled.isNotEmpty()) {
-            return MockRunResult(
-                passed = false, failure = MockRunFailure.DEFINITION, detail = "$FLEET_SAMPLE_DETAIL: ${unfilled.joinToString(", ", transform = ::unfilledOf)}",
-                robotId = ROBOT_ID, sample = sample, physicalState = null, units = emptyList(), virtualElapsedSeconds = 0,
-                wallElapsedMillis = wall().toMillis(),
-            )
-        }
-        val ideal = idealSignals(definition)
-            ?: return MockRunResult(
-                passed = false, failure = MockRunFailure.DEFINITION, detail = conflict(definition), robotId = ROBOT_ID,
-                sample = sample, physicalState = null, units = emptyList(), virtualElapsedSeconds = 0, wallElapsedMillis = wall().toMillis(),
-            )
+        if (unfilled.isNotEmpty()) return refused("$FLEET_SAMPLE_DETAIL: ${unfilled.joinToString(", ", transform = ::unfilledOf)}")
+        val waits = plannedWaits(planned)
+        val ideal = idealSignals(waits) ?: return refused(conflict(waits))
 
         Harness(mapOf(ROBOT_ID to profile), schema = schema).use { harness ->
             // 요청마다 새 플릿 세계다. 수동 진행이라 진행 루프가 가상 시계를 민 뒤에만 걷는다 — 놓인 시각이 그 가상 시각이다.
@@ -193,6 +223,7 @@ class MockRunner(
                 },
                 virtualElapsedSeconds = virtual().seconds,
                 wallElapsedMillis = wall().toMillis(),
+                branches = branches,
             )
 
             val execution = when (val submission = middleware.submit(order, ROBOT_ID)) {
@@ -231,12 +262,53 @@ class MockRunner(
     }
 
     /**
-     * 표본 작업 지시에 있어야 하는 반복 대상(설비 쓰임). 최상위 단위 노드의 `forEach` 와 반복 그룹(`EachStep`)의 `forEach` 다.
-     * `once` 노드와 그룹 안쪽 노드는 `forEach` 가 없어(널) 빠진다(picasso §15.325, `MissionValidator.unitNodes`).
+     * 표본 작업 지시에 있어야 하는 반복 대상(설비 쓰임) — **이 표본으로 도는 노드**의 것만이다. 분기 밖 최상위 단위 노드의 `forEach`,
+     * 반복 그룹(`EachStep`)의 `forEach`, 그리고 최상위 분기는 표본이 고른 가지([choices], picasso `DefinedCapability.choices`) 안 단위 노드의
+     * `forEach` 다. 고르지 않은 가지의 반복 대상은 요구하지 않는다 — 가지마다 다른 설비군을 반복하는 정의는 한 가지만 든 표본이 유효하고,
+     * 고르지 않은 가지는 [MockBranch.notRun](돌지 않은 가지, 검증 안 됨)으로만 보인다(picasso §15.328). 값이 없어 접힌 분기(`whenMissing`)도
+     * 가지를 고르지 않아 요구하지 않는다. `once` 노드와 그룹 안쪽 노드(그룹 안 분기의 가지 포함)는 `forEach` 가 없어(널) 빠진다(picasso §15.325).
      */
-    private fun repeatedUses(definition: MissionDefinition): List<String> =
-        (MissionValidator.unitNodes(definition).filter { !it.once }.mapNotNull(UnitStep::forEach) +
-            definition.steps.filterIsInstance<EachStep>().map { it.forEach }).distinct()
+    private fun repeatedUses(definition: MissionDefinition, choices: Map<String, String>): List<String> =
+        definition.steps.flatMap { step ->
+            when (step) {
+                is UnitStep -> listOf(step)
+                is ChoiceStep -> choices[step.id]?.let(step::steps).orEmpty().filterIsInstance<UnitStep>()
+                else -> emptyList()
+            }.filter { !it.once }.mapNotNull(UnitStep::forEach) + listOfNotNull((step as? EachStep)?.forEach)
+        }.distinct()
+
+    /**
+     * 정의의 분기마다 표본이 고른 가지와 돌지 않은 가지([MockBranch]). [choices] 는 같은 표본의 `DefinedCapability.choices` 다(자리 →
+     * 가지). 분기는 최상위와 반복 그룹 안에만 온다(중첩 없음). 자리 열쇠는 picasso 의 형식대로 **정확히** 짓는다 — 최상위 분기는 분기 id
+     * 그대로, 그룹 안 분기는 그 그룹이 반복하는 표본 설비마다 `분기 id[설비 id]`. 접두사로 고르면 분기 id 가 `how` 와 `how[x]` 처럼 겹칠 때
+     * 다른 분기의 선택이 섞인다. 자리를 하나도 열지 않은 분기는 모든 가지가 돌지 않은 것으로 한 줄 싣는다.
+     */
+    private fun branches(definition: MissionDefinition, choices: Map<String, String>, order: JobOrder): List<MockBranch> {
+        val nodes: List<Pair<ChoiceStep, List<String>>> = definition.steps.flatMap { step ->
+            when (step) {
+                is ChoiceStep -> listOf(step to listOf(step.id))
+                is EachStep -> {
+                    val items = order.equipmentRequirements.filter { it.equipmentUse == step.forEach }.map { it.id }.distinct()
+                    step.steps.filterIsInstance<ChoiceStep>().map { choice -> choice to items.map { "${choice.id}[$it]" } }
+                }
+                else -> emptyList()
+            }
+        }
+        return nodes.flatMap { (choice, keys) ->
+            val names = choice.arms.indices.map { "arms[$it]" } + ChoiceStep.OTHERWISE
+            val values = choice.arms.withIndex().associate { (index, arm) -> "arms[$index]" to arm.values }
+            val sites = keys.mapNotNull { key -> choices[key]?.let { key to it } }
+            if (sites.isEmpty()) {
+                listOf(MockBranch(choice.id, choice.id, null, names, values))
+            } else {
+                sites.map { (site, chosen) -> MockBranch(site, choice.id, chosen, names - chosen, values) }
+            }
+        }
+    }
+
+    /** 계획에 든 설비 대기 단위(`route == SIGNAL`)와 그 대기 사양. 고르지 않은 분기 가지의 대기 노드는 계획에 없어 들지 않는다. */
+    private fun plannedWaits(planned: List<ExecutionUnit>): List<Pair<String, WaitSpec>> =
+        planned.filter { it.route == Route.SIGNAL }.mapNotNull { unit -> unit.wait?.let { unit.unitId to it } }
 
     /** 표본이 채우지 못한 플릿 단위 하나의 소견 — 단위 id 와 비어 있는 칸. */
     private fun unfilledOf(unit: ExecutionUnit): String =
@@ -247,19 +319,21 @@ class MockRunner(
         ).joinToString(", ") + ")"
 
     /**
-     * 신호마다 이상적 값. 같은 신호를 기대 값이 다른 대기 노드가 쓰면 하나로 정할 수 없어 `null` 이다.
+     * 신호마다 이상적 값. **표본의 계획에 든 대기 단위만** 본다([plannedWaits]) — 정의의 대기 노드 전부(`MissionValidator.waitNodes`)를
+     * 모으면 배타 가지가 같은 신호를 다른 기대 값으로 기다릴 때(한 계획에 함께 나지 않는다) 충돌로 오판한다(picasso §15.328). 계획에
+     * 든 대기 단위 둘이 같은 신호를 다른 기대 값으로 기다리면 하나로 정할 수 없어 `null` 이다.
      */
-    private fun idealSignals(definition: MissionDefinition): Map<String, String>? {
-        val expects = definition.steps.filterIsInstance<WaitStep>().groupBy({ it.signal }, { it.expect })
+    private fun idealSignals(waits: List<Pair<String, WaitSpec>>): Map<String, String>? {
+        val expects = waits.groupBy({ it.second.signal }, { it.second.expect })
         if (expects.values.any { it.distinct().size > 1 }) return null
         return expects.mapValues { (_, values) -> values.first() }
     }
 
-    private fun conflict(definition: MissionDefinition): String =
-        definition.steps.filterIsInstance<WaitStep>().groupBy { it.signal }
-            .filterValues { waits -> waits.map { it.expect }.distinct().size > 1 }
-            .entries.joinToString("; ") { (signal, waits) ->
-                "신호 $signal 을 기대 값이 다른 대기 노드가 쓴다: ${waits.joinToString(", ") { "${it.id}=${it.expect}" }}"
+    private fun conflict(waits: List<Pair<String, WaitSpec>>): String =
+        waits.groupBy { it.second.signal }
+            .filterValues { same -> same.map { it.second.expect }.distinct().size > 1 }
+            .entries.joinToString("; ") { (signal, same) ->
+                "신호 $signal 을 기대 값이 다른 대기 노드가 쓴다: ${same.joinToString(", ") { (unitId, wait) -> "$unitId=${wait.expect}" }}"
             }
 
     private fun sample(order: JobOrder): MockSample {
@@ -280,7 +354,7 @@ class MockRunner(
      * 때는 배정 게이트(받기 전)과 태스크를 낸 뒤의 근거 확인뿐이라, 받기 전 비움·받은 뒤 점유가 곧 작업 전 비움·완료 뒤 점유다. 그래서
      * 목적지 관측을 요구한 단위(`REQUIRED`)도 게이트를 지나고 근거는 오늘처럼 선다. 출발 자리(`source`)는 점유이고 그 자리의 자재를
      * 낸다 — 이상적 현장에서는 설비가 출발 자리의 신원을 말하므로 출발 관측을 요구한 단위(`REQUIRED`)도 게이트를 지난다. 그 밖의 자리는
-     * `null`(침묵)이다. 이름 있는 신호는 대기 노드의 기대 값이다.
+     * `null`(침묵)이다. 이름 있는 신호는 계획된 대기 단위의 기대 값이다.
      *
      * 플릿 단위의 출발지·목적지([fleetLocations])는 플릿 세계를 본다. 용기가 있으면 점유이고 그 용기와 놓인 시각을 내며(처음 둔 출발지는
      * 놓인 시각을 모르므로 `null`), 없으면 비었다고 말한다. 플릿 단위에는 관측 선언이 없어 게이트가 이 자리를 묻지 않으므로, 플릿이 인계한
@@ -334,6 +408,13 @@ class MockRunner(
 
         /** 표본이 플릿 단위의 용기·출발지·목적지를 채우지 못한 소견([MockRunFailure.DEFINITION]). 뒤에 그 단위와 빈 칸이 붙는다. */
         const val FLEET_SAMPLE_DETAIL = "표본이 플릿 운반 단위를 채우지 못했습니다"
+
+        /**
+         * 표본이 고른 분기 가지가 모두 비어(`otherwise: []` 등) 계획에 돌릴 단위가 없다는 소견([MockRunFailure.DEFINITION], picasso §15.328).
+         * 뒤에 자리마다 고른 가지가 붙는다. 정의가 틀렸다는 뜻이 아니라 이 표본으로는 아무 가지도 검증하지 못한다는 뜻이다 — 단위를 내는
+         * 가지를 고르는 표본으로 다시 돌린다.
+         */
+        const val EMPTY_BRANCH_DETAIL = "표본이 고른 분기 가지가 비어 돌릴 단위가 없습니다(단위를 내는 가지를 고르는 표본으로 다시 돌리십시오)"
 
         /** 셀 대역 스냅숏으로 만든 표본이 플릿 경로 정의일 때 출발 자리에 싣는 용기 id 의 앞머리. 뒤에 초안 id 가 붙는다. */
         const val SAMPLE_CONTAINER_PREFIX = "MOCK-CONTAINER-"

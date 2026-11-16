@@ -12,6 +12,7 @@ import type {
   HostSubmitResult,
   JobResponseDisposition,
   LegacyMockRunFailure,
+  MockRunBranch,
   MockRunFailure,
   MockRunView,
   Owner,
@@ -83,6 +84,8 @@ export const KIND_LABEL: Record<string, string> = {
   // SOURCE_OBSERVATION_UNUSED 는 picasso `b57964e` 가 더한 열한째 종류다. 서브모듈을 올리기 전에는 호스트가 내지 않는다.
   // DESTINATION_OBSERVATION_UNDECLARED·DESTINATION_OBSERVATION_UNUSED 는 picasso `786a0a2` 가 더한 열두째·열셋째 종류다.
   // AFTER_INVALID·UNIT_ID_SHAPE_COLLISION·FLEET_UNIT_INVALID·WHEN_MISSING_INVALID 는 picasso `2edb29e`(§15.325)가 더한 열넷째~열일곱째 종류다.
+  // picasso `393f952`(§15.328, 접수 시점 분기)는 종류를 더하지 않았다 — DUPLICATE_NODE_ID·AFTER_INVALID·UNIT_ID_SHAPE_COLLISION·
+  // WHEN_MISSING_INVALID 의 조건이 분기와 가지 안까지 넓어졌을 뿐이라 이름표가 그대로다.
   UNREADABLE: '읽을 수 없는 정의',
   DUPLICATE_NODE_ID: '노드 id 겹침',
   DEADLINE_INVALID: '대기 기한 오류',
@@ -215,12 +218,54 @@ export function routeWithLabel(route: string): string {
   return label === undefined ? route : `${route}(${label})`
 }
 
-/** 모의 실행의 통과 여부 한 줄. 실패면 하위 범주를 붙인다(S3b JSON 계약 §4.5). */
+/**
+ * 모의 실행의 통과 여부 한 줄. 실패면 하위 범주를 붙인다(S3b JSON 계약 §4.5). 통과여도 돌지 않은 분기 가지가 있으면 그 통과가 표본이
+ * 고른 가지만의 것임을 붙인다 — 안 돈 가지를 검증 성공으로 보이지 않는다(picasso §15.328).
+ */
 export function mockRunVerdict(run: MockRunView): string {
-  if (run.passed) return '통과'
+  if (run.passed) return unrunBranches(run.result.branches) ? `통과(${BRANCH_PARTIAL_VERDICT})` : '통과'
   const { failure } = run.result
   return failure === null ? '실패' : `실패(${MOCK_RUN_FAILURE_LABEL[failure] ?? failure})`
 }
+
+/** 통과한 모의 실행에 돌지 않은 분기 가지가 있을 때 판정 뒤에 붙는 말. */
+export const BRANCH_PARTIAL_VERDICT = '표본이 고른 가지만, 돌지 않은 가지는 검증 안 됨'
+
+/** 돌지 않은 분기 가지가 하나라도 있는가. 옛 행(칸 없음)과 분기 없는 정의는 거짓이다. */
+export function unrunBranches(branches: MockRunBranch[] | undefined): boolean {
+  return (branches ?? []).some((branch) => branch.notRun.length > 0)
+}
+
+/**
+ * 분기 가지 이름 하나(picasso §15.328). `arms[i]` 는 맞는 값을 붙이고(`arms[0](thermal)`), `otherwise` 는 기본 가지, `whenMissing` 은
+ * 값이 없어 접힌 것이다. 모르는 이름은 그대로 보인다.
+ */
+export function branchArmLabel(name: string, armValues: Record<string, string[]>): string {
+  if (name === 'otherwise') return '기본 가지(otherwise)'
+  if (name === 'whenMissing') return '값 없음 접힘(whenMissing)'
+  const values = armValues[name]
+  return values === undefined ? name : `${name}(${values.map((v) => (v === '' ? '빈 문자열' : v)).join('·')})`
+}
+
+/**
+ * 분기가 든 실행의 작업 수락·리비전 거부 사유(picasso §15.328)에 붙이는 안내. 사유 문장은 picasso 가 낸 그대로 보이고, 이 안내는 운영자에게
+ * 다음 걸음을 말한다. 분기와 무관한 사유는 null 이다.
+ */
+export function choiceRefusalNote(reason: string | null): string | null {
+  if (reason === null) return null
+  if (CHOICE_REVISION_REFUSALS.some((prefix) => reason.startsWith(prefix))) return CHOICE_REVISION_NOTE
+  if (reason.startsWith(CHOICE_SITE_CLASH)) return CHOICE_CLASH_NOTE
+  return null
+}
+
+/** 분기가 든 실행의 리비전 거부 사유 앞머리(picasso `choiceRefusal`). 리비전은 분기 자리를 더하기만 한다. */
+export const CHOICE_REVISION_REFUSALS = ['리비전이 분기 자리를 없앤다', '리비전이 분기의 가지를 바꾼다', '리비전이 분기 자리의 단위 id 를 바꾼다']
+/** 분기 자리 겹침 거부 사유 앞머리(picasso `DefinedCapability.planRefusal`). 작업 수락과 리비전 둘 다다. */
+export const CHOICE_SITE_CLASH = '분기 자리가 겹쳐 받지 않는다'
+export const CHOICE_REVISION_NOTE =
+  '분기가 든 실행의 리비전은 분기 자리(설비)를 더하기만 합니다. 설비를 빼거나 가지를 바꾸려면 새 작업 지시로 내십시오.'
+export const CHOICE_CLASH_NOTE =
+  '분기가 든 반복 그룹의 같은 쓰임에 같은 설비 id 가 둘 있습니다. 설비 id 가 겹치지 않게 고쳐 다시 내십시오.'
 
 /** 시작용 정의의 화면 이름(S3b JSON 계약 §4.2). 모르는 id 는 호스트가 준 제목을 쓴다. */
 export const TEMPLATE_LABEL: Record<string, string> = {

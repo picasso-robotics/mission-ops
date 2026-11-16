@@ -170,4 +170,132 @@ class MissionDefinitionGroupsHostTest {
             assertEquals(MissionVersions.SOURCE_CODE, overview["active"]["source"].asText(), overview.toString())
         }
     }
+
+    /** 그룹 안 분기의 작업 지시 — 대상마다 `item`(점검 종류)을 단다. 같은 id 를 두 번 넣을 수 있다(분기 자리 겹침). */
+    private fun byItem(jobOrderId: String, workMaster: String, version: Int, vararg targets: Pair<String, String>): ObjectNode = JSON.readTree(
+        """{"jobOrderId":"$jobOrderId","workMasterId":"$workMaster","version":$version,"requiredEvidence":"E0","parameters":{},"materialRequirements":[],""" +
+            """"equipmentRequirements":[""" + targets.joinToString(",") { (id, item) ->
+                """{"id":"$id","equipmentUse":"mission_target","properties":{"location":"bay-$id","item":"$item"}}"""
+            } + "]}",
+    ) as ObjectNode
+
+    /**
+     * 접수 시점 분기(picasso §15.328)를 실행 호스트의 저장·검증·모의 실행·활성화·접수·리비전으로 민다. 정의는 화면 «대상마다 이동 뒤 종류별
+     * 점검» 템플릿과 같은 글자의 시험 자원 `mission-profile-choice.json` 이다(picasso `MissionFixtures.INSPECT_BY_ITEM` 모양).
+     */
+    @Test
+    fun `분기 정의는 모의 실행이 자리마다 돈 가지와 안 돈 가지를 싣고 활성화 뒤 접수한 작업 지시는 고른 가지만 기체에 내며 가지를 바꾸는 리비전과 분기 자리가 겹친 작업 지시는 picasso 사유 그대로 거부한다`() {
+        HostBench().use { bench ->
+            bench.awaitPump()
+            val profile = JSON.readTree(javaClass.getResourceAsStream("/mission-profile-choice.json"))
+            val wm = profile["workMasterId"].asText()
+            val draftId = bench.saveDraft(wm, profile["definition"].toString(), byItem("SAMPLE", wm, 1, "T1" to "thermal", "T2" to "visual"))
+            val validated = bench.step(draftId, "validate").body!!
+            assertEquals("PASSED", validated["result"].asText(), validated.toString())
+            val mock = bench.step(draftId, "mock-run").body!!
+            assertEquals("PASSED", mock["result"].asText(), mock.toString())
+            val result = mock["mockRun"]["result"]
+            assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2.look"), result["units"].map { it["unitId"].asText() }, mock.toString())
+            // 모의 실행 행에 자리마다 고른 가지와 돌지 않은 가지가 남는다 — 화면이 안 돈 가지를 검증 성공으로 보이지 않게 이 칸을 읽는다.
+            assertEquals(
+                listOf(Triple("how[T1]", "arms[0]", listOf("arms[1]", "otherwise")), Triple("how[T2]", "arms[1]", listOf("arms[0]", "otherwise"))),
+                result["branches"].map { b -> Triple(b["site"].asText(), b["chosen"].asText(), b["notRun"].map { it.asText() }) },
+                mock.toString(),
+            )
+            val activation = bench.activate(draftId)
+            assertEquals(listOf("ACTIVATED", "1"), listOf(activation["result"].asText(), activation["version"].asText()), activation.toString())
+
+            // 이 정의는 대상마다 이동 단위(`<대상>.travel`)를 내므로 같은 설비 id 가 둘이면 분기 자리 겹침보다 단위 id 겹침이 먼저 걸린다
+            // (picasso `submit` 의 검사 순서). 분기 자리 겹침만 걸리는 모양은 아래 [choiceOnly] 시험이 본다.
+            val clash = bench.post(
+                "/host/job-orders",
+                request(byItem("JO-2", wm, 1, "T1" to "thermal", "T1" to "visual").put("missionVersion", "1").toString(), "candidates", QUADRUPED),
+            ).body!!
+            assertEquals("REJECTED", clash["result"].asText(), clash.toString())
+            assertTrue(clash["rejectionReason"].asText().startsWith(Middleware.DUPLICATE_UNIT_ID), clash.toString())
+
+            val submitted = bench.post(
+                "/host/job-orders",
+                request(byItem("JO-1", wm, 1, "T1" to "thermal", "T2" to "visual").put("missionVersion", "1").toString(), "candidates", QUADRUPED),
+            ).body!!
+            assertEquals("ACCEPTED", submitted["result"].asText(), submitted.toString())
+            val executionId = submitted["executionId"].asText()
+            val planned = bench.execution(executionId)!!
+            assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2.look"), planned["units"].map { it["unitId"].asText() }, planned.toString())
+
+            // 남은 자리의 가지를 바꾸는 리비전(T2 를 visual → thermal)은 picasso 의 거부 사유가 호스트 응답으로 그대로 나간다.
+            val revised = bench.post(
+                "/host/job-orders",
+                request(byItem("JO-1", wm, 2, "T1" to "thermal", "T2" to "thermal").put("missionVersion", "1").toString(), "candidates", QUADRUPED),
+            )
+            assertEquals(200, revised.status, revised.body.toString())
+            assertEquals("REJECTED", revised.body!!["result"].asText(), revised.body.toString())
+            val reason = revised.body["rejectionReason"].asText()
+            assertTrue(reason.startsWith("리비전이 분기의 가지를 바꾼다: how[T2]") && reason.endsWith("새 작업 지시로 낸다"), reason)
+            // 대상을 빼는 리비전(T2 를 뺌)은 분기 자리를 없애 받지 않는다.
+            val dropped = bench.post(
+                "/host/job-orders",
+                request(byItem("JO-1", wm, 3, "T1" to "thermal").put("missionVersion", "1").toString(), "candidates", QUADRUPED),
+            ).body!!
+            assertEquals("REJECTED", dropped["result"].asText(), dropped.toString())
+            assertTrue(dropped["rejectionReason"].asText().startsWith("리비전이 분기 자리를 없앤다: how[T2]"), dropped.toString())
+
+            val done = bench.driveUntil(executionId, settled)
+            assertEquals("PHYSICALLY_DONE", done["physicalState"].asText(), done.toString())
+            assertEquals(listOf("T1.travel", "T1", "T2.travel", "T2.look"), done["units"].map { it["unitId"].asText() }, done.toString())
+            assertTrue(done["units"].all { it["state"].asText() == "DONE" }, done.toString())
+            // 기체에 나간 태스크는 고른 가지의 것뿐이다 — 대상마다 이동 하나와 점검 하나. 고르지 않은 가지의 점검은 나가지 않았다.
+            assertEquals(
+                listOf("navigate_to", "inspect", "navigate_to", "inspect"),
+                bench.mimic.server.exclusive { bench.mimic.instance(QUADRUPED)!!.tasks.all.map { it.skillType } },
+            )
+        }
+    }
+
+    /**
+     * 분기 자리 겹침(picasso §15.328) — 그룹 안에 분기만 둔 정의(이동 없음, `mission-profile-choice.json` 에서 이동 노드와 선행을 뺀 것)는
+     * 같은 설비 id 둘이 고르지 않는 가지(`otherwise`)로 가면 단위 id 가 겹치지 않아 분기 자리 겹침만 걸린다. 작업 수락과 리비전 둘 다
+     * picasso 사유 그대로 REJECTED 이고, 대상을 더하는 리비전은 받는다.
+     */
+    @Test
+    fun `그룹 안 분기만 둔 정의는 같은 설비 id 가 둘인 작업 지시를 작업 수락과 리비전 모두 분기 자리 겹침으로 거부하고 대상을 더하는 리비전은 받는다`() {
+        HostBench().use { bench ->
+            bench.awaitPump()
+            val profile = JSON.readTree(javaClass.getResourceAsStream("/mission-profile-choice.json"))
+            val wm = "AssetInspectByItemOnly"
+            val each = profile["definition"]["steps"][0] as ObjectNode
+            val steps = each["steps"] as com.fasterxml.jackson.databind.node.ArrayNode
+            steps.remove(0)
+            steps[0]["arms"].forEach { arm -> arm["steps"].forEach { (it as ObjectNode).remove("after") } }
+            val definition = (profile["definition"] as ObjectNode).put("workMasterId", wm).toString()
+            check("travel" !in definition) { "이동 노드를 빼지 못했다" }
+            val draftId = bench.saveDraft(wm, definition, byItem("SAMPLE", wm, 1, "T1" to "thermal"))
+            assertEquals("PASSED", bench.step(draftId, "validate").body!!["result"].asText())
+            assertEquals("PASSED", bench.step(draftId, "mock-run").body!!["result"].asText())
+            bench.activate(draftId)
+
+            fun submit(version: Int, vararg targets: Pair<String, String>) = bench.post(
+                "/host/job-orders",
+                request(byItem("JO-1", wm, version, *targets).put("missionVersion", "1").toString(), "candidates", QUADRUPED),
+            ).body!!
+
+            val clash = submit(1, "T1" to "acoustic", "T1" to "acoustic", "T2" to "thermal")
+            assertEquals("REJECTED", clash["result"].asText(), clash.toString())
+            assertTrue(clash["rejectionReason"].asText().startsWith("분기 자리가 겹쳐 받지 않는다: how[T1]"), clash.toString())
+            assertTrue(clash["executionId"].isNull, clash.toString())
+
+            val accepted = submit(1, "T2" to "thermal")
+            assertEquals("ACCEPTED", accepted["result"].asText(), accepted.toString())
+            val executionId = accepted["executionId"].asText()
+            val revisedClash = submit(2, "T1" to "acoustic", "T1" to "acoustic", "T2" to "thermal")
+            assertEquals("REJECTED", revisedClash["result"].asText(), revisedClash.toString())
+            assertTrue(revisedClash["rejectionReason"].asText().startsWith("분기 자리가 겹쳐 받지 않는다: how[T1]"), revisedClash.toString())
+            assertEquals(listOf("T2"), bench.execution(executionId)!!["units"].map { it["unitId"].asText() })
+
+            // 새 자리를 더하는 리비전(T3 를 더함)은 받는다 — 같은 실행에 T3 의 고른 가지 단위가 더해진다.
+            val added = submit(3, "T2" to "thermal", "T3" to "visual")
+            assertEquals(listOf("ACCEPTED", executionId), listOf(added["result"].asText(), added["executionId"].asText()), added.toString())
+            assertEquals(listOf("T2", "T3.look"), bench.execution(executionId)!!["units"].map { it["unitId"].asText() })
+        }
+    }
 }
