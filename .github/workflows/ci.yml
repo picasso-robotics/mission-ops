@@ -10,9 +10,22 @@ permissions:
 
 # Gradle 과 npm 을 따로 돌린다(스펙 §10). job 이 둘이라 한쪽이 실패해도 다른 쪽이 돈다.
 jobs:
-  gradle:
+  # Gradle 시험을 모듈별로 나눠 함께 돌린다 — 시험은 한 JVM 안에서 순차라 한 잡이면 벽시계가 모듈 합이 된다.
+  # ops-service 와 mission-host 의 시험이 거의 전부를 차지하므로 둘을 따로 떼고, 나머지(컴파일·site·e2e·두 모듈의 시험 밖 검사)는 셋째 잡이 맡는다.
+  gradle-part:
+    name: gradle (${{ matrix.part }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: ops-service
+            tasks: ':ops-service:build'
+          - part: mission-host
+            tasks: ':mission-host:build'
+          - part: rest
+            tasks: 'build -x :ops-service:test -x :mission-host:test'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,14 +37,23 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       # Testcontainers 는 러너의 Docker 를 쓴다.
       - name: Gradle build
-        run: ./gradlew build --console=plain
+        run: ./gradlew ${{ matrix.tasks }} --console=plain
       # 판정은 종료 코드가 아니라 XML 의 실패 시험 이름으로 한다. 실패해도 올린다.
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: test-results-${{ matrix.part }}
           path: '**/build/test-results/test/*.xml'
+
+  # 나눈 잡 셋의 결과를 한 이름(gradle)으로 모은다 — 셋 중 하나라도 실패·취소면 실패.
+  gradle:
+    runs-on: ubuntu-latest
+    needs: gradle-part
+    if: always()
+    steps:
+      - name: All Gradle parts passed
+        run: test "${{ needs.gradle-part.result }}" = "success"
 
   ui:
     runs-on: ubuntu-latest
