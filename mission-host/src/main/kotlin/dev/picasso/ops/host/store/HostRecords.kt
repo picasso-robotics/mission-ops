@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonFormat
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.springframework.jdbc.core.simple.JdbcClient
-import org.springframework.transaction.support.TransactionTemplate
 import java.sql.ResultSet
 import java.sql.Types
 import java.time.Instant
@@ -96,6 +95,16 @@ data class SettledHistory(val rows: List<SettledRow>, val nextBefore: Long?, val
  * 작업 응답의 내용 키(S4b 스펙 T6). 인스턴스마다 달라지는 것(응답 id, 실행 id, 미완 사유 문자열, `connection`)은 뺀다.
  * 단위 id 목록은 정렬해 둔다. 두 키가 같은지는 이 값의 `equals` 다.
  */
+/** 만료 인수 뒤 운영자 확인 한 행(V19). */
+data class TakeoverConfirmationRow(
+    val generation: Long,
+    val instanceId: String,
+    val previousHolder: String?,
+    val confirmedBy: String,
+    val reason: String,
+    val confirmedAt: Instant,
+)
+
 data class ResponseContent(
     val jobOrderId: String,
     val version: Int,
@@ -380,11 +389,20 @@ data class WithdrawalRow(
  *
  * pump 뒤 기록은 [inTransaction] 하나로 묶는다(§6.2). 그 밖의 호출은 문장 하나가 한 트랜잭션이다. 호스트 잠금 아래에서 부를 수
  * 있고, 연결을 쥔 채 호스트 잠금을 기다리는 길은 없다(S3b 와 같은 잠금 순서).
+ *
+ * **쓰기는 모두 리스 가드를 지난다**(V19, HA 설계 기록 §6). 쓰기 문장은 [writes] 로 내고 [inTransaction] 은 [AuthorityGuard.withAuthorityTransaction]
+ * 이다 — 리스를 쥔 리더가 아니면 아무것도 적지 않는다([NotAuthority]·[AuthorityLost]). 예외: 인스턴스 행(심장박동·멈춤·자기 차단)은 대기 인스턴스도
+ * 적으므로 가드 밖이다(그 표에는 펜싱 트리거가 없다).
  */
-class HostRecords(private val jdbc: JdbcClient, private val transactions: TransactionTemplate, private val json: ObjectMapper) {
+class HostRecords(
+    private val jdbc: JdbcClient,
+    private val guard: AuthorityGuard,
+    private val json: ObjectMapper,
+) {
+    private val writes: JdbcClient = guard.writes
 
-    /** [action] 을 한 트랜잭션으로 돈다. 예외가 나가면 아무것도 남지 않는다. */
-    fun <T> inTransaction(action: () -> T): T = transactions.execute { action() } as T
+    /** [action] 을 리스를 확인한 한 트랜잭션으로 돈다. 예외가 나가면 아무것도 남지 않는다. */
+    fun <T> inTransaction(action: () -> T): T = guard.withAuthorityTransaction(action)
 
     /** Serialized transactional counter: allocation order is commit order, with no rollback gaps. */
     fun appendResult(instance: String, responseId: String, snapshot: com.fasterxml.jackson.databind.JsonNode) {
@@ -394,7 +412,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .param("instance",instance).param("response",responseId).query(Long::class.java).single() > 0
         if (exists) return
         // The counter step and the outbox row in one statement (one round trip per result in the pump's transaction; HA design §10).
-        val inserted = jdbc.sql(
+        val inserted = writes.sql(
             "WITH next AS (UPDATE mission.result_producer SET last_sequence=last_sequence+1 WHERE singleton RETURNING last_sequence) " +
                 "INSERT INTO mission.result_outbox(sequence,instance_id,response_id,snapshot) SELECT last_sequence,:instance,:response,CAST(:snapshot AS JSONB) FROM next",
         ).param("instance",instance).param("response",responseId).param("snapshot",snapshot.toString()).update()
@@ -423,7 +441,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         instanceId: String,
         executionId: String,
     ): JournalRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
             VALUES (:jobOrderId, :robotId, CAST(:jobOrder AS jsonb), :workMaster, :missionVersion, :instanceId, :executionId)
@@ -441,7 +459,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .single()
 
     fun event(jobOrderId: String, kind: JournalEventKind, instanceId: String, executionId: String?, detail: String?): JournalEvent =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, execution_id, detail)
             VALUES (:jobOrderId, :kind, :instanceId, :executionId, :detail)
@@ -460,7 +478,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      * 정착 이벤트와 그때의 실행 본문(V8, HA 설계 기록 §10). [snapshot] 은 `ExecutionView` JSON 글자다. pump 뒤 기록의 트랜잭션 안에서 부른다.
      */
     fun settled(jobOrderId: String, instanceId: String, executionId: String, physicalState: String, snapshot: String): JournalEvent =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, execution_id, detail, snapshot)
             VALUES (:jobOrderId, 'SETTLED', :instanceId, :executionId, :detail, CAST(:snapshot AS json))
@@ -577,7 +595,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
 
     /** 받은 개정판을 적는다(V10). [jobOrder] 는 picasso `JobOrder` 의 칸 그대로의 JSON 글자다. */
     fun revision(jobOrderId: String, version: Int, jobOrder: String, instanceId: String, executionId: String): RevisionRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_journal_revision (job_order_id, version, job_order, instance_id, execution_id)
             VALUES (:jobOrderId, :version, CAST(:jobOrder AS jsonb), :instanceId, :executionId)
@@ -662,7 +680,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .orElse(null)
 
     fun logResponse(instanceId: String, jobResponseId: String, executionId: String, content: ResponseContent, disposition: ResponseDisposition): ResponseLogRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.job_response_log (instance_id, job_response_id, job_order_id, execution_id, version, physical_state,
                 required_evidence, reached_evidence, completed_units, unverified_units, incomplete_units, in_doubt_units,
@@ -736,7 +754,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         wireVersion: String,
         line: String,
     ) {
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.incident_copy (instance_id, incident_id, execution_id, job_order_id, unit_id, detail, wire_version, line)
             VALUES (:instanceId, :incidentId, :executionId, :jobOrderId, :unitId, CAST(:detail AS json), :wireVersion, :line)
@@ -757,7 +775,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
     /** 인시던트 줄의 개정들(2 부터, V17). 같은 (인스턴스, 인시던트 id, 개정)이 이미 있으면 그 행은 건너뛴다(멱등). */
     fun copyIncidentRevisions(instanceId: String, wireVersion: String, rows: List<IncidentRevisionWrite>) {
         if (rows.isEmpty()) return
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.incident_copy_revision (instance_id, incident_id, revision, wire_version, line)
             SELECT :instanceId, x.incident_id, x.revision, :wireVersion, x.line
@@ -808,7 +826,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
     /** 탐색 사본들. 같은 (인스턴스, 탐색 id)가 이미 있으면 그 행은 건너뛴다(멱등). 줄은 picasso 글자 그대로다 — 여기서 고치지 않는다. */
     fun copySearches(instanceId: String, wireVersion: String, rows: List<SearchCopyWrite>) {
         if (rows.isEmpty()) return
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.remedy_search_copy (instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line)
             SELECT :instanceId, x.search_id, x.job_order_id, x.robot_id, x.outcome, :wireVersion, x.line
@@ -860,7 +878,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      */
     fun copyRevisionRemovals(instanceId: String, wireVersion: String, rows: List<RemovalCopyWrite>) {
         if (rows.isEmpty()) return
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.revision_removal
                 (instance_id, execution_id, job_order_id, robot_id, from_version, to_version, removed, removed_at, wall_clock_at, wire_version, line)
@@ -916,7 +934,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      * 않는다 — 재시도와 실행 복원이 두 번 세지 않는다. 새로 적었으면 참이다.
      */
     fun approvalFact(instanceId: String, fact: ApprovalFactWrite): Boolean =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.remedy_approval
                 (instance_id, execution_id, job_order_id, robot_id, remedy_types, approver_id, approver_kind, approved_at, wall_clock_at)
@@ -956,7 +974,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .list()
 
     fun copyResolution(instanceId: String, incidentId: String, resolution: CopyResolutionRow) {
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.incident_copy_resolution (instance_id, incident_id, decision, decided_at, wall_clock_at, decided_by_id, decided_by_kind)
             VALUES (:instanceId, :incidentId, :decision, :at, :wallClockAt, :byId, :byKind)
@@ -1005,7 +1023,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         approverKind: String,
         reason: String,
     ): CancelRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_cancel (instance_id, execution_id, job_order_id, physical_state, approver_id, approver_kind, reason)
             VALUES (:instanceId, :executionId, :jobOrderId, :physicalState, :approverId, :approverKind, :reason)
@@ -1045,7 +1063,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      * [objectRef] 가 빈 문자열이면 `null` 로 적는다.
      */
     fun markResidualHold(robotId: String, jobOrderId: String, executionId: String, instanceId: String, unitId: String, objectRef: String?): ResidualHoldRow? =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.robot_residual_hold (robot_id, job_order_id, execution_id, instance_id, unit_id, object_ref)
             VALUES (:robotId, :jobOrderId, :executionId, :instanceId, :unitId, :objectRef)
@@ -1105,7 +1123,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         acknowledged: Boolean,
     ): ResidualHoldClearingRow =
         observed(
-            jdbc.sql(
+            writes.sql(
                 """
                 INSERT INTO mission.robot_residual_hold_clearing (marker_id, approver_id, approver_kind, reason, request_id, $OBSERVATION_COLUMNS,
                     conflict_request_id, acknowledged_mismatch)
@@ -1151,7 +1169,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         observation: HoldObservation,
     ): ResidualHoldConflictRow =
         observed(
-            jdbc.sql(
+            writes.sql(
                 """
                 INSERT INTO mission.robot_residual_hold_conflict (request_id, marker_id, approver_id, approver_kind, reason, $OBSERVATION_COLUMNS)
                 VALUES (:requestId, :markerId, :approverId, :approverKind, :reason, $OBSERVATION_PARAMS)
@@ -1186,7 +1204,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      * `DuplicateKeyException`(쓰기 실패)이다.
      */
     fun residualHoldRecovery(markerId: Long, executionId: String, jobOrderId: String, approverId: String) {
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.robot_residual_hold_recovery (marker_id, execution_id, job_order_id, approver_id)
             VALUES (:markerId, :executionId, :jobOrderId, :approverId)
@@ -1219,7 +1237,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         reason: String,
         requestId: UUID?,
     ): FaultReleaseRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_fault_release (instance_id, execution_id, job_order_id, faults, approver_id, approver_kind, reason, request_id)
             VALUES (:instanceId, :executionId, :jobOrderId, CAST(:faults AS JSONB), :approverId, :approverKind, :reason, :requestId)
@@ -1276,7 +1294,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
         requestId: UUID,
     ): CloseRow {
         val event = event(jobOrderId, JournalEventKind.CLOSED, instanceId, null, basis)
-        return jdbc.sql(
+        return writes.sql(
             """
             INSERT INTO mission.execution_close (event_id, job_order_id, instance_id, closed_instance_id, closed_execution_id, robot_id,
                 restore_result, restore_reason, basis, approver_id, approver_kind, reason, request_id, response_id)
@@ -1316,7 +1334,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      * [instanceId] 는 확인을 본 인스턴스다. 문장 하나가 한 트랜잭션이다. 적지 못하면 `DataAccessException` 이다.
      */
     fun confirmClose(closeId: Long, instanceId: String) {
-        jdbc.sql("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES (:closeId, :instanceId) ON CONFLICT (close_id) DO NOTHING")
+        writes.sql("INSERT INTO mission.execution_close_confirmed (close_id, instance_id) VALUES (:closeId, :instanceId) ON CONFLICT (close_id) DO NOTHING")
             .param("closeId", closeId)
             .param("instanceId", instanceId)
             .update()
@@ -1334,7 +1352,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
 
     /** 작업 지시 철회 한 행을 적는다. 같은 작업 지시나 같은 [requestId] 의 행이 이미 있으면 `DuplicateKeyException`(쓰기 실패)이다. */
     fun withdraw(jobOrderId: String, requestId: UUID, requestedBy: String, reason: String): WithdrawalRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.job_order_withdrawal (job_order_id, request_id, requested_by, reason)
             VALUES (:jobOrderId, :requestId, :requestedBy, :reason)
@@ -1367,7 +1385,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
     // ── 판단 기록(V6)
 
     fun judgmentRecord(jobOrderId: String, instanceId: String, executionId: String, wireVersion: String, record: String): JudgmentRecordRow =
-        jdbc.sql(
+        writes.sql(
             """
             INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record)
             VALUES (:jobOrderId, :instanceId, :executionId, :wireVersion, :record)
@@ -1391,7 +1409,7 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
      */
     fun judgmentRecords(instanceId: String, wireVersion: String, rows: List<JudgmentRecordWrite>) {
         if (rows.isEmpty()) return
-        val written = jdbc.sql(
+        val written = writes.sql(
             """
             INSERT INTO mission.execution_judgment_record (job_order_id, instance_id, execution_id, wire_version, record)
             SELECT x.job_order_id, :instanceId, x.execution_id, :wireVersion, x.record
@@ -1452,7 +1470,76 @@ class HostRecords(private val jdbc: JdbcClient, private val transactions: Transa
             .update()
     }
 
+    /**
+     * 리스를 잃은 인스턴스의 자기 차단 기록(V19, HA 설계 기록 §7 의 FENCED). 가드 밖이다 — 잃은 뒤에 적는다. 멈춤(`stopped_at`)은 적지 않는다:
+     * 멈춤은 정상 종료의 증거라 다음 보유자가 곧바로 발행하게 하는데, 잃은 인스턴스는 정상 종료가 아니다.
+     */
+    fun fence(instanceId: String, reason: String) {
+        jdbc.sql("UPDATE mission.host_instance SET fenced_at = clock_timestamp(), fenced_reason = :reason WHERE instance_id = :instanceId AND fenced_at IS NULL")
+            .param("instanceId", instanceId)
+            .param("reason", reason)
+            .update()
+    }
+
+    /** 리스 행(공용 풀로 읽는다). */
+    fun leaseRow(): dev.picasso.ops.host.lease.LeaseRow =
+        jdbc.sql(
+            """
+            SELECT l.holder, l.generation, t.expires_at, t.expires_at > clock_timestamp(), t.issuing
+            FROM mission.host_lease l JOIN mission.host_lease_term t USING (role) WHERE l.role = 'host'
+            """.trimIndent(),
+        )
+            .query { rs, _ ->
+                dev.picasso.ops.host.lease.LeaseRow(rs.getString(1), rs.getLong(2), instant(rs, "expires_at"), rs.getBoolean(4), rs.getBoolean(5))
+            }
+            .single()
+
+    /** 만료 인수 뒤 운영자 확인을 적는다(V19). 그 세대에 이미 있으면 `DuplicateKeyException` 이다. */
+    fun confirmTakeover(generation: Long, instanceId: String, previousHolder: String?, confirmedBy: String, reason: String): TakeoverConfirmationRow =
+        writes.sql(
+            """
+            INSERT INTO mission.host_takeover_confirmation (generation, instance_id, previous_holder, confirmed_by, reason)
+            VALUES (:generation, :instanceId, :previous, :by, :reason)
+            RETURNING generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("previous", previousHolder, java.sql.Types.VARCHAR)
+            .param("by", confirmedBy)
+            .param("reason", reason)
+            .query { rs, _ -> takeoverRow(rs) }
+            .single()
+
+    /** 그 세대의 운영자 확인. 없으면 `null`. */
+    fun takeoverConfirmation(generation: Long): TakeoverConfirmationRow? =
+        jdbc.sql("SELECT generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at FROM mission.host_takeover_confirmation WHERE generation = :generation")
+            .param("generation", generation)
+            .query { rs, _ -> takeoverRow(rs) }
+            .optional()
+            .orElse(null)
+
+    private fun takeoverRow(rs: ResultSet) = TakeoverConfirmationRow(
+        rs.getLong("generation"), rs.getString("instance_id"), rs.getString("previous_holder"), rs.getString("confirmed_by"), rs.getString("reason"),
+        instant(rs, "confirmed_at"),
+    )
+
     /** 그 인스턴스가 지금(DB 시각) 살아 있는가. 행이 없으면 거짓이다(이 표 이전의 인스턴스와 모르는 인스턴스). */
+    /**
+     * 그 인스턴스가 살아 있다는 직접 증거가 있는가: 심장박동이 DB 시각으로 만료 전이고 멈춤도 자기 차단도 적지 않았다. 만료 인수 뒤 운영자 확인이
+     * 앞 보유자를 대조할 때 쓴다.
+     */
+    fun instanceAlive(instanceId: String): Boolean =
+        jdbc.sql(
+            """
+            SELECT EXISTS (SELECT 1 FROM mission.host_instance
+                           WHERE instance_id = :instanceId AND stopped_at IS NULL AND fenced_at IS NULL AND expires_at > clock_timestamp())
+            """.trimIndent(),
+        )
+            .param("instanceId", instanceId)
+            .query(Boolean::class.java)
+            .single()
+
     fun instanceLive(instanceId: String): Boolean =
         jdbc.sql(
             """

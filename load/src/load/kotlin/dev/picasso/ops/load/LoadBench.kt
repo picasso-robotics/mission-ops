@@ -4,7 +4,7 @@ import java.lang.management.ManagementFactory
 
 /**
  * `./gradlew :load:loadBench --args="<시나리오…> [quick]"`. 시나리오는 stations·delivery·pump·pumpscale·explain·list·takeover·all 이다. list(실행 목록 크기,
- * 실행 10000 까지 쌓음)와 pumpscale(기체 100·200)과 takeover(비정상 종료 뒤 인수 공백, 기본 만료 30초를 회차마다 기다림)는 all 에 들지 않는다.
+ * 실행 10000 까지 쌓음)와 pumpscale(기체 100·200)과 takeover(비정상 종료 뒤 만료 인수 공백, 기본 리스 만료 30초를 회차마다 기다림)는 all 에 들지 않는다.
  * `quick` 을 붙이면 규모를 줄여 배선만 확인한다. 결과는 `load/build/load/<시나리오>.md` 와 표준 출력에 같이 남는다.
  */
 fun main(args: Array<String>) {
@@ -47,15 +47,15 @@ fun main(args: Array<String>) {
         if (quick) 5 else 30,
     )
     if ("list" in chosen) ListLoad.run(Report("list"), if (quick) listOf(10, 20) else listOf(2_000, 10_000), if (quick) 2 else 50, if (quick) 3 else 10)
-    // 비정상 종료 뒤 순차 인수의 공백(HA 설계 §4.5·§7). 기본 심장박동(5초/30초)과 짧은 심장박동(0.5초/3초). all 에 들지 않는다.
+    // 비정상 종료 뒤 만료 인수의 공백(HA 설계 §4.5·§7). 기본 리스(5초/30초/여유 5초)와 짧은 리스(0.5초/3초/여유 1초). all 에 들지 않는다.
     if ("takeover" in chosen) TakeoverLoad.run(
         Report("takeover"),
         if (quick) {
-            listOf(TakeoverLoad.Beat(java.time.Duration.ofMillis(500), java.time.Duration.ofSeconds(3)))
+            listOf(TakeoverLoad.Lease(java.time.Duration.ofMillis(500), java.time.Duration.ofSeconds(3), java.time.Duration.ofSeconds(1)))
         } else {
             listOf(
-                TakeoverLoad.Beat(java.time.Duration.ofSeconds(5), java.time.Duration.ofSeconds(30)),
-                TakeoverLoad.Beat(java.time.Duration.ofMillis(500), java.time.Duration.ofSeconds(3)),
+                TakeoverLoad.Lease(java.time.Duration.ofSeconds(5), java.time.Duration.ofSeconds(30), java.time.Duration.ofSeconds(5)),
+                TakeoverLoad.Lease(java.time.Duration.ofMillis(500), java.time.Duration.ofSeconds(3), java.time.Duration.ofSeconds(1)),
             )
         },
         if (quick) listOf(1, 2) else listOf(1, 10, 50),

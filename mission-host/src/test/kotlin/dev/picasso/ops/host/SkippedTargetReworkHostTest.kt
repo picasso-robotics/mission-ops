@@ -405,12 +405,12 @@ class SkippedTargetReworkHostTest {
         HostBench().use { bench ->
             val executionId = bench.partial()
             val before = bench.recordCount()
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_record() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'record refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE TRIGGER refuse_record BEFORE INSERT ON mission.execution_judgment_record FOR EACH ROW EXECUTE FUNCTION mission.refuse_record()",
             )
             // 판단은 picasso 에 섰다. 기록을 못 적었으므로 그 실행이 일지 막힘에 들고 pump 가 새 시도를 내지 않는다.
@@ -424,7 +424,7 @@ class SkippedTargetReworkHostTest {
             val refused = bench.post("/host/job-orders", request(inspect("JO-2", "T9" to "bay-9"), "candidates", QUADRUPED)).body!!
             assertEquals("REJECTED", refused["result"].asText(), refused.toString())
 
-            PostgresSupport.execute("DROP TRIGGER refuse_record ON mission.execution_judgment_record")
+            Fenced.execute("DROP TRIGGER refuse_record ON mission.execution_judgment_record")
             bench.eventually("판단 기록") { bench.recordCount() > before }
             assertTrue(bench.latestRecord().units.single { it.unitId == "T1" }.decision?.decision == OperatorDecision.REWORK)
             bench.eventually("막힘 풀림") { bench.get("/host/executions")["journalBlockedExecutionIds"].isEmpty }

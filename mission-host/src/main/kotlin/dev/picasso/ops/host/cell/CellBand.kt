@@ -7,6 +7,7 @@ import dev.picasso.middleware.NamedSignal
 import dev.picasso.middleware.SlotSignal
 import dev.picasso.middleware.mission.SignalKind
 import dev.picasso.middleware.mission.SignalSpec
+import dev.picasso.ops.host.lease.SendAuthority
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -69,11 +70,14 @@ data class SignalRelay(val status: Int, val contentType: String?, val body: Byte
  * @param baseUrl 현장 셀 대역의 주소. 경로 `/cell` 을 붙여 부른다.
  * @param timeout 연결 제한과 셀 대역 읽기의 요청 제한
  * @param writeTimeout 신호 조작의 요청 제한. [SIGNAL_WRITE_TIMEOUT] 의 까닭을 본다
+ * @param authority 송신 직전 로컬 권위 확인(HA 설계 기록 §4.4 의 3). 신호 쓰기와 결함 주입 중계는 보내기 직전에 이것을 확인하고, 발행하는 리더가
+ *   아니면 보내지 않고 `CommandNotSent` 를 던진다(REST 는 503). 읽기([fetch])는 막지 않는다.
  */
 class CellBandClient(
     baseUrl: String,
     private val timeout: Duration = Duration.ofSeconds(1),
     private val writeTimeout: Duration = SIGNAL_WRITE_TIMEOUT,
+    private val authority: SendAuthority = SendAuthority.ALWAYS,
 ) {
 
     private val base = baseUrl.trimEnd('/')
@@ -99,13 +103,13 @@ class CellBandClient(
      * 조각으로 인코딩한다. 판정(404·400·403)은 현장의 몫이다.
      */
     fun writeSignal(name: String, body: ByteArray): SignalRelay? =
-        relay("$base/cell/signals/${URLEncoder.encode(name, StandardCharsets.UTF_8).replace("+", "%20")}", body)
+        authority.sending("셀 신호 쓰기 $name") { relay("$base/cell/signals/${URLEncoder.encode(name, StandardCharsets.UTF_8).replace("+", "%20")}", body) }
 
     /**
      * 기체 장애 주입 `POST /faults` 를 현장에 그대로 넘긴다(S4a 스펙 §6). 현장이 안 닿으면 `null` 이다. 종류의 해석과 판정은
      * 현장의 몫이다. 현장의 주입도 mimic 엔진 잠금을 기다리므로 신호 조작과 같은 요청 제한을 쓴다.
      */
-    fun injectFault(body: ByteArray): SignalRelay? = relay("$base/faults", body)
+    fun injectFault(body: ByteArray): SignalRelay? = authority.sending("결함 주입 중계") { relay("$base/faults", body) }
 
     private fun relay(url: String, body: ByteArray): SignalRelay? = try {
         val response = http.send(

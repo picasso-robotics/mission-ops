@@ -135,7 +135,7 @@ picasso 서브모듈 `74e4d3d` 위의 실행 호스트가 실제로 내고 받�
 | `executionId` | 문자열 또는 `null` | `RESTORED` 일 때 새 실행 id(새 인스턴스의 셈이라 대개 `exec-1` 부터). 그 밖에는 `null` |
 | `reason` | 문자열 또는 `null` | `DEFERRED`·`GAVE_UP` 의 사유. `RESTORED` 면 `null` |
 
-- `DEFERRED` 는 기체 스냅숏을 못 읽었거나 살아 있는 다른 인스턴스가 든 실행인 것이고, 사유는 `살아 있는 다른 인스턴스가 든 실행이라 다시 짓지 않는다: instance=<id>` 또는 picasso 의 문장 그대로 `기체 스냅숏을 못 읽어 다시 짓지 않는다: robot=<robotId>, ...` 로 시작합니다. `previousInstanceId` 는 행을 든 인스턴스이기도 합니다(살아 있는지 보는 대상). 그 인스턴스가 만료되면 pump 가 다시 시도하며, 다시 시도가 스냅숏으로 미뤄지면 보고 행의 사유만 스냅숏 문장으로 바뀌고 일지 이벤트는 더 적지 않습니다. 스냅숏 사유면 pump 마다(250ms) 다시 시도하며, 읽히면 그 행이 그 자리에서 `RESTORED`(실행 id 있음, 사유 `null`)로 바뀝니다. 다른 거부로 바뀌면 `GAVE_UP` 이 됩니다.
+- `DEFERRED` 는 기체 스냅숏을 못 읽었거나 살아 있는 다른 인스턴스가 든 실행인 것이고(V19 부터 뒤의 것은 더 생기지 않음 — 복원은 리스를 쥔 호스트만 하고 앞 인스턴스의 심장박동을 보지 않음), 사유는 `살아 있는 다른 인스턴스가 든 실행이라 다시 짓지 않는다: instance=<id>` 또는 picasso 의 문장 그대로 `기체 스냅숏을 못 읽어 다시 짓지 않는다: robot=<robotId>, ...` 로 시작합니다. `previousInstanceId` 는 행을 든 인스턴스이기도 합니다(살아 있는지 보는 대상). 그 인스턴스가 만료되면 pump 가 다시 시도하며, 다시 시도가 스냅숏으로 미뤄지면 보고 행의 사유만 스냅숏 문장으로 바뀌고 일지 이벤트는 더 적지 않습니다. 스냅숏 사유면 pump 마다(250ms) 다시 시도하며, 읽히면 그 행이 그 자리에서 `RESTORED`(실행 id 있음, 사유 `null`)로 바뀝니다. 다른 거부로 바뀌면 `GAVE_UP` 이 됩니다.
 - `GAVE_UP` 사유: 임무 버전 행이 없으면 `임무 버전 행이 없다: <workMasterId> 버전 <n>`, 저장된 정의를 못 읽으면 `저장된 임무 버전 ... 을 읽지 못했다: ...`, 판단 기록을 읽지 못하면 `판단 기록을 읽지 못해 다시 짓지 않는다: record=<id>, <picasso 문장>`, 판단 기록이 이 작업 지시의 것이 아니면 `<picasso RESUME_RECORD_MISMATCH 문장> (record=<id>)`(앞머리 `판단 기록이 이 작업 지시의 것이 아니어서 다시 짓지 않는다`), 그 밖에는 picasso `resume` 의 거부 문장 그대로(예 `요구 근거 등급 E2 은 InspectAsset 의 최고 등급 E0 를 넘는다 — 확인 수단이 없다`).
 - 리빌드한 실행은 판단 기록이 있으면 판정 있는 단위는 기록의 상태·근거 등급 그대로 서고 다시 돌리지 않습니다(통합 시험 단계 1: 대기 DONE E2, S01 DONE E2). 기록이 없으면 단위가 모두 대기(로봇·플릿 단위는 `PENDING`, 앞서 통과한 설비 대기는 `DONE`·`E0`)에서 시작하고, 첫 pump 들이 기체를 다시 관측해 끝난 단위는 `DONE`, 도는 단위는 `RUNNING` 으로 세웁니다. 호스트 시험에서는 가상 시계를 밀지 않고 시험 상한 5초(실제 시간, pump 250ms) 안에 섰습니다.
 
@@ -149,7 +149,7 @@ picasso 서브모듈 `74e4d3d` 위의 실행 호스트가 실제로 내고 받�
 
 - 이 이유만 있을 때 `runningExecutionId` 는 `null` 입니다(호스트가 모르는 고아 태스크라 실행 id 가 없다).
 - `GAVE_UP` 행은 판정 때만 그 기체 스냅숏을 한 번 읽습니다. 고아 태스크가 종료 상태(용어집의 넷: `SUCCEEDED`, `FAILED`, `CANCELLED`, `CANCELLED_RECOVERY_FAILED`)이거나 없으면 풀리고, 사람을 기다리는 `RETRIABLE`·`NEEDS_INTERVENTION` 은 종료하지 않은 상태라 계속 뺍니다(호스트 시험 `HostRestoreTest` 의 NEEDS_INTERVENTION 고아 태스크). 풀리면 그 인스턴스에서는 다시 빼지 않습니다. 이전 기동에서 포기한 행도 다음 기동에서 다시 같은 검사를 받습니다(리빌드하지는 않음).
-- `DEFERRED` 행은 `RESTORED` 가 될 때까지 늘 뺍니다. 다른 인스턴스로 미룬 `DEFERRED` 행도 같은 문장 `복원 못 한 실행이 있다: <jobOrderId>` 로 그 기체를 뺍니다(근거: `HostInstanceTest` 의 `살아 있는 다른 인스턴스가 든 일지 행은 다시 짓지 않고 미루며 그 기체를 판정에서 빼고 그 심장박동이 끊기면 다시 짓는다`). 그 뒤로는 리빌드한 실행이 `진행 중인 실행이 있다: exec-N` 으로 뺍니다.
+- `DEFERRED` 행은 `RESTORED` 가 될 때까지 늘 뺍니다. V19 이전에는 다른 인스턴스로 미룬 `DEFERRED` 행도 같은 문장 `복원 못 한 실행이 있다: <jobOrderId>` 로 그 기체를 뺐습니다(V19 부터 그 미룸은 없음, `HostInstanceTest` 의 `리스를 쥔 호스트는 심장박동이 살아 있는 다른 인스턴스가 든 일지 행도 곧바로 다시 짓는다`). 그 뒤로는 리빌드한 실행이 `진행 중인 실행이 있다: exec-N` 으로 뺍니다.
 
 ### H3. `GET /host/incidents` 의 `earlier`
 
@@ -275,6 +275,8 @@ picasso 서브모듈 `74e4d3d` 위의 실행 호스트가 실제로 내고 받�
 HA 단계 0 에서 더해진 V6 `execution_judgment_record`(`V6__execution_judgment_record.sql`): `record_id` identity PK, `job_order_id`(FK → `execution_journal`), `instance_id`, `execution_id`, `wire_version`(`JudgmentRecordWire.SCHEMA_VERSION`, 지금 `"1"`), `record`(TEXT, 받은 글자 그대로. JSON 이 아님), `recorded_at`. 변경·삭제·통째 비우기 금지. 수락 직후, pump 뒤 기록, 운영자 판단 직후 직전 글자와 다를 때만 한 행.
 
 HA 단계 0 에서 더해진 V7 `host_instance`(`V7__host_instance_heartbeat.sql`): `instance_id` PK, `started_at`, `last_seen_at`, `expires_at`, `stopped_at`(NULL 가능), CHECK(`expires_at >= last_seen_at OR stopped_at IS NOT NULL`). 인스턴스마다 한 행이고 그 인스턴스만 고침. 덧붙이기 전용이 아님. 시각은 DB `clock_timestamp()`.
+
+능동-대기 1단계 기반에서 더해진 V19(`V19__host_lease.sql`): `host_lease`(역할 `host` 한 행: `holder`·`generation`), `host_lease_term`(`expires_at`·`issuing`), `host_takeover_confirmation`(만료 인수 뒤 운영자 확인, 세대마다 한 행, 덧붙이기만), `host_instance` 의 `fenced_at`·`fenced_reason`. `mission` 의 쓰기 표 전부(리스 두 표·`host_instance`·마이그레이션 이력 표 제외)에 문장 수준 펜싱 트리거 — 리스를 확인한 트랜잭션의 지역 표식 `mission.fenced_generation` 이 없는 쓰기는 SQLSTATE `MHF01` 로 거부. 표 모양(위 칸들)은 바뀌지 않음.
 
 브랜치 `perf/ui-execution-list` 에서 더해진 V8(`V8__settled_execution_snapshot.sql`): `execution_journal_event` 에 `snapshot JSON`(NULL 가능) 칸을 더함. 새 표는 없고 표 수는 15 개로 유지됨. CHECK(`execution_journal_event_snapshot_settled`: `snapshot IS NULL OR kind = 'SETTLED'`)로 종결 이벤트만 본문을 가질 수 있습니다. 종결 이력 페이징을 위해 `(event_id) WHERE kind = 'SETTLED'` 부분 인덱스 `execution_journal_event_settled` 를 둠(커서는 `event_id`). 실행 호스트가 `recordAfterPump` 에서 동일 트랜잭션으로 `SETTLED` 이벤트를 적을 때 그 시점의 실행 본문인 `GET /host/executions` 실행 행(`ExecutionView` JSON)을 함께 적습니다. 이 본문에는 재할당 뒤 기체, 단위 상태와 근거, 마지막 작업 응답, 운영자 취소가 담김. JSONB 가 아닌 JSON 을 쓰는 이유는 인시던트 사본과 마찬가지로 적힌 본문 글자 그대로라 REST 실행 행의 키 순서를 보존하기 위함임. V8 이전에 적힌 `SETTLED` 행과 다른 모든 이벤트는 NULL 입니다. 표는 여전히 덧붙이기 전용입니다(행 트리거는 `UPDATE`·`DELETE` 만 막으며 변경 없음). 화면의 실행 목록은 미들웨어 메모리가 아니라 이 종결 이력에서 종결된 실행을 읽습니다(HA 설계 기록 §10, S3a JSON 계약 §5.8). 근거 시험은 `MissionStoreTest`(마이그레이션 8 개), `SettledHistoryTest` 의 `정착 이력은 인스턴스를 가리지 않고 일지 행의 기체와 임무를 싣고 본문 없는 정착 이벤트도 읽는다`(종결 아닌 이벤트에 본문 작성이 거부됨도 확인).
 

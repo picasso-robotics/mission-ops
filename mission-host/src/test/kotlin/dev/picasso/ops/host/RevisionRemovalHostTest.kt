@@ -202,10 +202,10 @@ class RevisionRemovalHostTest {
     fun `제거 사건을 적지 못하면 개정판 행도 남지 않고 일지가 막히며 다음 pump 가 함께 다시 적는다`() {
         HostBench().use { bench ->
             val executionId = bench.submit("T1" to "bay-7", "T2" to "dock-3")
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE FUNCTION mission.refuse_removal() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'removal refused'; END; ${'$'}${'$'} LANGUAGE plpgsql",
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_removal BEFORE INSERT ON mission.revision_removal FOR EACH ROW EXECUTE FUNCTION mission.refuse_removal()")
+            Fenced.execute("CREATE TRIGGER refuse_removal BEFORE INSERT ON mission.revision_removal FOR EACH ROW EXECUTE FUNCTION mission.refuse_removal()")
             try {
                 assertEquals(500, bench.revise(2, "T1" to "bay-7").status)
                 bench.idlePumps()
@@ -213,8 +213,8 @@ class RevisionRemovalHostTest {
                 assertEquals(0, removalRows())
                 assertEquals(listOf(executionId), bench.get("/host/executions")["journalBlockedExecutionIds"].map { it.asText() })
             } finally {
-                PostgresSupport.execute("DROP TRIGGER refuse_removal ON mission.revision_removal")
-                PostgresSupport.execute("DROP FUNCTION mission.refuse_removal()")
+                Fenced.execute("DROP TRIGGER refuse_removal ON mission.revision_removal")
+                Fenced.execute("DROP FUNCTION mission.refuse_removal()")
             }
             bench.eventually("다시 적음") { versions() == listOf(2) && removalRows() == 1 }
             bench.eventually("막힘 풀림") { bench.get("/host/executions")["journalBlockedExecutionIds"].isEmpty }
@@ -236,10 +236,10 @@ class RevisionRemovalHostTest {
             }
             bench.idlePumps()
             // pump 뒤 기록(송신 기록)을 실패시켜 게시를 늦춘다. 리비전의 개정판 행·제거 사건 트랜잭션은 그대로 커밋된다.
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE FUNCTION mission.refuse_response() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'response refused'; END; ${'$'}${'$'} LANGUAGE plpgsql",
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_response BEFORE INSERT ON mission.job_response_log FOR EACH ROW EXECUTE FUNCTION mission.refuse_response()")
+            Fenced.execute("CREATE TRIGGER refuse_response BEFORE INSERT ON mission.job_response_log FOR EACH ROW EXECUTE FUNCTION mission.refuse_response()")
             try {
                 listOf("JO-1", "JO-2").forEach { jobOrderId ->
                     val revised = bench.post(
@@ -253,8 +253,8 @@ class RevisionRemovalHostTest {
                 // 레지스터는 상한 1 이라 앞 사건을 내렸다.
                 assertEquals(1L, bench.host.retentionEvictions().revisionRemovals)
             } finally {
-                PostgresSupport.execute("DROP TRIGGER refuse_response ON mission.job_response_log")
-                PostgresSupport.execute("DROP FUNCTION mission.refuse_response()")
+                Fenced.execute("DROP TRIGGER refuse_response ON mission.job_response_log")
+                Fenced.execute("DROP FUNCTION mission.refuse_response()")
             }
             val file = export.resolve(LedgerExport.REVISION_REMOVALS)
             bench.eventually("두 사건 게시") { Files.exists(file) && file.readLines().size == 2 }

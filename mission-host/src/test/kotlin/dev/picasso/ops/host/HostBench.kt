@@ -12,6 +12,10 @@ import dev.picasso.middleware.RobotSnapshot
 import dev.picasso.mimic.cli.MimicCli
 import io.grpc.ManagedChannel
 import io.grpc.ManagedChannelBuilder
+import dev.picasso.ops.host.lease.HostExit
+import dev.picasso.ops.host.lease.HostLeadership
+import dev.picasso.ops.host.lease.LeaderState
+import dev.picasso.ops.host.lease.LeaseTiming
 import dev.picasso.ops.host.timings.SiteTimingsView
 import dev.picasso.registry.PostgresSupport
 import org.springframework.boot.web.context.WebServerApplicationContext
@@ -47,7 +51,7 @@ import java.util.concurrent.CopyOnWriteArrayList
  * @param gated 참이면 호스트의 하위 포트를 [blockedSnapshots] 에 든 기체의 스냅숏을 못 읽는 포트로 넣는다(S4b 의 복원 미룸).
  *   기동마다 새 채널과 새 `ClientRobotPort` 다(재기동한 호스트가 핸들을 처음부터 다시 받는 것과 같게).
  * @param permitMapping 주면 현장이 이 작업 허가 대응을 선언한 것이다(`host.work-permit.mapping`, ADR 52). 셀 대역 대역의 안전 신호가 원천이다.
- * @param heartbeat 주면 인스턴스 심장박동의 주기와 만료를 이것으로 덮는다(`host.instance.heartbeat-period`·`-expiry`).
+ * @param lease 주면 리스·심장박동의 시간 폭을 이것으로 덮는다(`host.lease.*`).
  * @param registryUrl 주면 호스트가 이 주소의 registry 진단 읽기로 기체 퇴역을 읽는다(`host.registry.url`). 안 주면 비워서 포트를 붙이지
  *   않는다. 기본 설정의 `REGISTRY_PORT` 는 이 기계에 뜬 실제 registry 일 수 있다.
  * @param retirementInterval 주면 퇴역 읽기 주기를 이것으로 덮는다(`host.retirement.read-interval`).
@@ -62,7 +66,7 @@ class HostBench(
     timings: List<Long>? = STANDARD_TIMINGS,
     private val gated: Boolean = false,
     private val permitMapping: Path? = null,
-    private val heartbeat: Pair<Duration, Duration>? = null,
+    private val lease: LeaseTiming? = null,
     private val registryUrl: String? = null,
     private val retirementInterval: Duration? = null,
     private val incidentLoop: Map<String, String> = emptyMap(),
@@ -106,11 +110,29 @@ class HostBench(
     /** [gated] 일 때 호스트가 하위에 낸 취소(기체, 태스크 id). */
     val cancels = CopyOnWriteArrayList<Pair<String, String>>()
 
+    /** [gated] 일 때 출발을 보내기 전에 이만큼 붙든다(끼어듦을 무시하고). 송신 중인 명령이 있는 채 닫는 장면에 쓴다. */
+    @Volatile
+    var startDelay: Duration? = null
+
+    /** [gated] 일 때 하위로 들어온 출발 수(붙들기 전에 센다). */
+    val startsBegun = java.util.concurrent.atomic.AtomicInteger()
+
     private fun gatedPort(): RobotPort {
         val delegate = clientPort()
         return object : RobotPort by delegate {
-            override fun start(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>) =
-                delegate.start(robotId, taskId, revision, skillType, parameters).also { starts += robotId to taskId }
+            override fun start(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>): dev.picasso.contracts.v1.StartTaskResponse {
+                startsBegun.incrementAndGet()
+                startDelay?.let { delay ->
+                    val until = System.nanoTime() + delay.toNanos()
+                    while (System.nanoTime() < until) {
+                        try {
+                            Thread.sleep(20)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+                return delegate.start(robotId, taskId, revision, skillType, parameters).also { starts += robotId to taskId }
+            }
 
             override fun cancel(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) =
                 delegate.cancel(robotId, handle).also { cancels += robotId to handle.taskId }
@@ -126,24 +148,24 @@ class HostBench(
     }
 
     init {
-        PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        PostgresSupport.execute("DROP SCHEMA IF EXISTS ops CASCADE")
+        Fenced.execute("DROP SCHEMA IF EXISTS mission CASCADE")
+        Fenced.execute("DROP SCHEMA IF EXISTS ops CASCADE")
         timings?.let(::timingsView)
     }
 
     /** 대역 뷰를 [row] 한 행으로 다시 만든다. 호스트는 다음 읽기(1초 주기)에서 그 행을 읽는다. */
     fun timingsView(row: List<Long>) {
         require(row.size == SiteTimingsView.COLUMNS.size) { "칸이 ${SiteTimingsView.COLUMNS.size} 개여야 한다: $row" }
-        PostgresSupport.execute("CREATE SCHEMA IF NOT EXISTS ${SiteTimingsView.NAME.substringBefore('.')}")
+        Fenced.execute("CREATE SCHEMA IF NOT EXISTS ${SiteTimingsView.NAME.substringBefore('.')}")
         dropTimingsView()
         val values = SiteTimingsView.COLUMNS.zip(row).joinToString(", ") { (column, value) -> "$value::${column.type}" }
-        PostgresSupport.execute(
+        Fenced.execute(
             "CREATE VIEW ${SiteTimingsView.NAME} (${SiteTimingsView.COLUMNS.joinToString(", ") { it.name }}) AS VALUES ($values)",
         )
     }
 
     /** 대역 뷰를 지운다. 호스트의 다음 읽기가 실패한다. */
-    fun dropTimingsView() = PostgresSupport.execute("DROP VIEW IF EXISTS ${SiteTimingsView.NAME}")
+    fun dropTimingsView() = Fenced.execute("DROP VIEW IF EXISTS ${SiteTimingsView.NAME}")
 
     /** `GET /host/site-timings` 가 [done] 을 만족할 때까지 기다린다(실제 시간 상한 5초). 만족한 본문을 돌려준다. */
     fun awaitTimings(done: (JsonNode) -> Boolean): JsonNode {
@@ -187,6 +209,14 @@ class HostBench(
      */
     val onCellFetch = java.util.concurrent.atomic.AtomicReference<(() -> Unit)?>(null)
 
+    /** 주면 셀 대역 대역이 신호 쓰기에 답하기 전에 이만큼 기다린다. */
+    @Volatile
+    var signalDelay: Duration? = null
+
+    /** 셀 대역 대역이 마지막 신호 쓰기에 답한 DB 시각(`clock_timestamp()`, 멈춤 기록과 같은 시계). */
+    @Volatile
+    var signalRepliedAt: Instant? = null
+
     /** 셀 대역 대역이 받은 신호 쓰기(경로의 이름, Content-Type, 본문). */
     val signalWrites = CopyOnWriteArrayList<Triple<String, String?, String>>()
 
@@ -215,6 +245,8 @@ class HostBench(
                     exchange.requestHeaders.getFirst("Content-Type"),
                     exchange.requestBody.readAllBytes().toString(Charsets.UTF_8),
                 )
+                signalDelay?.let { Thread.sleep(it.toMillis()) }
+                signalRepliedAt = PostgresSupport.queryOne("SELECT clock_timestamp()") { it.getTimestamp(1).toInstant() }
                 signalReply
             } else {
                 // 셀 읽기는 pump 의 첫 걸음이다. 걸어 둔 갈고리는 그 pump 가 미들웨어를 돌리기 전에 한 번 돈다.
@@ -237,11 +269,57 @@ class HostBench(
     /** 지금 뜬 호스트의 빈. */
     val host: MissionHost get() = context.getBean(MissionHost::class.java)
 
+    /** 지금 뜬 호스트의 리더 상태기계. */
+    val leadership: HostLeadership get() = leadershipOf(context)
+
+    fun leadershipOf(other: ConfigurableApplicationContext): HostLeadership = other.getBean(HostLeadership::class.java)
+
+    fun urlOf(other: ConfigurableApplicationContext): String = "http://127.0.0.1:${(other as WebServerApplicationContext).webServer.port}"
+
+    /**
+     * 지금 뜬 호스트를 닫고(정상 종료) [next](이 세트가 [startHost] 로 띄운 다른 컨텍스트)를 지금 호스트로 삼는다. 닫힌 호스트는 멈춤을 적고 리스를
+     * 내놓으므로 대기 중이던 [next] 가 다음 획득 주기에 넘겨받는다.
+     */
+    fun handOver(next: ConfigurableApplicationContext) {
+        context.close()
+        context = next
+    }
+
+    /** 지금 뜬 호스트의 리더 상태가 [state] 가 될 때까지 기다린다(실제 시간 상한 [within]). */
+    fun awaitLeader(state: LeaderState, within: Duration = Duration.ofSeconds(5), of: HostLeadership = leadership) {
+        val deadline = Instant.now().plus(within)
+        while (of.state != state) {
+            check(Instant.now().isBefore(deadline)) { "$within 안에 리더 상태가 $state 가 되지 않았다: ${of.state}" }
+            Thread.sleep(20)
+        }
+    }
+
     /** 지금 뜬 호스트 컨텍스트의 빈 하나. 시험이 기록 저장소를 직접 부를 때 쓴다. */
     fun <T : Any> bean(type: Class<T>): T = context.getBean(type)
 
-    /** 이 세트와 같은 인자로 호스트를 하나 띄운다. 기동이 실패하면 예외가 그대로 나간다. */
-    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, if (gated) gatedPort() else null, retention, fleet).run(
+    /** 리스를 잃은 호스트가 부른 종료 훅의 (인스턴스, 까닭). 시험 JVM 을 끝내지 않고 여기에 적는다. */
+    val exits = CopyOnWriteArrayList<Pair<String, String>>()
+
+    /** 종료 훅이 불릴 때 함께 도는 갈고리(인스턴스, 까닭). 잃은 순간의 DB 를 볼 때 쓴다. */
+    @Volatile
+    var onExit: ((String, String) -> Unit)? = null
+
+    /**
+     * 이 세트와 같은 인자로 호스트를 하나 띄운다. 기동이 실패하면 예외가 그대로 나간다. 리스를 다른 호스트가 쥐었으면 대기로 뜬다 — 지금 뜬 호스트와
+     * 함께 둘째 컨텍스트를 띄울 때도 이것을 부른다([leadershipOf]·[urlOf]).
+     */
+    fun startHost(): ConfigurableApplicationContext {
+        val holder = java.util.concurrent.atomic.AtomicReference<String>()
+        val exit = HostExit { reason ->
+            exits += holder.get() to reason
+            onExit?.invoke(holder.get(), reason)
+        }
+        return startHost(exit).also { holder.set(leadershipOf(it).instanceId) }
+    }
+
+    private fun startHost(exit: HostExit): ConfigurableApplicationContext = MissionHostApplication.builder(
+        HostClock { now() }, if (gated) gatedPort() else null, retention, fleet, exit,
+    ).run(
         *buildList {
             add("--server.port=0")
             add("--host.mimic.port=${mimic.server.port}")
@@ -258,9 +336,12 @@ class HostBench(
             fleetUrl?.let { add("--host.fleet.url=$it") }
             retirementInterval?.let { add("--host.retirement.read-interval=$it") }
             incidentLoop.forEach { (key, value) -> add("--host.incident-loop.$key=$value") }
-            heartbeat?.let { (period, expiry) ->
-                add("--host.instance.heartbeat-period=$period")
-                add("--host.instance.heartbeat-expiry=$expiry")
+            lease?.let {
+                add("--host.lease.period=${it.period}")
+                add("--host.lease.expiry=${it.expiry}")
+                add("--host.lease.margin=${it.margin}")
+                add("--host.lease.idle-in-transaction-timeout=${it.idleInTransaction}")
+                add("--host.lease.statement-timeout=${it.statementTimeout}")
             }
         }.toTypedArray(),
     )

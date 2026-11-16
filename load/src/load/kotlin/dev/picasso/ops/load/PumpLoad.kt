@@ -8,7 +8,8 @@ import java.time.Duration
 /**
  * 핫스팟 3·4 — 실행 호스트 pump(`MissionHost.pumpOnce`)와 미들웨어 아웃박스 누적.
  *
- * 세트를 띄운 뒤 호스트의 주기 pump 를 멈추고(`MissionHost.close` 는 pump 스레드만 닫는다) 하네스가 `pumpOnce()` 를 직접 불러 잰다.
+ * 세트를 띄운 뒤 호스트의 주기 pump 를 멈추고([LoadStack.stopPump] — 리스는 그대로 쥐고 갱신한다) 하네스가 `pumpOnce()` 를 직접 불러 잰다.
+ * pump 의 기록은 리스 가드(`FOR SHARE` 확인·트랜잭션 지역 표식)를 지난다.
  * 한 주기(cycle)는 기체마다 InspectAsset(E0, 대상 하나) 작업 지시를 하나씩 내고, 가상 시계를 5초씩 밀며 pump 해 전부 정착시킨다.
  * 실행 E 는 낸 작업 지시 수(정착한 실행 수)다. 실행 호스트가 정착을 적고 picasso 메모리에서 놓으므로(`Middleware.forget`) 미들웨어의
  * 실행과 아웃박스는 남은 실행만큼이고, 검사점마다 그 크기와 호스트 맵 크기(`MissionHost.footprint`)를 적고 0 인지 확인한다. 검사점마다
@@ -32,7 +33,7 @@ object PumpLoad {
         for (plan in plans) GcPauses().use { pauses -> LoadStack(robots = plan.robots, withOps = combinedStations > 0 && plan == plans.last()).use { stack ->
             report.floor(stack, "세트(기체 ${plan.robots})")
             val host = stack.missionHost
-            host.close()
+            stack.stopPump()
             val middleware = MissionHost::class.java.getDeclaredField("middleware").apply { isAccessible = true }.get(host) as Middleware
             val stats = StatementStats(stack)
             var cycle = 0

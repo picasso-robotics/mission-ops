@@ -134,7 +134,7 @@ class RerunRestoreTest {
             val row = bench.get("/host/executions")["restore"]["rows"].single()
             assertEquals(listOf("JO-1", "RESTORED"), listOf(row["jobOrderId"].asText(), row["result"].asText()), row.toString())
             val rebuilt = row["executionId"].asText()
-            PostgresSupport.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
+            Fenced.execute("DROP TRIGGER refuse_settled ON mission.execution_journal_event")
             val after = bench.host.instanceId
             bench.eventually("다시 지은 실행의 정착 기록") { events("JO-1").last().take(3) == listOf("SETTLED", after, rebuilt) }
             val settled = JSON.readTree(
@@ -233,13 +233,13 @@ class RerunRestoreTest {
             bench.awaitPump()
             // 이전 인스턴스가 정착을 적은 뒤 다시 돈 일지 행. 그 임무 버전 행이 없어 다시 짓지 못한다. 기체에는 그 작업 지시의 태스크가 돈다.
             val order = JSON.writeValueAsString(JSON.readTree(inspect("JO-X", "T1" to "bay-7")))
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
                 VALUES ('JO-X', '$HUMANOID', '$order'::jsonb, 'InspectAsset', 9, 'mw-before', 'exec-7')
                 """.trimIndent(),
             )
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.execution_journal_event (job_order_id, kind, instance_id, execution_id, detail) VALUES " +
                     "('JO-X', 'SETTLED', 'mw-before', 'exec-7', 'FAILED'), ('JO-X', 'REOPENED', 'mw-before', 'exec-7', 'RUNNING')",
             )
@@ -267,12 +267,12 @@ class RerunRestoreTest {
     fun `다시 돎을 적지 못하면 제출은 500 이고 적을 때까지 pump 와 제출을 막아 개정판의 로봇 명령이 나가지 않으며 적으면 풀린다`() {
         HostBench().use { bench ->
             val executionId = bench.failedRack("JO-1")
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_revision() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'revision refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE TRIGGER refuse_revision BEFORE INSERT ON mission.execution_journal_revision FOR EACH ROW EXECUTE FUNCTION mission.refuse_revision()",
             )
             val revised = bench.post("/host/job-orders", request(rackV2("JO-1"), "candidates", HUMANOID))
@@ -286,7 +286,7 @@ class RerunRestoreTest {
             val blocked = bench.post("/host/job-orders", request(inspect("JO-2", "T1" to "bay-7"), "candidates", HUMANOID)).body!!
             assertEquals("REJECTED", blocked["result"].asText(), blocked.toString())
 
-            PostgresSupport.execute("DROP TRIGGER refuse_revision ON mission.execution_journal_revision")
+            Fenced.execute("DROP TRIGGER refuse_revision ON mission.execution_journal_revision")
             bench.eventually("다시 돎 기록") { bench.get("/host/executions")["journalBlockedExecutionIds"].isEmpty }
             assertEquals(listOf(2), revisions("JO-1"))
             assertEquals(listOf("SETTLED", "REOPENED"), events("JO-1").map { it[0] })
@@ -316,13 +316,13 @@ class RerunRestoreTest {
         ) { it.getString(1) }
 
         fun refuseSettled() {
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_settled() RETURNS trigger AS ${'$'}${'$'}
                 BEGIN IF NEW.kind = 'SETTLED' THEN RAISE EXCEPTION 'settled refused'; END IF; RETURN NEW; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute(
+            Fenced.execute(
                 "CREATE TRIGGER refuse_settled BEFORE INSERT ON mission.execution_journal_event FOR EACH ROW EXECUTE FUNCTION mission.refuse_settled()",
             )
         }

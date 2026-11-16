@@ -22,10 +22,10 @@ class SiteTimingsReaderTest {
 
     @BeforeTest
     fun standInView() {
-        PostgresSupport.execute("DROP SCHEMA IF EXISTS ops CASCADE")
-        PostgresSupport.execute("CREATE SCHEMA ops")
+        Fenced.execute("DROP SCHEMA IF EXISTS ops CASCADE")
+        Fenced.execute("CREATE SCHEMA ops")
         val values = SiteTimingsView.COLUMNS.zip(HostBench.STANDARD_TIMINGS).joinToString(", ") { (column, value) -> "$value::${column.type}" }
-        PostgresSupport.execute(
+        Fenced.execute(
             "CREATE VIEW ${SiteTimingsView.NAME} (${SiteTimingsView.COLUMNS.joinToString(", ") { it.name }}) AS VALUES ($values)",
         )
     }

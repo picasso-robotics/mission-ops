@@ -29,7 +29,7 @@ object ListLoad {
         LoadStack(robots = 50).use { stack ->
             report.floor(stack, "세트(기체 50)")
             val host = stack.missionHost
-            host.close()
+            stack.stopPump()
             val middleware = MissionHost::class.java.getDeclaredField("middleware").apply { isAccessible = true }.get(host) as Middleware
             var order = 0
             for (target in checkpoints) {

@@ -131,7 +131,7 @@ class LedgerCopyHostTest {
             assertEquals(0, count("incident_copy"))
             assertEquals(emptyList(), fileLines(export.resolve(LedgerExport.INCIDENTS)), "커밋 전에 게시했다")
 
-            PostgresSupport.execute("DROP TRIGGER refuse_insert ON mission.incident_copy")
+            Fenced.execute("DROP TRIGGER refuse_insert ON mission.incident_copy")
             bench.eventually("게시") { fileLines(export.resolve(LedgerExport.INCIDENTS)).size == 1 }
             assertEquals(lines(bench.host.instanceId).map { it.third }, fileLines(export.resolve(LedgerExport.INCIDENTS)))
 
@@ -172,7 +172,7 @@ class LedgerCopyHostTest {
             val again = bench.host.attemptApproval(attempt("JO-Q"))
             assertTrue(again is dev.picasso.middleware.ApprovalOutcome.Refused && again.reason.contains("실행 일지 저장 실패"), again.toString())
 
-            PostgresSupport.execute("DROP TRIGGER refuse_insert ON mission.execution_judgment_record")
+            Fenced.execute("DROP TRIGGER refuse_insert ON mission.execution_judgment_record")
             bench.eventually("다시 적기") { journaled("JO-P") == 1 }
             assertTrue(bench.get("/host/executions/summary")["journalBlockedExecutionIds"].isEmpty)
             val record = JSON.readTree(
@@ -233,7 +233,7 @@ class LedgerCopyHostTest {
             assertEquals(first, PostgresSupport.queryOne("SELECT instance_id FROM mission.remedy_approval") { it.getString(1) })
 
             // 이전 인스턴스의 같은 조치 승인(기체 + 조치 유형 열, 승인자 종류는 가르지 않는다)과 합산된다.
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 INSERT INTO mission.remedy_approval (instance_id, execution_id, job_order_id, robot_id, remedy_types, approver_id, approver_kind, approved_at, wall_clock_at)
                 VALUES ('mw-older', 'exec-3', 'JO-OLD', '$HUMANOID', '["pick_place"]', 'kim', 'PERSON', now(), now())
@@ -315,7 +315,7 @@ class LedgerCopyHostTest {
             // 결함 주입: 담는 쪽이 제안의 걸음을 조인해 WITHHELD 줄을 채우면 사본 표가 받지 않는다.
             val joined = stored.third.removeSuffix("}") + ""","steps":[{"skillType":"pick_place"}]}"""
             val e = assertFailsWith<SQLException> {
-                PostgresSupport.execute(
+                Fenced.execute(
                     "INSERT INTO mission.remedy_search_copy (instance_id, search_id, job_order_id, robot_id, outcome, wire_version, line) " +
                         "VALUES ('mw-x', 'search-1', 'JO-W', '$HUMANOID', 'WITHHELD', '9', '$joined')",
                 )
@@ -402,13 +402,13 @@ class LedgerCopyHostTest {
 
         /** [table] 의 INSERT 를 거부하는 트리거(`refuse_insert`). [condition] 을 주면 그 행만 거부한다. */
         fun refuseInserts(table: String, condition: String = "true") {
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE OR REPLACE FUNCTION mission.refuse_insert_$table() RETURNS trigger AS ${'$'}${'$'}
                 BEGIN IF $condition THEN RAISE EXCEPTION 'insert refused'; END IF; RETURN NEW; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_insert BEFORE INSERT ON mission.$table FOR EACH ROW EXECUTE FUNCTION mission.refuse_insert_$table()")
+            Fenced.execute("CREATE TRIGGER refuse_insert BEFORE INSERT ON mission.$table FOR EACH ROW EXECUTE FUNCTION mission.refuse_insert_$table()")
         }
 
         fun fileLines(file: java.nio.file.Path): List<String> = if (!Files.exists(file)) emptyList() else file.readLines().filter { it.isNotBlank() }

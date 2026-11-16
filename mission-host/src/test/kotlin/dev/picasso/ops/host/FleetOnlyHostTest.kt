@@ -174,7 +174,7 @@ class FleetOnlyHostTest {
             assertEquals("ACCEPTED", accepted["result"].asText(), accepted.toString())
             bench.eventually("플릿에 맡김") { fleet.dispatches == 1 }
             // 같은 작업 지시에 걸린 표시(다른 기체). 실제로는 개정판·재작업이 정착한 실행을 다시 돌릴 때 생기는 자리다.
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.robot_residual_hold (robot_id, job_order_id, execution_id, instance_id, unit_id) VALUES ('$HUMANOID', 'JO-F', 'exec-0', 'mw-old', 'pick')",
             )
             val markerId = PostgresSupport.queryAll("SELECT marker_id FROM mission.robot_residual_hold WHERE job_order_id = 'JO-F'") { it.getLong(1) }.single()
@@ -186,7 +186,7 @@ class FleetOnlyHostTest {
     }
 
     /** 작업 지시를 못 읽는 일지 행을 넣는다(기동 복원이 GAVE_UP 으로 포기한다). */
-    private fun insertUnreadable(jobOrderId: String, workMaster: String, version: Int? = null) = PostgresSupport.execute(
+    private fun insertUnreadable(jobOrderId: String, workMaster: String, version: Int? = null) = Fenced.execute(
         """
         INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
         VALUES ('$jobOrderId', '$HUMANOID', '{"jobOrderId":"$jobOrderId"}'::jsonb, '$workMaster', ${version ?: "NULL"}, 'mw-before', 'exec-9')
@@ -221,7 +221,7 @@ class FleetOnlyHostTest {
                 assertEquals(listOf("GAVE_UP"), PostgresSupport.queryAll("SELECT kind FROM mission.execution_journal_event WHERE job_order_id = '$id' ORDER BY event_id") { it.getString(1) })
             }
             // 빈손 확인도 같은 일지 판정이다(대칭).
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.robot_residual_hold (robot_id, job_order_id, execution_id, instance_id, unit_id) VALUES ('$QUADRUPED', 'WT-9', 'exec-9', 'mw-before', 'pick')",
             )
             val markerId = PostgresSupport.queryAll("SELECT marker_id FROM mission.robot_residual_hold WHERE job_order_id = 'WT-9'") { it.getLong(1) }.single()
@@ -242,7 +242,7 @@ class FleetOnlyHostTest {
             insertUnreadable("WT-11", PrepareSequencedRack.WORK_MASTER)
             bench.restartHost()
             assertEquals("GAVE_UP", bench.get("/host/executions")["restore"]["rows"].single()["result"].asText())
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.robot_residual_hold (robot_id, job_order_id, execution_id, instance_id, unit_id) VALUES ('$QUADRUPED', 'WT-11', 'exec-9', 'mw-before', 'pick')",
             )
             val markerId = PostgresSupport.queryAll("SELECT marker_id FROM mission.robot_residual_hold WHERE job_order_id = 'WT-11'") { it.getLong(1) }.single()

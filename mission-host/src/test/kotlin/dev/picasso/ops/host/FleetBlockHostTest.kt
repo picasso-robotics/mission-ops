@@ -145,7 +145,7 @@ class FleetBlockHostTest {
             """"parameters":{},"materialRequirements":[],"equipmentRequirements":[""" +
             """{"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},""" +
             """{"id":"SEQ-IN-02","equipmentUse":"destination","properties":{}}]}"""
-        PostgresSupport.execute(
+        Fenced.execute(
             """
             INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id)
             VALUES ('$jobOrderId', '$HUMANOID', '$order'::jsonb, '${DeliverContainer.WORK_MASTER}', NULL, 'mw-before', 'exec-9')

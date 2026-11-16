@@ -168,12 +168,12 @@ class FaultReleaseHostTest {
         HostBench().use { bench ->
             val blocked = bench.blocked()
             val executionId = blocked["executionId"].asText()
-            PostgresSupport.execute(
+            Fenced.execute(
                 """
                 CREATE FUNCTION mission.refuse_release() RETURNS trigger AS ${'$'}${'$'} BEGIN RAISE EXCEPTION 'release refused'; END; ${'$'}${'$'} LANGUAGE plpgsql
                 """.trimIndent(),
             )
-            PostgresSupport.execute("CREATE TRIGGER refuse_release BEFORE INSERT ON mission.execution_fault_release FOR EACH ROW EXECUTE FUNCTION mission.refuse_release()")
+            Fenced.execute("CREATE TRIGGER refuse_release BEFORE INSERT ON mission.execution_fault_release FOR EACH ROW EXECUTE FUNCTION mission.refuse_release()")
             val records = bench.recordCount("JO-1")
 
             val failed = bench.release(executionId, saw(blocked))
@@ -187,7 +187,7 @@ class FaultReleaseHostTest {
             assertEquals(records, bench.recordCount("JO-1"))
             assertEquals(emptyList(), bench.latestRecord("JO-1").acknowledgedFaults)
 
-            PostgresSupport.execute("DROP TRIGGER refuse_release ON mission.execution_fault_release")
+            Fenced.execute("DROP TRIGGER refuse_release ON mission.execution_fault_release")
             assertEquals("RELEASED", bench.release(executionId, saw(blocked)).body!!["result"].asText())
         }
     }
@@ -341,7 +341,7 @@ class FaultReleaseHostTest {
     @Test
     fun `감수 표는 덧붙이기만 하고 승인자는 사람뿐이며 요청 id 는 한 번이고 감수한 결함은 비지 않는다`() {
         HostBench().use { _ ->
-            PostgresSupport.execute(
+            Fenced.execute(
                 "INSERT INTO mission.execution_journal (job_order_id, robot_id, job_order, work_master_id, instance_id, execution_id) " +
                     "VALUES ('JO-1', 'r', '{}', 'InspectAsset', 'mw-1', 'exec-1')",
             )
@@ -349,15 +349,15 @@ class FaultReleaseHostTest {
             fun insert(faults: String = """[{"errorType":"E"}]""", kind: String = "PERSON", request: String = "'$requestId'") =
                 "INSERT INTO mission.execution_fault_release (instance_id, execution_id, job_order_id, faults, approver_id, approver_kind, reason, request_id) " +
                     "VALUES ('mw-1', 'exec-1', 'JO-1', '$faults', 'kim', '$kind', '확인', $request)"
-            PostgresSupport.execute(insert())
-            PostgresSupport.execute(insert(request = "NULL"))
-            PostgresSupport.execute(insert(request = "NULL"))
+            Fenced.execute(insert())
+            Fenced.execute(insert(request = "NULL"))
+            Fenced.execute(insert(request = "NULL"))
             listOf(
                 "UPDATE mission.execution_fault_release SET reason = 'x'",
                 "DELETE FROM mission.execution_fault_release",
                 "TRUNCATE mission.execution_fault_release",
             ).forEach { sql ->
-                val e = assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) }
+                val e = assertFailsWith<SQLException>(sql) { Fenced.execute(sql) }
                 assertTrue("덧붙이기만" in e.message!!, "$sql: ${e.message}")
             }
             listOf(
@@ -367,7 +367,7 @@ class FaultReleaseHostTest {
                 insert(faults = "[]", request = "NULL"),
                 insert(faults = """{"errorType":"E"}""", request = "NULL"),
                 insert(request = "NULL").replace("'JO-1'", "'JO-X'"),
-            ).forEach { sql -> assertFailsWith<SQLException>(sql) { PostgresSupport.execute(sql) } }
+            ).forEach { sql -> assertFailsWith<SQLException>(sql) { Fenced.execute(sql) } }
             assertEquals(3, releaseRows())
         }
     }
