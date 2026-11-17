@@ -7,6 +7,8 @@ import dev.picasso.middleware.NamedSignal
 import dev.picasso.middleware.SlotSignal
 import dev.picasso.middleware.mission.SignalKind
 import dev.picasso.middleware.mission.SignalSpec
+import dev.picasso.ops.host.lease.ControllerConfirmation
+import dev.picasso.ops.host.lease.HttpEpoch
 import dev.picasso.ops.host.lease.SendAuthority
 import java.net.URI
 import java.net.URLEncoder
@@ -72,12 +74,16 @@ data class SignalRelay(val status: Int, val contentType: String?, val body: Byte
  * @param writeTimeout 신호 조작의 요청 제한. [SIGNAL_WRITE_TIMEOUT] 의 까닭을 본다
  * @param authority 송신 직전 로컬 권위 확인(HA 설계 기록 §4.4 의 3). 신호 쓰기와 결함 주입 중계는 보내기 직전에 이것을 확인하고, 발행하는 리더가
  *   아니면 보내지 않고 `CommandNotSent` 를 던진다(REST 는 503). 읽기([fetch])는 막지 않는다.
+ * @param epoch 실을 제어자 세대와 밀려남 판정(HA 3단계 PR B1). 모든 요청에 세대 헤더를 싣고, 모든 응답에서 본문을 넘기기 전에 바닥값 헤더를 본다 —
+ *   실은 세대보다 높으면 밀려남이라 리더를 잃음으로 넘긴다. 신호 쓰기·결함 주입의 현장 응답(409 `STALE_CONTROLLER` 포함)은 그 판단 뒤 상태 코드와
+ *   본문 그대로 돌려준다 — «현장이 안 닿음» 으로 접지 않는다. 기본은 세대 0 이고 밀려남을 보지 않는다(시험).
  */
 class CellBandClient(
     baseUrl: String,
     private val timeout: Duration = Duration.ofSeconds(1),
     private val writeTimeout: Duration = SIGNAL_WRITE_TIMEOUT,
     private val authority: SendAuthority = SendAuthority.ALWAYS,
+    private val epoch: HttpEpoch = HttpEpoch("셀"),
 ) {
 
     private val base = baseUrl.trimEnd('/')
@@ -85,47 +91,89 @@ class CellBandClient(
     private val http = HttpClient.newBuilder().connectTimeout(timeout).build()
     private val json = ObjectMapper()
 
-    fun fetch(): CellSnapshot? = try {
-        val response = http.send(
-            HttpRequest.newBuilder(uri).timeout(timeout).GET().build(),
-            HttpResponse.BodyHandlers.ofByteArray(),
-        )
-        if (response.statusCode() == 200) parse(json.readTree(response.body())) else null
-    } catch (e: InterruptedException) {
-        Thread.currentThread().interrupt()
-        null
-    } catch (_: Exception) {
-        null
+    fun fetch(): CellSnapshot? {
+        val mine = epoch.forRequest(false, "셀 대역 읽기")
+        val response = try {
+            http.send(
+                HttpRequest.newBuilder(uri).timeout(timeout).header(HttpEpoch.EPOCH_HEADER, mine.toString()).GET().build(),
+                // 머리말을 받은 순간 바닥값을 본다(읽기 응답만으로도, 본문을 받다 끊겨도 밀려남이다).
+                epoch.observing(mine),
+            )
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+        return try {
+            if (response.statusCode() == 200) parse(json.readTree(response.body())) else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
      * `POST /cell/signals/{name}` 을 현장에 그대로 넘긴다. 현장이 안 닿으면(연결 실패, 시간 초과) `null` 이다. 이름은 경로
      * 조각으로 인코딩한다. 판정(404·400·403)은 현장의 몫이다.
      */
-    fun writeSignal(name: String, body: ByteArray): SignalRelay? =
-        authority.sending("셀 신호 쓰기 $name") { relay("$base/cell/signals/${URLEncoder.encode(name, StandardCharsets.UTF_8).replace("+", "%20")}", body) }
+    fun writeSignal(name: String, body: ByteArray): SignalRelay? = authority.sending("셀 신호 쓰기 $name") {
+        relay("$base/cell/signals/${URLEncoder.encode(name, StandardCharsets.UTF_8).replace("+", "%20")}", body, "셀 신호 쓰기 $name")
+    }
 
     /**
      * 기체 장애 주입 `POST /faults` 를 현장에 그대로 넘긴다(S4a 스펙 §6). 현장이 안 닿으면 `null` 이다. 종류의 해석과 판정은
      * 현장의 몫이다. 현장의 주입도 mimic 엔진 잠금을 기다리므로 신호 조작과 같은 요청 제한을 쓴다.
      */
-    fun injectFault(body: ByteArray): SignalRelay? = authority.sending("결함 주입 중계") { relay("$base/faults", body) }
+    fun injectFault(body: ByteArray): SignalRelay? = authority.sending("결함 주입 중계") { relay("$base/faults", body, "결함 주입 중계") }
 
-    private fun relay(url: String, body: ByteArray): SignalRelay? = try {
-        val response = http.send(
-            HttpRequest.newBuilder(URI.create(url))
-                .timeout(writeTimeout)
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
-                .build(),
-            HttpResponse.BodyHandlers.ofByteArray(),
-        )
-        SignalRelay(response.statusCode(), response.headers().firstValue("Content-Type").orElse(null), response.body())
-    } catch (e: InterruptedException) {
-        Thread.currentThread().interrupt()
-        null
-    } catch (_: Exception) {
-        null
+    /**
+     * 셀 면 인수 확인 `POST /cell/controller/confirm`(본문 `{}`, 세대는 헤더). 리스를 쥔 동안 호스트 잠금 밖의 전용 스레드([SiteFenceConfirmer])가 부른다 —
+     * 실행 준비의 조건이 아니다. 현장이 안 닿으면 `null` 이다. 붙잡은 세대가 바뀌었으면(잃음) 보내지 않고 `CommandNotSent` 를 던진다.
+     */
+    fun confirmController(): ControllerConfirmation? {
+        val mine = epoch.forRequest(true, "셀 인수 확인")
+        val response = try {
+            http.send(
+                HttpRequest.newBuilder(URI.create("$base$CONFIRM_PATH"))
+                    .timeout(HttpEpoch.CONFIRM_TIMEOUT)
+                    .header("Content-Type", "application/json")
+                    .header(HttpEpoch.EPOCH_HEADER, mine.toString())
+                    .POST(HttpRequest.BodyPublishers.ofByteArray("{}".toByteArray()))
+                    .build(),
+                epoch.observing(mine),
+            )
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+        return ControllerConfirmation.read(response.statusCode(), response.body(), json)
+    }
+
+    /**
+     * 변경 하나를 현장에 넘긴다. 연결 실패·시간 초과·본문 수신 실패만 `null`(현장이 안 닿음)이다. 바닥값은 머리말을 받은 순간에 본다(밀려남이면 잃음 —
+     * 그 뒤 본문 수신이 실패해 `null` 이어도 잃음은 이미 판단됐다). 응답을 받으면 상태 코드와 본문 그대로 돌려준다(세대 거부 409 가 «안 닿음» 으로 접히지 않게).
+     */
+    private fun relay(url: String, body: ByteArray, what: String): SignalRelay? {
+        val mine = epoch.forRequest(true, what)
+        val response = try {
+            http.send(
+                HttpRequest.newBuilder(URI.create(url))
+                    .timeout(writeTimeout)
+                    .header("Content-Type", "application/json")
+                    .header(HttpEpoch.EPOCH_HEADER, mine.toString())
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                    .build(),
+                epoch.observing(mine),
+            )
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+        return SignalRelay(response.statusCode(), response.headers().firstValue("Content-Type").orElse(null), response.body())
     }
 
     companion object {
@@ -135,6 +183,9 @@ class CellBandClient(
          * 된다. 운영 서비스의 호스트 요청 제한(5초)보다는 짧아야 호스트의 503 이 운영 서비스에 닿는다.
          */
         val SIGNAL_WRITE_TIMEOUT: Duration = Duration.ofSeconds(4)
+
+        /** 셀 면 인수 확인 경로. */
+        const val CONFIRM_PATH = "/cell/controller/confirm"
 
         /** 본문 모양이 어긋나면 예외다. [fetch] 가 그것을 «스냅숏 없음» 으로 접는다. `signals` 칸이 없으면 신호 사양을 모른다. */
         fun parse(node: JsonNode): CellSnapshot =

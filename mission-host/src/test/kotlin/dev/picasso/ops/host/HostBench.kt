@@ -2,6 +2,7 @@ package dev.picasso.ops.host
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import dev.picasso.client.PicassoClient
 import dev.picasso.middleware.ClientRobotPort
@@ -84,6 +85,8 @@ class HostBench(
     private val wiring: ((HostBench, dev.picasso.ops.host.lease.HostLeadership, HostClock) -> RobotPort)? = null,
     /** 호스트 실행 인자 뒤에 더할 것(`--키=값`). */
     private val extraArgs: List<String> = emptyList(),
+    /** 참이면 셀 대역 대역이 요청을 여러 스레드로 받는다(한 요청을 붙잡아도 다른 요청이 돈다). 기본은 JDK 기본 실행기(직렬)다. */
+    private val concurrentCell: Boolean = false,
 ) : AutoCloseable {
 
     /** [gated] 일 때 스냅숏을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
@@ -275,11 +278,36 @@ class HostBench(
     /** 셀 대역 대역이 받은 장애 주입(Content-Type, 본문). */
     val faultWrites = CopyOnWriteArrayList<Pair<String?, String>>()
 
+    /**
+     * 셀 대역 대역이 모든 응답에 싣는 바닥값 헤더(`X-Picasso-Controller-Epoch-Floor`). 0 이면 싣지 않는다 — 대조하지 않는 현장(기본, 기존 시험의 거동)이다.
+     * 시험이 올리면 다음 셀 읽기부터 호스트가 그 값을 본다(읽기 응답만으로 밀려남).
+     */
+    @Volatile
+    var cellFloor: Long = 0
+
+    /** 주면 셀 대역 대역이 신호 쓰기 응답에만 [cellFloor] 대신 이 바닥값 헤더를 싣는다(셀 읽기는 그대로). */
+    @Volatile
+    var signalFloor: Long? = null
+
+    /** 셀 대역 대역이 받은 요청의 (경로, 세대 헤더). 셀 읽기·신호 쓰기·인수 확인·장애 주입 모두다. */
+    val cellEpochs = CopyOnWriteArrayList<Pair<String, String?>>()
+
+    /** 셀 면 인수 확인(`POST /cell/controller/confirm`)을 받을 때 답하기 전에 도는 갈고리. 확인이 호스트 잠금 밖인지 볼 때 막는다. */
+    @Volatile
+    var onCellConfirm: (() -> Unit)? = null
+
+    private fun HttpExchange.stampFloor() {
+        cellEpochs += requestURI.path to requestHeaders.getFirst(dev.picasso.ops.host.lease.HttpEpoch.EPOCH_HEADER)
+        val floor = signalFloor?.takeIf { requestURI.path.startsWith("/cell/signals/") } ?: cellFloor
+        floor.takeIf { it > 0 }?.let { responseHeaders.add(dev.picasso.ops.host.lease.HttpEpoch.FLOOR_HEADER, it.toString()) }
+    }
+
     private val cell: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0).apply {
         createContext("/faults") { exchange ->
             faultWrites += exchange.requestHeaders.getFirst("Content-Type") to exchange.requestBody.readAllBytes().toString(Charsets.UTF_8)
             val (status, body) = faultReply
             val bytes = body.toByteArray()
+            exchange.stampFloor()
             exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(status, bytes.size.toLong())
             exchange.responseBody.write(bytes)
@@ -287,7 +315,13 @@ class HostBench(
         }
         createContext("/cell") { exchange ->
             val path = exchange.requestURI.path
-            val (status, body) = if (path.startsWith("/cell/signals/") && exchange.requestMethod == "POST") {
+            exchange.stampFloor()
+            val (status, body) = if (path == dev.picasso.ops.host.cell.CellBandClient.CONFIRM_PATH && exchange.requestMethod == "POST") {
+                // 대조하지 않는 현장의 인수 확인 답이다. 셀 읽기 갈고리(onCellFetch)는 건드리지 않는다.
+                exchange.requestBody.readAllBytes()
+                onCellConfirm?.invoke()
+                200 to """{"controllerEpochFloor":"$cellFloor","fenceStatus":"UNSPECIFIED","receiverBootId":"bench"}"""
+            } else if (path.startsWith("/cell/signals/") && exchange.requestMethod == "POST") {
                 signalWrites += Triple(
                     path.removePrefix("/cell/signals/"),
                     exchange.requestHeaders.getFirst("Content-Type"),
@@ -307,6 +341,7 @@ class HostBench(
             exchange.responseBody.write(bytes)
             exchange.close()
         }
+        if (concurrentCell) executor = java.util.concurrent.Executors.newCachedThreadPool { Thread(it).apply { isDaemon = true } }
         start()
     }
 

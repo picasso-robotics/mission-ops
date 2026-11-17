@@ -11,6 +11,7 @@ import dev.picasso.middleware.PrefetchingRobotPort
 import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.ops.host.cell.CellBandClient
+import dev.picasso.ops.host.cell.SiteFenceConfirmer
 import dev.picasso.ops.host.fleet.HostFleetPort
 import dev.picasso.ops.host.fleet.HttpFleetPort
 import dev.picasso.ops.host.incident.ApprovalWindow
@@ -19,6 +20,7 @@ import dev.picasso.ops.host.lease.GatedRobotPort
 import dev.picasso.ops.host.lease.HostExit
 import dev.picasso.ops.host.lease.HostLease
 import dev.picasso.ops.host.lease.HostLeadership
+import dev.picasso.ops.host.lease.HttpEpoch
 import dev.picasso.ops.host.lease.LeaseConnections
 import dev.picasso.ops.host.lease.LeaseTiming
 import dev.picasso.ops.host.lease.SendAuthority
@@ -138,11 +140,13 @@ open class MissionHostApplication {
      * 선언이다. 주소가 틀린 모양(http(s) 아님)이면 기동이 멈춘다. 현장이 지금 안 닿는 것은 기동을 막지 않는다(pump 가 다음 라운드에 다시 본다).
      *
      * 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다. 닫는 것은 Spring 이 추론한 `close` 다([HostFleetPort]).
+     *
+     * 요청마다 리스 세대를 싣고 응답 바닥값이 그보다 높으면(밀려남) 리더를 잃음으로 넘긴다([epochOf] — 기체 포트와 같은 공급·같은 판정).
      */
     @Bean
     @ConditionalOnMissingBean(AmrFleetPort::class)
     open fun fleetPort(@Value("\${host.fleet.url}") url: String, clock: HostClock, leadership: HostLeadership): AmrFleetPort =
-        fleetPortOf(url, clock, leadership)
+        fleetPortOf(url, clock, leadership, epochOf("플릿", leadership))
 
     /**
      * 미들웨어 보존 상한([MissionHost.RETENTION], 놓은 작업 지시 표시는 `EVICT` 선언). 운영 설정으로 열지 않는다. 시험은 [builder] 로 작은 상한을
@@ -152,10 +156,33 @@ open class MissionHostApplication {
     @ConditionalOnMissingBean(Retention::class)
     open fun hostRetention(): Retention = MissionHost.RETENTION
 
-    /** 셀 대역. 신호 쓰기와 결함 주입 중계는 보내기 직전에 리더를 확인한다. */
+    /**
+     * 셀 대역. 신호 쓰기와 결함 주입 중계는 보내기 직전에 리더를 확인한다. 요청마다 리스 세대를 싣고 응답 바닥값이 그보다 높으면 리더를 잃음으로
+     * 넘긴다([epochOf]).
+     */
     @Bean
     open fun cellBand(@Value("\${host.cell.url}") url: String, leadership: HostLeadership): CellBandClient =
-        CellBandClient(url, authority = leadership)
+        CellBandClient(url, authority = leadership, epoch = epochOf("셀", leadership))
+
+    /**
+     * 현장 HTTP 면 인수 확인(`host.fence-confirm.interval`·`.retry`). 리스를 쥔 동안 호스트 잠금 밖의 전용 스레드에서 획득 직후, 확정 전에는 재시도 간격마다,
+     * 확정 뒤에는 간격마다 현장 셀 키와(플릿 포트가 현장 플릿 면이면) 플릿 키의 바닥값을 이 세대로 올린다([SiteFenceConfirmer]). 실행 준비의 조건이 아니고
+     * 플릿 준비에도 쓰지 않는다.
+     */
+    @Bean(destroyMethod = "close")
+    open fun siteFenceConfirmer(
+        cellBand: CellBandClient,
+        fleet: AmrFleetPort,
+        leadership: HostLeadership,
+        @Value("\${host.fence-confirm.interval}") interval: Duration,
+        @Value("\${host.fence-confirm.retry}") retry: Duration,
+    ): SiteFenceConfirmer {
+        val targets = buildMap<String, () -> dev.picasso.ops.host.lease.ControllerConfirmation?> {
+            put(SiteFenceConfirmer.CELL, cellBand::confirmController)
+            (fleet as? HostFleetPort)?.confirm?.let { put(SiteFenceConfirmer.FLEET, it) }
+        }
+        return SiteFenceConfirmer(targets, { leadership.claim()?.generation }, interval, retry).start()
+    }
 
     /**
      * `mission` 마이그레이션. 공용 풀이 아니라 같은 DB 주소·계정의 따로 연 연결로 돈다([migrationDataSource]) — 풀 연결에는 리스용 세션 제한
@@ -349,8 +376,8 @@ open class MissionHostApplication {
          * 일시 장애로 보아 경고만 남기고 뜬다(현장이 늦게 뜨거나 잠시 아플 수 있다). 맡기기·취소는 송신 스레드에서 [authority] 를 확인한다
          * ([GatedFleetPort]).
          */
-        fun fleetPortOf(url: String, clock: HostClock, authority: SendAuthority = SendAuthority.ALWAYS): AmrFleetPort {
-            val port = url.trim().takeIf { it.isNotEmpty() }?.let { HttpFleetPort(it) } ?: return AmrFleetPort.None
+        fun fleetPortOf(url: String, clock: HostClock, authority: SendAuthority = SendAuthority.ALWAYS, epoch: HttpEpoch = HttpEpoch("플릿")): AmrFleetPort {
+            val port = url.trim().takeIf { it.isNotEmpty() }?.let { HttpFleetPort(it, epoch = epoch) } ?: return AmrFleetPort.None
             when (val status = port.probe()) {
                 // 안 닿음과 5xx 는 일시 장애일 수 있다(현장이 늦게 뜨거나 잠시 아픔) — 경고만 하고 뜬다. pump 가 다음 라운드에 다시 본다.
                 null -> org.slf4j.LoggerFactory.getLogger(MissionHostApplication::class.java).warn("플릿 세계 면이 아직 안 닿는다(기동은 계속): {}", port.url)
@@ -359,8 +386,14 @@ open class MissionHostApplication {
                 // 그 밖(4xx·3xx 등)은 오설정이 확실하다 — 그 주소에 플릿 세계 면이 없다.
                 else -> throw IllegalArgumentException("플릿 주소(host.fleet.url)가 현장 플릿 세계 면이 아니다: GET ${port.url}/fleet/world → HTTP $status")
             }
-            return HostFleetPort(GatedFleetPort(port, authority), clock, port.url)
+            return HostFleetPort(GatedFleetPort(port, authority), clock, port.url, port::confirmController)
         }
+
+        /**
+         * 현장 HTTP 면([receiver] = `플릿`·`셀`)에 싣는 세대와 밀려남 판정. 기체 gRPC 포트([clientPort])와 같은 공급([HostLeadership.controllerEpoch] — 대기·잃음이면
+         * 0, 처음 본 0 아닌 값을 붙잡음)과 같은 판정([HostLeadership.superseded] — 밀려남만 잃음)이다.
+         */
+        fun epochOf(receiver: String, leadership: HostLeadership): HttpEpoch = HttpEpoch(receiver, leadership::controllerEpoch, leadership::superseded)
 
         /** 작업 허가 대응 경로에서 포트를 짓는다. 비어 있으면 `null`(선언하지 않은 현장)이다. 경로는 작업 디렉터리 기준이다. */
         fun workPermits(mapping: String, clock: HostClock): CellWorkPermits? =

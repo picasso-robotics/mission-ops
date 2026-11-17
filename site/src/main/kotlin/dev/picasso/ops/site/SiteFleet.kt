@@ -3,6 +3,7 @@ package dev.picasso.ops.site
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpExchange
+import dev.picasso.contracts.wire.FencedCall
 import dev.picasso.fleetmimic.AmrFleetMimic
 import dev.picasso.middleware.TransportHandle
 import dev.picasso.middleware.TransportOrder
@@ -52,13 +53,21 @@ sealed interface FleetWorldWrite {
  * - `GET /fleet/world` → `{places, blocked, dispatches}`. `places` 는 인계 자리 순서의 `{location, containerId, placedAt}` 이다.
  * - `POST /fleet/world/{place|clear|block|unblock}` `{location[, containerId]}` → `GET /fleet/world` 와 같은 본문.
  *
+ * - `POST /fleet/controller/confirm` `{}` → `{controllerEpochFloor, fenceStatus, receiverBootId}`. 제어자 세대 인수 확인([SiteHttpFence.confirm]).
+ *
  * 세계는 프로세스 메모리에만 있다. 현장을 재기동하면 장부가 비고 호스트가 든 핸들은 «모르는 운반» 이 된다(보장 아님, `docs/guarantees.md`).
+ *
+ * ## 제어자 세대 대조([SiteHttpFence], 키 [SiteHttpFence.FLEET])
+ *
+ * 맡기기·취소만 요청 헤더의 세대를 맞댄다. 찾기·상태·세계 읽기와 세계 채우기(`/fleet/world/...`, 현장 운영)는 맞대지 않는다. 모든 응답에 바닥값 헤더를
+ * 싣는다. 대조가 막은 요청(409·503)은 [handle] 의 `changed` 를 부르지 않는다. 통과한 변경의 표지는 세계 변경과 셀 투영(`changed`)이 끝난 뒤 닫는다.
  */
 class SiteFleet(
     mimic: MimicCli.Started,
     val places: List<String>,
     containers: Map<String, String> = emptyMap(),
     stepEvery: Duration = STEP,
+    private val fence: SiteHttpFence = SiteHttpFence(),
 ) {
     init {
         require(places.distinct().size == places.size) { "인계 자리 id 가 겹친다: $places" }
@@ -125,11 +134,19 @@ class SiteFleet(
         return FleetWorldWrite.Written
     }
 
-    /** `/fleet` 아래 요청 하나. 셀 대역의 서버가 넘긴다. 세계를 바꿀 수 있는 요청이면 [changed] 를 부른다(셀 투영 갱신). */
+    /**
+     * `/fleet` 아래 요청 하나. 셀 대역의 서버가 넘긴다. 세계를 바꿀 수 있는 요청이면 [changed] 를 부른다(셀 투영 갱신) — 대조가 막은 요청, 세대 헤더가
+     * 틀린 요청, 인수 확인(어떤 결과든 세계를 바꾸지 않음)은 부르지 않는다. 통과한 변경의 표지는 [changed] 가 끝난 뒤에 닫는다.
+     */
     fun handle(exchange: HttpExchange, changed: () -> Unit) {
         try {
-            val (status, body) = route(exchange)
-            if (exchange.requestMethod != "GET") changed()
+            val scope = fence.scope(exchange, SiteHttpFence.FLEET)
+            val (status, body) = scope.use {
+                val reply = scope.malformed?.let { 400 to rejection(BAD_REQUEST, it) } ?: route(exchange, scope)
+                if (exchange.requestMethod != "GET" && scope.mayHaveChanged && exchange.requestURI.rawPath != CONFIRM) changed()
+                reply
+            }
+            scope.stamp()
             if (body.isNotEmpty()) exchange.responseHeaders.add("Content-Type", "application/json")
             exchange.sendResponseHeaders(status, if (body.isEmpty()) -1 else body.size.toLong())
             if (body.isNotEmpty()) exchange.responseBody.write(body)
@@ -138,12 +155,17 @@ class SiteFleet(
         }
     }
 
-    private fun route(exchange: HttpExchange): Pair<Int, ByteArray> {
+    private fun route(exchange: HttpExchange, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> {
         val path = exchange.requestURI.rawPath
         val method = exchange.requestMethod
         return when {
+            path == CONFIRM -> if (method == "POST") {
+                posted(exchange) { _ -> fence.confirmReply(SiteHttpFence.FLEET, scope.requested, boot) }
+            } else {
+                notAllowed(exchange, "POST")
+            }
             path == TRANSPORTS -> when (method) {
-                "POST" -> posted(exchange) { node -> dispatched(node) }
+                "POST" -> posted(exchange) { node -> dispatched(node, scope) }
                 "GET" -> found(exchange.requestURI.rawQuery)
                 else -> notAllowed(exchange, "GET, POST")
             }
@@ -151,7 +173,9 @@ class SiteFleet(
                 val handle = decode(path.removePrefix("$TRANSPORTS/").removeSuffix(CANCEL_SUFFIX))
                 if (handle.isEmpty() || '/' in handle) return 404 to ByteArray(0)
                 if (method != "POST") return notAllowed(exchange, "POST")
-                posted(exchange) { _ -> 200 to write(linkedMapOf("accepted" to (internal(handle)?.let(world::cancel) ?: false))) }
+                posted(exchange) { _ ->
+                    scope.mutation(FencedCall.CANCEL) { 200 to write(linkedMapOf("accepted" to (internal(handle)?.let(world::cancel) ?: false))) }
+                }
             }
             path.startsWith("$TRANSPORTS/") -> {
                 val handle = decode(path.removePrefix("$TRANSPORTS/"))
@@ -177,7 +201,7 @@ class SiteFleet(
         }
     }
 
-    private fun dispatched(node: JsonNode): Pair<Int, ByteArray> {
+    private fun dispatched(node: JsonNode, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> {
         val reference = node.text("reference")
         val containerId = node.text("containerId")
         val source = node.text("source")
@@ -185,7 +209,9 @@ class SiteFleet(
         if (reference == null || containerId == null || source == null || destination == null) {
             return 400 to rejection(BAD_REQUEST, "본문이 {reference, containerId, source, destination} 문자열 넷이 아니다")
         }
-        return 200 to write(linkedMapOf("handle" to dispatch(TransportOrder(reference, containerId, source, destination))?.let(::external)))
+        return scope.mutation(FencedCall.START) {
+            200 to write(linkedMapOf("handle" to dispatch(TransportOrder(reference, containerId, source, destination))?.let(::external)))
+        }
     }
 
     private fun found(query: String?): Pair<Int, ByteArray> {
@@ -242,6 +268,9 @@ class SiteFleet(
         const val PATH = "/fleet"
         const val TRANSPORTS = "/fleet/transports"
         const val WORLD = "/fleet/world"
+
+        /** 플릿 면의 제어자 세대 인수 확인. */
+        const val CONFIRM = "/fleet/controller/confirm"
         private const val CANCEL_SUFFIX = "/cancel"
 
         const val PLACE = "place"
