@@ -169,12 +169,12 @@ class HostEpochTakeoverTest {
                 assertTrue(old.lostReason!!.startsWith("수신자가 더 높은 세대로 넘겨받았다고 알렸다"), old.lostReason)
 
                 // 세대를 싣지 않은 명령(설정 오류)은 그 명령만 거절된다 — 새 보유자는 잃지 않는다.
-                val history = bench.history(HUMANOID)
+                // 새 보유자는 humanoid-01 을 열어 exec-1 을 이어 가므로 그 기체의 이력은 이 사이에도 정당하게 자랄 수 있다 — 거절된 태스크가 없는지만 본다.
                 val unfenced = MissionHostApplication.clientPort(bench.channel(), { 0L }, next::superseded)
                 val reply = unfenced.start(HUMANOID, "JO-Z#T1.travel", 1, "navigate_to", emptyMap())
                 assertEquals(RejectionCode.REJECTION_CODE_STALE_CONTROLLER, reply.rejection.code)
                 assertEquals(0L, reply.rejection.requestedControllerEpoch)
-                assertEquals(history, bench.history(HUMANOID))
+                assertTrue("JO-Z#T1.travel" !in bench.history(HUMANOID).keys, bench.history(HUMANOID).keys.toString())
                 bench.idlePumps()
                 assertEquals(LeaderState.HOLDING, next.state)
             } finally {
