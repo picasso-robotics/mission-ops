@@ -10,6 +10,7 @@ import dev.picasso.middleware.Retention
 import dev.picasso.middleware.RobotPort
 import dev.picasso.middleware.RobotSnapshot
 import dev.picasso.mimic.cli.MimicCli
+import dev.picasso.contracts.wire.ControllerFence
 import io.grpc.ManagedChannel
 import io.grpc.ManagedChannelBuilder
 import dev.picasso.ops.host.lease.HostExit
@@ -59,6 +60,10 @@ import java.util.concurrent.CopyOnWriteArrayList
  * @param retention 주면 호스트가 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(운영 설정이 아니라 [MissionHostApplication.builder] 로 넣는다).
  * @param fleet 주면 호스트가 `host.fleet.url` 대신 이것을 플릿 포트로 쓴다(프로세스 안의 플릿 미믹을 [MissionHostApplication.builder] 로 넣는다).
  * @param fleetUrl 주면 `host.fleet.url` 을 이 값으로 둔다(배선 시험). 안 주면 기본 설정의 빈 값이다(플릿 포트 없음).
+ * @param fence mimic 의 제어자 세대 대조(picasso ADR 54). 기본은 대조하지 않는다(`UNFENCED`) — 기존 시험의 거동 그대로다.
+ * @param split 주면 quadruped-01 을 이 대조로 띄운 **둘째 mimic**(수신자 둘째)에 두고, humanoid-01 만 첫 mimic([fence])에 둔다. 호스트는 기체마다 그
+ *   수신자에 붙는 운영 배선([MissionHostApplication.clientPort], 세대 공급·밀려남)으로 짓는다. 시계는 둘을 함께 민다([advance]).
+ * @param wiring 주면 기체 포트를 이것으로 짓는다([RobotWiring], 리더를 받는다). [gated]·[split] 보다 앞선다.
  */
 class HostBench(
     private val mockVirtualLimit: Duration? = null,
@@ -74,6 +79,11 @@ class HostBench(
     /** 바꾸면 다음 [startHost]·[restartHost] 부터 미친다(플릿 포트 없이 재기동 → 붙여 재기동). */
     var fleet: AmrFleetPort? = null,
     private val fleetUrl: String? = null,
+    private val fence: ControllerFence = ControllerFence(),
+    private val split: ControllerFence? = null,
+    private val wiring: ((HostBench, dev.picasso.ops.host.lease.HostLeadership, HostClock) -> RobotPort)? = null,
+    /** 호스트 실행 인자 뒤에 더할 것(`--키=값`). */
+    private val extraArgs: List<String> = emptyList(),
 ) : AutoCloseable {
 
     /** [gated] 일 때 스냅숏을 못 읽는 기체. 바꾸면 다음 호출부터 미친다. */
@@ -81,11 +91,33 @@ class HostBench(
 
     private val channels = CopyOnWriteArrayList<ManagedChannel>()
 
-    /** mimic 에 붙는 새 포트. 시험이 미들웨어 밖에서 태스크를 직접 낼 때(고아 태스크) 쓴다. */
+    /** mimic 에 붙는 새 포트. 시험이 미들웨어 밖에서 태스크를 직접 낼 때(고아 태스크) 쓴다. 세대를 싣지 않는다(대조하는 mimic 은 명령을 거절한다). */
     fun clientPort(clientId: String = MissionHostApplication.CLIENT_ID): ClientRobotPort {
         val channel = ManagedChannelBuilder.forAddress("127.0.0.1", mimic.server.port).usePlaintext().build()
         channels += channel
         return ClientRobotPort(PicassoClient(channel, clientId))
+    }
+
+    /** [started] mimic 에 붙는 새 채널. 닫는 것은 이 세트다. */
+    fun channel(started: MimicCli.Started = mimic): ManagedChannel =
+        ManagedChannelBuilder.forAddress("127.0.0.1", started.server.port).usePlaintext().build().also { channels += it }
+
+    /** 기체가 든 mimic([split] 이면 quadruped-01 은 둘째). */
+    fun mimicOf(robotId: String): MimicCli.Started = if (robotId == QUADRUPED) second ?: mimic else mimic
+
+    /** 운영 배선으로 짓는 기체 포트. 기체마다 그 수신자의 채널에 [MissionHostApplication.clientPort] 를 붙이고 [HostRobotPort] 로 감싼다. */
+    fun hostedPort(leadership: dev.picasso.ops.host.lease.HostLeadership, clock: HostClock, wrap: (String, RobotPort) -> RobotPort = { _, p -> p }): RobotPort {
+        val robots = listOf(HUMANOID, QUADRUPED)
+        val routes = robots.associateWith { robot ->
+            wrap(robot, MissionHostApplication.clientPort(channel(mimicOf(robot)), leadership::controllerEpoch, leadership::superseded))
+        }
+        return HostRobotPort(dev.picasso.ops.host.lease.GatedRobotPort(RoutedRobotPort(routes), leadership), clock)
+    }
+
+    /** 가상 시계를 민다(둘째 mimic 이 있으면 함께). */
+    fun advance(by: Duration) {
+        mimic.server.advance(by)
+        second?.server?.advance(by)
     }
 
     /** [gated] 일 때 호스트가 하위에 낸 `StartTask`(기체, 태스크 id). 같은 태스크 id 의 재전송도 하나씩 든다. */
@@ -183,17 +215,33 @@ class HostBench(
 
     val mimic: MimicCli.Started = checkNotNull(
         MimicCli().start(
-            robots = mapOf(
-                HUMANOID to ROOT.resolve("picasso/profile/profiles/humanoid-a.json"),
-                QUADRUPED to ROOT.resolve("picasso/profile/profiles/quadruped-b.json"),
-            ),
+            robots = buildMap {
+                put(HUMANOID, ROOT.resolve("picasso/profile/profiles/humanoid-a.json"))
+                if (split == null) put(QUADRUPED, ROOT.resolve("picasso/profile/profiles/quadruped-b.json"))
+            },
             schema = ROOT.resolve("picasso/profile/schema/capability-profile.schema.json"),
             port = 0,
             virtual = true,
             seed = 0L,
             err = System.err,
+            fence = fence,
         ),
     ) { "mimic 기동 거부" }
+
+    /** [split] 일 때 quadruped-01 을 든 둘째 mimic(다른 수신자). */
+    val second: MimicCli.Started? = split?.let { secondFence ->
+        checkNotNull(
+            MimicCli().start(
+                robots = mapOf(QUADRUPED to ROOT.resolve("picasso/profile/profiles/quadruped-b.json")),
+                schema = ROOT.resolve("picasso/profile/schema/capability-profile.schema.json"),
+                port = 0,
+                virtual = true,
+                seed = 0L,
+                err = System.err,
+                fence = secondFence,
+            ),
+        ) { "둘째 mimic 기동 거부" }
+    }
 
     /** 셀 대역 대역이 낼 본문. 바꾸면 다음 pump 부터 호스트가 읽는다. */
     @Volatile
@@ -318,7 +366,12 @@ class HostBench(
     }
 
     private fun startHost(exit: HostExit): ConfigurableApplicationContext = MissionHostApplication.builder(
-        HostClock { now() }, if (gated) gatedPort() else null, retention, fleet, exit,
+        HostClock { now() }, if (gated && wiring == null && split == null) gatedPort() else null, retention, fleet, exit,
+        when {
+            wiring != null -> RobotWiring { leadership, clock -> wiring.invoke(this, leadership, clock) }
+            split != null -> RobotWiring { leadership, clock -> hostedPort(leadership, clock) }
+            else -> null
+        },
     ).run(
         *buildList {
             add("--server.port=0")
@@ -336,6 +389,7 @@ class HostBench(
             fleetUrl?.let { add("--host.fleet.url=$it") }
             retirementInterval?.let { add("--host.retirement.read-interval=$it") }
             incidentLoop.forEach { (key, value) -> add("--host.incident-loop.$key=$value") }
+            addAll(extraArgs)
             lease?.let {
                 add("--host.lease.period=${it.period}")
                 add("--host.lease.expiry=${it.expiry}")
@@ -472,6 +526,7 @@ class HostBench(
             cell.stop(0)
             channels.forEach { it.shutdownNow() }
             mimic.server.shutdown()
+            second?.server?.shutdown()
         }
     }
 

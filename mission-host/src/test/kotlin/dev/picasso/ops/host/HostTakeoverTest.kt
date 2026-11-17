@@ -137,12 +137,18 @@ class HostTakeoverTest {
             assertEquals(503, bench.post("/host/job-orders", request(inspect("JO-1", "T1" to "bay-7"), "candidates", HUMANOID)).status)
             assertTrue(first != second && second != third)
 
+            // 확인 안 된 인수의 연쇄(첫째 발행 → 둘째 관측 → 셋째): 셋째의 확인은 마지막으로 발행을 연 첫째를 미해소 원천 보유자로 지목해야 한다(둘째는
+            // 멈춤을 적었다). 앞 보유자 하나만 본 확인은 대상이 다르다.
+            val legacy = """{"confirmedBy":"kim","reason":"옛 호스트 종료 확인","instanceId":"$third","generation":3,"previousHolder":"$second"}"""
+            assertEquals("TAKEOVER_TARGET_CHANGED", bench.post("/host/leader/takeover-confirmation", legacy).body!!["error"].asText())
+            assertEquals(listOf(first), bench.get("/host/leader")["unresolvedHolders"].map { it.asText() })
+
             // 확인이 확인 행만 적고 발행 표시에서 실패하면(연결 장애) 같은 대상의 재요청이 그 전이를 이어 간다.
             bench.leadership.lease.beforeMark = {
                 bench.leadership.lease.beforeMark = null
                 throw java.sql.SQLException("시험: 발행 표시 직전 연결 장애", "08006")
             }
-            val body = """{"confirmedBy":"kim","reason":"옛 호스트 종료 확인","instanceId":"$third","generation":3,"previousHolder":"$second"}"""
+            val body = """{"confirmedBy":"kim","reason":"옛 호스트 종료 확인","instanceId":"$third","generation":3,"previousHolder":"$second","unresolvedHolders":["$first"]}"""
             assertEquals(500, bench.post("/host/leader/takeover-confirmation", body).status)
             assertEquals(1, PostgresSupport.queryOne("SELECT count(*) FROM mission.host_takeover_confirmation WHERE generation = 3") { it.getInt(1) })
             assertEquals(LeaderState.HOLDING, bench.leadership.state)

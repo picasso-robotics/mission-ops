@@ -335,6 +335,32 @@ class HostLeaseTest {
     }
 
     @Test
+    fun `V19 에서 V20 으로 올리면 지금 세대 한 줄과 발행 표시를 보유자 이력에 옮기고 그 앞 세대는 비어 있으며 다음 획득이 이어 적는다`() {
+        PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
+        org.flywaydb.core.Flyway.configure().configuration(HostSchema.flyway(ds).configuration).target("19").load().migrate()
+        // V19 아래에서 세대 3 을 쥔 보유자가 발행을 열었고 리스는 이미 만료했다.
+        PostgresSupport.execute("UPDATE mission.host_lease SET holder = 'mw-old', generation = 3 WHERE role = 'host'")
+        PostgresSupport.execute("UPDATE mission.host_lease_term SET issuing = true, expires_at = clock_timestamp() - interval '1 second' WHERE role = 'host'")
+        assertEquals(1, HostSchema.flyway(ds).migrate().migrationsExecuted)
+        fun grants() = PostgresSupport.queryAll("SELECT generation, holder, issuing_at IS NOT NULL FROM mission.host_lease_grant ORDER BY generation") {
+            "${it.getLong(1)}|${it.getString(2)}|${it.getBoolean(3)}"
+        }
+        assertEquals(listOf("3|mw-old|true"), grants())
+        // 옛 확인 행에는 빈 지목 집합·이력 완전이 채워진다(칸 기본값).
+        val defaults = PostgresSupport.queryAll(
+            "SELECT column_name, column_default FROM information_schema.columns WHERE table_schema = 'mission' AND table_name = 'host_takeover_confirmation' " +
+                "AND column_name IN ('unresolved_holders', 'history_complete')",
+        ) { it.getString(1) to it.getString(2) }.toMap()
+        assertTrue(defaults.getValue("unresolved_holders").startsWith("'{}'"), defaults.toString())
+        assertEquals("true", defaults.getValue("history_complete"))
+        HostLease("mw-new", FAST, PLAIN).use { lease ->
+            assertEquals(4L, assertNotNull(lease.acquire()).generation)
+            assertTrue(lease.markIssuing())
+        }
+        assertEquals(listOf("3|mw-old|true", "4|mw-new|true"), grants())
+    }
+
+    @Test
     fun `펜싱 트리거는 mission 스키마의 쓰기 표 전부에 문장 수준으로 걸리고 예외 표에는 없다`() {
         val tables = PostgresSupport.queryAll("SELECT tablename FROM pg_tables WHERE schemaname = 'mission' ORDER BY tablename") { it.getString(1) }
         val fenced = PostgresSupport.queryAll(
@@ -344,7 +370,7 @@ class HostLeaseTest {
             WHERE n.nspname = 'mission' AND p.proname = 'mission_require_fenced_generation' ORDER BY c.relname
             """.trimIndent(),
         ) { it.getString(1) to it.getInt(2) }
-        val exempt = setOf("host_lease", "host_lease_term", "host_instance", "flyway_schema_history")
+        val exempt = setOf("host_lease", "host_lease_term", "host_lease_grant", "host_instance", "flyway_schema_history")
         assertTrue(tables.size > 25, tables.toString())
         assertEquals(tables.filter { it !in exempt }, fenced.map { it.first }, "펜싱 트리거가 빠진 쓰기 표가 있다(새 표는 그 마이그레이션이 트리거를 건다)")
         // BEFORE(2) + INSERT(4) + DELETE(8) + UPDATE(16), 행 수준(1) 아님.

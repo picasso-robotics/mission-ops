@@ -65,6 +65,7 @@ import dev.picasso.ops.host.lease.GatedRobotPort
 import dev.picasso.ops.host.lease.HostLeadership
 import dev.picasso.ops.host.lease.LeaderState
 import dev.picasso.ops.host.lease.LeadershipListener
+import dev.picasso.ops.host.lease.Requirement
 import dev.picasso.ops.host.lease.SendAuthority
 import dev.picasso.ops.host.mission.MockRunner
 import dev.picasso.middleware.mission.MissionDefinitionParser
@@ -613,7 +614,16 @@ data class HostFootprint(
  * 신규 발행을 연다([LeaderState.HOLDING], [Acquired.graceful]).
  *
  * 기체·플릿 명령은 미들웨어에 넘기는 포트에서 송신 직전에 리더를 확인한다([GatedRobotPort]·[GatedFleetPort]). DB 쓰기는 기록 저장소의 리스 가드가
- * 막는다. 리스를 잃으면 pump 와 심장박동을 먼저 멈추고 자기 차단을 (제한 시간 안에) 적는다([lost]). 닫을 때는 리더를 정상 종료 중으로 바꾸고
+ * 막는다.
+ *
+ * ## 수신 측 세대 대조 소비(HA 3단계, picasso ADR 54)
+ *
+ * 관측([LeaderState.HOLDING]) 안에서 기체마다 준비를 본다([HostLeadership.observeFresh]). 미리 읽기(잠금 밖)가 준비를 보인 미준비 기체만 pump 가
+ * 그 라운드에 **지금** 읽게 하고([HostRobotPort.readNowFor]·[HostRobotPort.onFreshRead], 대조 안 함·휘발 기체는 이번 관측의 첫 관측과 그 뒤 기체별 간격(`host.readiness.unread-retry`)마다 한 번 말고는 잠금 아래에서 읽지 않음 — [HostRobotPort.unreadFallback]), 그 스냅숏의 응답 바닥값이 이 세대와 같고 `DURABLE_CONFIRMED` 면 그 라운드의
+ * 재대조(같은 스냅숏으로 동기화한 `Middleware.pump`)가 끝난 뒤 자동 확인 근거(`mission.host_readiness_evidence`, 리스 가드 안)를 적고 그 기체를
+ * 연다([publishReadiness], 이 세대 안 래치). 미들웨어 발행 관문의 권위 입력([HostLeadership.authorityPort])은 «실행 → 필수 기체·플릿» 표
+ * ([refreshRequirements])로 기체 R 이 든 실행들의 요구가 모두 준비일 때만 쥐었다고 답한다 — 준비되지 않은 기체의 단위는 `AUTHORITY_NOT_HELD`
+ * 로 막히고 까닭이 화면에 보인다. 전역 발행·발행 표시·변경 HTTP·값 없는 승인·셀 쓰기는 그대로 운영자 확인 뒤다. 리스를 잃으면 pump 와 심장박동을 먼저 멈추고 자기 차단을 (제한 시간 안에) 적는다([lost]). 닫을 때는 리더를 정상 종료 중으로 바꾸고
  * pump 와 송신 중인 명령이 끝난 것을 본 뒤에만 멈춤을 적으며, 그것을 적었을 때만 리스를 내놓는다([close]).
  *
  * @param robots 하위 포트. 판정의 케이퍼빌리티도 이것으로 묻는다(`PicassoClient` 가 세대별로 캐시한다). 그 캐시는 잠금 밖에서
@@ -711,7 +721,17 @@ class MissionHost(
         fleet = if (fleetPort === AmrFleetPort.None) fleetPort else GatedFleetPort(fleetPort, leadership),
         now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
         retirements = retirements, entitlements = entitlements, retention = retention, instanceId = leadership.instanceId,
+        authority = leadership.authorityPort,
     )
+
+    init {
+        // 지금 읽은 스냅숏만 준비 판정에 간다(미리 읽은 값은 넘기지 않는다). 포트가 [HostRobotPort] 가 아니면 관측 중 자동으로 열리는 기체가 없다.
+        (robots as? HostRobotPort)?.onFreshRead = { robot, snapshot, seq, at -> leadership.observeFresh(robot, snapshot, seq, at) }
+        // 미리 읽은 값은 열지 않고 지금 읽기 대상을 거르고 래치 뒤 후퇴를 보는 데만 쓴다.
+        (robots as? HostRobotPort)?.onOtherRead = { robot, snapshot, seq -> leadership.observePrefetched(robot, snapshot, seq) }
+        // 관측 중 미리 읽은 값이 없는 미준비 기체는 첫 관측 뒤로는 기체별 간격마다 한 번만 잠금 아래에서 동기로 읽는다.
+        (robots as? HostRobotPort)?.unreadFallback = leadership::allowUnreadFallback
+    }
 
     /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
     private val exported: IncidentExport? = export?.let { IncidentExport(it, middleware.instanceId) }
@@ -961,6 +981,34 @@ class MissionHost(
         }
         records.attestedClosures().forEach { row -> attested += Attested(row, checkNotNull(records.closeOf(row.jobOrderId))) }
         openHolds += records.openResidualHolds()
+        refreshRequirements()
+    }
+
+    /**
+     * «실행 → 필수 기체·플릿» 표를 다시 짓는다(HA 3단계). 구동이 도는 실행마다 계획의 기체 전부와 플릿 단위가 있는가. 발행 관문의 권위 입력과
+     * 송신 직전 확인([GatedRobotPort]·[GatedFleetPort])이 같은 표를 읽는다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun refreshRequirements() {
+        leadership.requirements = middleware.executions().filter { it.physicalState.pumps }.map { e ->
+            Requirement(e.executionId, e.order.jobOrderId, e.robots.toSet(), e.units.any { it.route == Route.FLEET })
+        }
+    }
+
+    /**
+     * 이번 라운드의 지금 읽기로 준비를 본 기체를 연다. `Middleware.pump` 가 그 스냅숏으로 재대조를 마친 뒤에 부른다. 근거를 리스 가드 안에서 적은
+     * 뒤에만 래치한다 — 적지 못하면(리스 불일치면 잃음으로 감) 그 후보를 버리고 다음 라운드가 다시 지금 읽는다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun publishReadiness() {
+        val generation = leadership.lease.generation ?: return
+        leadership.pendingReady().forEach { ready ->
+            try {
+                records.recordReadiness(generation, instanceId, ready.robotId, ready.floor, ready.fenceStatus.name, ready.observedAt)
+                leadership.latch(ready)
+            } catch (e: Exception) {
+                leadership.dropCandidate(ready.robotId)
+                log.warn("기체 {} 의 자동 확인 근거를 적지 못해 열지 않는다(다음 라운드에 다시 읽는다): {}", ready.robotId, e.toString())
+            }
+        }
     }
 
     /** 이 일지 행을 든 바로 앞 인스턴스와 실행. 마지막 RESTORED 이벤트의 것이고 없으면 받은 인스턴스와 실행이다. */
@@ -1156,8 +1204,14 @@ class MissionHost(
                 // 판단 뒤 적지 못한 판단 기록도 pump 전에 다시 적는다(재작업의 새 시도가 그 기록보다 먼저 나가지 않게).
                 saveDecisions()
                 if (journalBlocked().isNotEmpty()) return@withLock
-                (robots as? HostRobotPort)?.readNowFor(startingRobots())
+                refreshRequirements()
+                // 이 라운드의 후보는 이 라운드의 지금 읽기에서만 선다(앞 라운드의 잔류 후보를 재대조 없이 래치하지 않는다).
+                leadership.clearCandidates()
+                // 관측 중이면 미리 읽기가 준비를 보인 미준비 기체를 지금 읽는다(그 읽기만 준비 판정에 간다).
+                // 관측 중에는 출발을 앞둔 기체도 열렸거나 미리 읽기가 준비를 보인 것만 지금 읽는다(준비가 설 수 없는 기체는 어차피 출발하지 못한다).
+                (robots as? HostRobotPort)?.readNowFor(startingRobots().filterTo(HashSet(), leadership::mayReadNow) + leadership.freshTargets())
                 middleware.pump()
+                publishReadiness()
                 pumpedAt = at
                 // 기록이 커밋된 뒤 사본을 확인하고 파일을 게시하며, 그 뒤에 정착한 실행을 놓는다([recordAfterPump]).
                 recordAfterPump()

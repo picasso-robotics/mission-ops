@@ -38,6 +38,8 @@ dependencies {
     testImplementation(kotlin("test"))
     // 시험용 Postgres 는 registry 의 testFixtures 를 쓴다. 복사하지 않는다(운영 서비스와 같음).
     testImplementation(testFixtures("dev.picasso:registry"))
+    // 수신 측 세대 대조 시험(HA 3단계)이 mimic 의 바닥값을 운영과 같은 파일 저장(`FileFenceStore`)에 둔다. 운영 코드는 쓰지 않는다.
+    testImplementation("dev.picasso:adapter-host")
 }
 
 // 저장소 루트에서 돈다. 모의 실행 프로파일·스키마 경로(host.mock-run.*)가 루트 기준이다(site 의 run 과 같음).

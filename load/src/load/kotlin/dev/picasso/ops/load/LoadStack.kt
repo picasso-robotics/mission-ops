@@ -3,6 +3,9 @@ package dev.picasso.ops.load
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
+import dev.picasso.adapter.host.FileFenceStore
+import dev.picasso.contracts.wire.ControllerFence
+import dev.picasso.contracts.wire.FenceMode
 import dev.picasso.mimic.cli.MimicCli
 import dev.picasso.ops.host.HostClock
 import dev.picasso.ops.host.MissionHost
@@ -34,8 +37,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * - 셀 대역은 대역(stub)이고 [cellBody] 를 바꾸면 다음 pump 부터 호스트가 읽는다. 스테이션 신호 쌍을 여기서 늘린다.
  * - 운영 서비스의 주기 작업 셋(스테이션 tick·결과 수집·결과 전달)은 하루 주기로 미뤄 끈다. 하네스가 같은 코드를 직접 불러 잰다.
  *   registry 는 띄우지 않는다(측정 경로가 registry 를 부르지 않는다).
+ *
+ * [fenced] 면 mimic 이 제어자 세대를 대조하고(`FENCED`, picasso ADR 54) 바닥값을 세트마다 새 임시 디렉터리의 `FileFenceStore` 에 둔다(컨테이너 DB 와
+ * 같은 수명). 인수 시나리오의 대조 변형만 켠다 — 나머지 측정은 오늘 거동(`UNFENCED`)이다.
  */
-class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: List<String> = emptyList()) : AutoCloseable {
+class LoadStack(
+    val robots: Int,
+    withOps: Boolean = true,
+    private val hostArgs: List<String> = emptyList(),
+    val fenced: Boolean = false,
+) : AutoCloseable {
 
     val pg: PostgreSQLContainer<*> = PostgreSQLContainer("postgres:16-alpine")
         .withDatabaseName("picasso").withUsername("picasso").withPassword("picasso")
@@ -58,6 +69,9 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
 
     val robotIds: List<String> = (1..robots).map { "humanoid-%03d".format(it) }
 
+    private val fenceDir: Path? = if (fenced) java.nio.file.Files.createTempDirectory("load-fence") else null
+    private val fenceStore: FileFenceStore? = fenceDir?.let(::FileFenceStore)
+
     val mimic: MimicCli.Started = checkNotNull(
         MimicCli().start(
             robots = robotIds.associateWith { ROOT.resolve("picasso/profile/profiles/humanoid-a.json") },
@@ -66,6 +80,7 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
             virtual = true,
             seed = 0L,
             err = System.err,
+            fence = fenceStore?.let { ControllerFence(FenceMode.FENCED, it) } ?: ControllerFence(),
         ),
     ) { "mimic 기동 거부" }
 
@@ -220,6 +235,8 @@ class LoadStack(val robots: Int, withOps: Boolean = true, private val hostArgs: 
         runCatching { cell.stop(0) }
         runCatching { callback.stop(0) }
         runCatching { mimic.server.shutdown() }
+        runCatching { fenceStore?.close() }
+        runCatching { fenceDir?.toFile()?.deleteRecursively() }
         runCatching { pg.stop() }
     }
 

@@ -2,7 +2,7 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { Execution, PermitBlock } from '../api'
-import { PERMIT_BLOCK_TEXT as TEXT, RETIRED_BLOCK_TEXT as RETIRED } from '../labels'
+import { AUTHORITY_BLOCK_TEXT as AUTHORITY, PERMIT_BLOCK_TEXT as TEXT, RETIRED_BLOCK_TEXT as RETIRED } from '../labels'
 import { ExecutionList } from './ExecutionList'
 import { WorkRequests } from './WorkRequests'
 
@@ -131,4 +131,54 @@ it('작업 요청 상세는 현재 실행의 작업 허가 대기를 보인다',
   const notice = await within(article).findByRole('region', { name: TEXT.heading })
   expect(within(notice).getByText('기체 humanoid-01: 차단')).toBeVisible()
   expect(within(notice).getByText(/막는 주체 guard_closed=false/)).toBeVisible()
+})
+
+const authorityReason = {
+  source: null,
+  cause: 'AUTHORITY_NOT_HELD',
+  subject: '인수 확인 대기 — 실행 exec-1(작업 지시 JO-1)의 기체 quadruped-01: 수신자 대조 안 함(바닥값 0)',
+  resumeBasis: '이 인스턴스가 그 기체의 권위를 쥘 때',
+  observedAt: null,
+}
+
+it('권위만으로 막힌 실행은 인수 확인 대기의 제목과 안내, 막는 기체와 까닭을 보이고 안전 신호 안내는 보이지 않는다', () => {
+  const held: PermitBlock = { ...block, robots: [{ robotId: 'humanoid-01', permit: 'INHIBITED', reasons: [authorityReason] }] }
+  render(<ExecutionList read={{ value: { instanceId: 'mw-1', pumpedAt: 't', executions: [execution({ permitBlock: held })], ...NO_SETTLED }, error: null }} highlight={null} />)
+  expect(screen.queryByRole('region', { name: TEXT.heading })).not.toBeInTheDocument()
+  const notice = screen.getByRole('region', { name: AUTHORITY.heading })
+  expect(within(notice).getByText(AUTHORITY.intro)).toBeVisible()
+  expect(within(notice).getByText(/까닭 인수 확인 대기 · 막는 주체 인수 확인 대기 — 실행 exec-1\(작업 지시 JO-1\)의 기체 quadruped-01: 수신자 대조 안 함\(바닥값 0\)/)).toBeVisible()
+  expect(within(notice).getByText(AUTHORITY.resume)).toBeVisible()
+  expect(within(notice).getByText(AUTHORITY.notStop)).toBeVisible()
+  expect(within(notice).queryByText(TEXT.notSafety)).not.toBeInTheDocument()
+  expect(within(notice).queryByText(RETIRED.resume)).not.toBeInTheDocument()
+  expect(within(notice).queryByRole('button')).not.toBeInTheDocument()
+})
+
+it('작업 허가와 권위가 섞이면 작업 허가의 안내에 인수 확인으로 풀린다는 줄을 더한다', () => {
+  const mixed: PermitBlock = { ...block, robots: [...block.robots, { robotId: 'quadruped-01', permit: 'INHIBITED', reasons: [authorityReason] }] }
+  render(<ExecutionList read={{ value: { instanceId: 'mw-1', pumpedAt: 't', executions: [execution({ permitBlock: mixed })], ...NO_SETTLED }, error: null }} highlight={null} />)
+  const notice = screen.getByRole('region', { name: TEXT.heading })
+  expect(within(notice).getByText(AUTHORITY.mixed)).toBeVisible()
+  expect(within(notice).queryByText(RETIRED.mixed)).not.toBeInTheDocument()
+})
+
+it('권위 까닭이라도 인수 확인 대기가 아니면(밀려남 따위) 인수 확인 대기 제목과 자동으로 풀린다는 안내를 보이지 않는다', () => {
+  const superseded = {
+    source: null,
+    cause: 'AUTHORITY_NOT_HELD',
+    subject: '수신자가 답한 세대 거절: robot=humanoid-01 BELOW_FLOOR 요청 세대=1 바닥값=2',
+    resumeBasis: '이 인스턴스가 더 높은 세대로 다시 설 때(새 프로세스)',
+    observedAt: null,
+  }
+  const held: PermitBlock = { ...block, robots: [{ robotId: 'humanoid-01', permit: 'INHIBITED', reasons: [superseded] }] }
+  render(<ExecutionList read={{ value: { instanceId: 'mw-1', pumpedAt: 't', executions: [execution({ permitBlock: held })], ...NO_SETTLED }, error: null }} highlight={null} />)
+  expect(screen.queryByRole('region', { name: AUTHORITY.heading })).not.toBeInTheDocument()
+  const notice = screen.getByRole('region', { name: TEXT.heading })
+  expect(within(notice).queryByText(AUTHORITY.resume)).not.toBeInTheDocument()
+  expect(within(notice).queryByText(AUTHORITY.mixed)).not.toBeInTheDocument()
+  expect(within(notice).getByText(/막는 주체 수신자가 답한 세대 거절/)).toBeVisible()
+  // 행의 까닭 라벨도 «인수 확인 대기» 가 아니라 일반 라벨이다.
+  expect(within(notice).getByText(/까닭 권위 없음 · 막는 주체 수신자가 답한 세대 거절/)).toBeVisible()
+  expect(within(notice).queryByText(/까닭 인수 확인 대기/)).not.toBeInTheDocument()
 })

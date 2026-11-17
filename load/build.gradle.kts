@@ -12,6 +12,8 @@ dependencies {
     // 실행 호스트는 picasso·mimic 을 implementation 으로 든다. 하네스가 미들웨어 크기를 읽고(반사) mimic 을 직접 띄우므로 적는다.
     "loadImplementation"("dev.picasso:picasso")
     "loadImplementation"("dev.picasso:mimic")
+    // 인수 시나리오의 대조 변형(takeoverfenced)이 mimic 바닥값을 운영과 같은 파일 저장(`FileFenceStore`)에 둔다.
+    "loadImplementation"("dev.picasso:adapter-host")
     // Testcontainers Postgres. registry testFixtures 의 PostgresSupport 는 pg_stat_statements 를 싣지 않아 컨테이너만 같은 판으로 따로 띄운다.
     "loadImplementation"(testFixtures("dev.picasso:registry"))
     "loadImplementation"(platform(libs.spring.boot.bom))

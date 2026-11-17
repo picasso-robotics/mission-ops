@@ -67,7 +67,8 @@ fun interface LeaseConnections {
  * 리더 상태기계([HostLeadership])에서만 오고 메서드마다 동기화한다.
  *
  * - **획득**: 먼저 잠금 없이 기간 행의 만료를 읽고, 만료했을 때만 보유자 행 → 기간 행 순서로 `FOR UPDATE`(쓰기 트랜잭션의 `FOR SHARE` 가 끝나기를
- *   기다림) 한 뒤 잠근 상태에서 만료를 다시 보고 보유자·세대(+1)를 바꾸고 새 기간을 둔다 — 리스가 살아 있는 동안 대기는 보유자 행을 잠그지 않아,
+ *   기다림) 한 뒤 잠근 상태에서 만료를 다시 보고 보유자·세대(+1)를 바꾸고 새 기간을 두며, 같은 트랜잭션에서 세대별 보유자 이력
+ *   (`mission.host_lease_grant`, V20 — 운영자 확인 연쇄의 «미해소 원천 보유자» 를 셈)에 한 줄을 넣는다 — 리스가 살아 있는 동안 대기는 보유자 행을 잠그지 않아,
  *   대기가 멎어도 능동의 쓰기·갱신을 막지 않는다. 같은 보유자의 재획득 조건(`OR holder = :me`)은 없다. 확정되지 않은 실패(망 오류)면 다시 고치지
  *   않고 새 연결로 행을 읽어 내가 보유자이고 살아 있으면 그 세대로 획득한 것으로 본다([Acquired.recovered], 늘 만료 인수). 그 읽기마저 실패하면 다음
  *   획득 시도가 먼저 읽는다. 복구한 획득의 자기 차단 기한은 **처음 획득 문장을 보내기 직전** 시각에서 잰다(조회는 DB 만료를 늘리지 않으므로) —
@@ -199,6 +200,11 @@ class HostLease(
             s.setDouble(1, timing.expiry.toMillis() / 1000.0)
             s.executeUpdate()
         }
+        c.prepareStatement(GRANT).use { s ->
+            s.setLong(1, next)
+            s.setString(2, instanceId)
+            s.executeUpdate()
+        }
         return Acquired(next, previous, previousStopped, previousIssuing, othersLive)
     }
 
@@ -221,13 +227,26 @@ class HostLease(
 
     /**
      * 이 세대가 발행을 연다는 표시(기간 행 `issuing`). [HostLeadership] 이 [LeaderState.ISSUING] 에 들기 **전에** 적는다 — 다음 보유자는 이것이
-     * 있을 때만 앞 보유자의 정상 종료를 곧바로 발행할 근거로 쓴다. 거짓이면 이 세대가 아니다(잃었다).
+     * 있을 때만 앞 보유자의 정상 종료를 곧바로 발행할 근거로 쓴다. 같은 문장이 보유자 이력(`host_lease_grant`)의 그 세대 줄에 `issuing_at` 을
+     * 채운다(기간 행을 고쳤을 때만). 거짓이면 이 세대가 아니다(잃었다).
      */
     @Synchronized
     fun markIssuing(): Boolean {
         val held = generation ?: return false
         beforeMark?.invoke()
-        return single(MARK_ISSUING, held) { } == 1
+        return try {
+            autocommit { c ->
+                c.prepareStatement(MARK_ISSUING).use { s ->
+                    s.setString(1, instanceId)
+                    s.setLong(2, held)
+                    s.setLong(3, held)
+                    s.executeQuery().use { rs -> rs.next() && rs.getInt(1) == 1 }
+                }
+            }
+        } catch (e: SQLException) {
+            drop()
+            throw e
+        }
     }
 
     /** 쥔 리스를 곧바로 만료시킨다(정상 종료). 실패는 삼킨다 — 그러면 대기 인스턴스는 만료까지 기다린다. */
@@ -354,7 +373,15 @@ class HostLease(
 
         private const val RENEW =
             "UPDATE mission.host_lease_term SET expires_at = clock_timestamp() + make_interval(secs => ?) WHERE role = 'host' AND expires_at > clock_timestamp() $MINE"
-        private const val MARK_ISSUING = "UPDATE mission.host_lease_term SET issuing = true WHERE role = 'host' AND expires_at > clock_timestamp() $MINE"
+        /** 획득한 세대의 보유자 이력 한 줄(V20). 획득 트랜잭션 안이다. */
+        private const val GRANT = "INSERT INTO mission.host_lease_grant (generation, holder) VALUES (?, ?)"
+
+        /** 기간 행의 발행 표시를 세우고, 세웠을 때만 보유자 이력의 그 세대 줄에 `issuing_at` 을 채운다(한 문장). 기간 행을 고친 수를 돌려준다. */
+        private const val MARK_ISSUING = """
+            WITH t AS (UPDATE mission.host_lease_term SET issuing = true WHERE role = 'host' AND expires_at > clock_timestamp() $MINE RETURNING 1),
+                 g AS (UPDATE mission.host_lease_grant SET issuing_at = coalesce(issuing_at, clock_timestamp()) WHERE generation = ? AND EXISTS (SELECT 1 FROM t))
+            SELECT count(*) FROM t
+        """
         private const val RELEASE =
             "UPDATE mission.host_lease_term SET expires_at = clock_timestamp() WHERE role = 'host' AND expires_at > clock_timestamp() $MINE"
 

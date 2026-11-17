@@ -32,6 +32,10 @@ import java.time.Instant
  * [restartHost] 는 DB 를 지우지 않고 실행 호스트만 같은 포트로 다시 띄운다. 운영 서비스는 기동 때 호스트 주소를 한 번 받으므로
  * 포트가 같아야 다시 띄운 호스트에 닿는다(S3b 스펙 §10 통합 행).
  *
+ * 현장 mimic 은 제어자 세대를 대조한다(`FENCED`, picasso ADR 54). 바닥값 파일은 띄울 때마다 새 임시 디렉터리에 두고 닫을 때 지운다 — DB 와 같은
+ * 수명이다(DB 를 비우면 리스 세대가 1 부터 다시 시작하므로 앞 바닥값이 남으면 새 세대가 모두 거절된다). [restartHost] 는 같은 현장(같은 바닥값)을
+ * 쓴다. 이 세트는 미믹에 직접 명령하지 않는다 — 명령은 모두 세대를 싣는 실행 호스트를 거친다.
+ *
  * 실행 호스트의 시계는 현장 시계(`Site.now()`)다. 시험은 `Site.advance` 로 가상 시각을 실제 시각보다 앞으로 밀고, 미들웨어는
  * E2 시간 윈도우의 기준 시각을 mimic 응답 헤더에서 가져오면서 마감은 호스트 시계로 보므로 둘이 같아야 한다(S3a 스펙 §7.2).
  */
@@ -44,6 +48,7 @@ class E2eStack private constructor(
     val siteId: String,
     private val permitMapping: Path? = null,
     private val fleet: Boolean = false,
+    private val fenceDir: Path? = null,
 ) : AutoCloseable {
 
     /** 운영 서비스 응답 한 건. 본문이 비면 널이다. */
@@ -93,7 +98,11 @@ class E2eStack private constructor(
             try {
                 host.close()
             } finally {
-                site.close()
+                try {
+                    site.close()
+                } finally {
+                    fenceDir?.toFile()?.deleteRecursively()
+                }
             }
         }
     }
@@ -120,17 +129,25 @@ class E2eStack private constructor(
             // 실행 호스트는 기동 안에서 ops 의 현장 시간값 뷰를 읽는다(S3c 스펙 §7.1). 호스트가 운영 서비스보다 먼저 뜨므로 ops 스키마를
             // 먼저 올려 둔다. 그러지 않으면 호스트가 미적용으로 뜨고, 운영 서비스가 뜬 뒤 첫 주기 읽기까지 작업 지시를 받지 않는다.
             OpsSchema.migrate(PostgresSupport.jdbcUrl, PostgresSupport.username, PostgresSupport.password)
-            val site = Site.start(
-                SiteConfig(
-                    root = root,
-                    siteId = siteId,
-                    db = db(),
-                    registryPort = 0,
-                    operatorToken = OPERATOR_TOKEN,
-                    ingestToken = "e2e-ingest",
-                    roster = RobotRoster.read(root.resolve(SiteConfig.ROSTER)),
-                ),
-            )
+            // 바닥값 디렉터리는 DB 와 같은 수명이다 — 방금 비운 DB 의 리스 세대는 1 부터다.
+            val fenceDir = java.nio.file.Files.createTempDirectory("e2e-fence")
+            val site = try {
+                Site.start(
+                    SiteConfig(
+                        root = root,
+                        siteId = siteId,
+                        db = db(),
+                        registryPort = 0,
+                        operatorToken = OPERATOR_TOKEN,
+                        ingestToken = "e2e-ingest",
+                        roster = RobotRoster.read(root.resolve(SiteConfig.ROSTER)),
+                        fenceDir = fenceDir,
+                    ),
+                )
+            } catch (e: Exception) {
+                fenceDir.toFile().deleteRecursively()
+                throw e
+            }
             // 실행 호스트는 Site 다음, 운영 서비스 앞이다. 운영 서비스가 기동에서 호스트 주소를 받는다.
             val host = try {
                 startHost(site, permitMapping = permitMapping, fleet = fleet)
@@ -146,7 +163,7 @@ class E2eStack private constructor(
                 site.close()
                 throw e
             }
-            return E2eStack(site, host, ops, hostUrl, "http://127.0.0.1:${(ops as WebServerApplicationContext).webServer.port}", siteId, permitMapping, fleet)
+            return E2eStack(site, host, ops, hostUrl, "http://127.0.0.1:${(ops as WebServerApplicationContext).webServer.port}", siteId, permitMapping, fleet, fenceDir)
         }
 
         /** [baseUrl] 의 운영 서비스를 화면처럼 부른다. */

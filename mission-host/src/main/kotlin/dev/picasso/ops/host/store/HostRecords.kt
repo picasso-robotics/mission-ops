@@ -95,7 +95,10 @@ data class SettledHistory(val rows: List<SettledRow>, val nextBefore: Long?, val
  * 작업 응답의 내용 키(S4b 스펙 T6). 인스턴스마다 달라지는 것(응답 id, 실행 id, 미완 사유 문자열, `connection`)은 뺀다.
  * 단위 id 목록은 정렬해 둔다. 두 키가 같은지는 이 값의 `equals` 다.
  */
-/** 만료 인수 뒤 운영자 확인 한 행(V19). */
+/**
+ * 만료 인수 뒤 운영자 확인 한 행(V19). [unresolvedHolders] 는 확인한 미해소 원천 보유자 집합(V20, 정렬), [historyComplete] 는 그 셈이 이력을 다
+ * 보았는가다(거짓이면 운영자가 끊긴 이력을 알고 확인했다).
+ */
 data class TakeoverConfirmationRow(
     val generation: Long,
     val instanceId: String,
@@ -103,6 +106,33 @@ data class TakeoverConfirmationRow(
     val confirmedBy: String,
     val reason: String,
     val confirmedAt: Instant,
+    val unresolvedHolders: List<String> = emptyList(),
+    val historyComplete: Boolean = true,
+)
+
+/**
+ * 세대별 보유자 이력 한 줄(V20 `host_lease_grant`)과 그 보유자 인스턴스의 지금 증거. [issuing] 은 그 세대가 발행을 열었는가, [stopped]·[fenced] 는
+ * 그 인스턴스가 멈춤·자기 차단을 적었는가, [alive] 는 심장박동이 DB 시각으로 만료 전이고 둘 다 없는가다(행이 없으면 모두 거짓).
+ */
+data class LeaseGrantRow(
+    val generation: Long,
+    val holder: String,
+    val acquiredAt: Instant,
+    val issuing: Boolean,
+    val stopped: Boolean,
+    val fenced: Boolean,
+    val alive: Boolean,
+)
+
+/** 자동 확인 근거 한 줄(V20 `host_readiness_evidence`). */
+data class ReadinessEvidenceRow(
+    val generation: Long,
+    val instanceId: String,
+    val robotId: String,
+    val controllerFloor: Long,
+    val fenceStatus: String,
+    val observedAt: Instant,
+    val recordedAt: Instant,
 )
 
 data class ResponseContent(
@@ -1494,13 +1524,25 @@ class HostRecords(
             }
             .single()
 
-    /** 만료 인수 뒤 운영자 확인을 적는다(V19). 그 세대에 이미 있으면 `DuplicateKeyException` 이다. */
-    fun confirmTakeover(generation: Long, instanceId: String, previousHolder: String?, confirmedBy: String, reason: String): TakeoverConfirmationRow =
+    /**
+     * 만료 인수 뒤 운영자 확인을 적는다(V19). [unresolvedHolders] 는 확인한 미해소 원천 보유자 집합이다(V20). 그 세대에 이미 있으면
+     * `DuplicateKeyException` 이다.
+     */
+    fun confirmTakeover(
+        generation: Long,
+        instanceId: String,
+        previousHolder: String?,
+        confirmedBy: String,
+        reason: String,
+        unresolvedHolders: List<String> = emptyList(),
+        historyComplete: Boolean = true,
+    ): TakeoverConfirmationRow =
         writes.sql(
             """
-            INSERT INTO mission.host_takeover_confirmation (generation, instance_id, previous_holder, confirmed_by, reason)
-            VALUES (:generation, :instanceId, :previous, :by, :reason)
-            RETURNING generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at
+            INSERT INTO mission.host_takeover_confirmation (generation, instance_id, previous_holder, confirmed_by, reason, unresolved_holders, history_complete)
+            VALUES (:generation, :instanceId, :previous, :by, :reason, string_to_array(:unresolved, ','), :complete)
+            RETURNING generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at, array_to_string(unresolved_holders, ',') AS unresolved,
+                      history_complete
             """.trimIndent(),
         )
             .param("generation", generation)
@@ -1508,12 +1550,20 @@ class HostRecords(
             .param("previous", previousHolder, java.sql.Types.VARCHAR)
             .param("by", confirmedBy)
             .param("reason", reason)
+            .param("unresolved", unresolvedHolders.sorted().joinToString(","))
+            .param("complete", historyComplete)
             .query { rs, _ -> takeoverRow(rs) }
             .single()
 
     /** 그 세대의 운영자 확인. 없으면 `null`. */
     fun takeoverConfirmation(generation: Long): TakeoverConfirmationRow? =
-        jdbc.sql("SELECT generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at FROM mission.host_takeover_confirmation WHERE generation = :generation")
+        jdbc.sql(
+            """
+            SELECT generation, instance_id, previous_holder, confirmed_by, reason, confirmed_at, array_to_string(unresolved_holders, ',') AS unresolved,
+                   history_complete
+            FROM mission.host_takeover_confirmation WHERE generation = :generation
+            """.trimIndent(),
+        )
             .param("generation", generation)
             .query { rs, _ -> takeoverRow(rs) }
             .optional()
@@ -1521,8 +1571,73 @@ class HostRecords(
 
     private fun takeoverRow(rs: ResultSet) = TakeoverConfirmationRow(
         rs.getLong("generation"), rs.getString("instance_id"), rs.getString("previous_holder"), rs.getString("confirmed_by"), rs.getString("reason"),
-        instant(rs, "confirmed_at"),
+        instant(rs, "confirmed_at"), rs.getString("unresolved").orEmpty().split(',').filter { it.isNotEmpty() }, rs.getBoolean("history_complete"),
     )
+
+    /**
+     * [generation] 보다 앞 세대의 보유자 이력(V20, 세대 내림차순)과 그 인스턴스의 지금 증거. 운영자 확인의 «미해소 원천 보유자» 를 셀 때 쓴다
+     * ([dev.picasso.ops.host.web.LeaderController.unresolvedHolders]). 발행을 연 가장 최근 세대(그 세대 포함)에서 끊는다 — 셈이 거기서 멈추므로 더
+     * 앞 세대는 읽지 않는다. 공용 풀로 읽는다(쓰지 않는다).
+     */
+    fun leaseGrantsBefore(generation: Long): List<LeaseGrantRow> =
+        jdbc.sql(
+            """
+            SELECT g.generation, g.holder, g.acquired_at, g.issuing_at IS NOT NULL AS issuing,
+                   coalesce(i.stopped_at IS NOT NULL, false) AS stopped, coalesce(i.fenced_at IS NOT NULL, false) AS fenced,
+                   coalesce(i.stopped_at IS NULL AND i.fenced_at IS NULL AND i.expires_at > clock_timestamp(), false) AS alive
+            FROM mission.host_lease_grant g LEFT JOIN mission.host_instance i ON i.instance_id = g.holder
+            WHERE g.generation < :generation
+              AND g.generation >= coalesce(
+                  (SELECT max(o.generation) FROM mission.host_lease_grant o WHERE o.generation < :generation AND o.issuing_at IS NOT NULL), 0)
+            ORDER BY g.generation DESC
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .query { rs, _ ->
+                LeaseGrantRow(
+                    rs.getLong("generation"), rs.getString("holder"), instant(rs, "acquired_at"), rs.getBoolean("issuing"),
+                    rs.getBoolean("stopped"), rs.getBoolean("fenced"), rs.getBoolean("alive"),
+                )
+            }
+            .list()
+
+    /**
+     * 자동 확인 근거를 적는다(V20, 리스 가드 안). 관측 중 수신자가 이 세대를 확인한 기체 하나에 한 줄이고, 같은 세대·기체의 줄이 이미 있으면 그대로
+     * 둔다(앞 쓰기의 결과를 못 받은 재시도).
+     */
+    fun recordReadiness(generation: Long, instanceId: String, robotId: String, floor: Long, fenceStatus: String, observedAt: Instant) {
+        writes.sql(
+            """
+            INSERT INTO mission.host_readiness_evidence (generation, instance_id, robot_id, controller_floor, fence_status, observed_at)
+            VALUES (:generation, :instanceId, :robotId, :floor, :status, :observedAt)
+            ON CONFLICT (generation, robot_id) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("robotId", robotId)
+            .param("floor", floor)
+            .param("status", fenceStatus)
+            .param("observedAt", OffsetDateTime.ofInstant(observedAt, ZoneOffset.UTC))
+            .update()
+    }
+
+    /** 그 세대의 자동 확인 근거(기체 이름 순). */
+    fun readinessEvidence(generation: Long): List<ReadinessEvidenceRow> =
+        jdbc.sql(
+            """
+            SELECT generation, instance_id, robot_id, controller_floor, fence_status, observed_at, recorded_at
+            FROM mission.host_readiness_evidence WHERE generation = :generation ORDER BY robot_id
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .query { rs, _ ->
+                ReadinessEvidenceRow(
+                    rs.getLong("generation"), rs.getString("instance_id"), rs.getString("robot_id"), rs.getLong("controller_floor"),
+                    rs.getString("fence_status"), instant(rs, "observed_at"), instant(rs, "recorded_at"),
+                )
+            }
+            .list()
 
     /** 그 인스턴스가 지금(DB 시각) 살아 있는가. 행이 없으면 거짓이다(이 표 이전의 인스턴스와 모르는 인스턴스). */
     /**

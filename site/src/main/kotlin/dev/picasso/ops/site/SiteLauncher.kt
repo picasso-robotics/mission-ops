@@ -19,6 +19,8 @@ fun main() {
     val site = Site.start(config)
     println("registry: ${site.registryUrl} (site=${config.siteId})")
     println("mimic: ${site.robotIds.sorted()} (gRPC 포트 ${site.mimicPort})")
+    // 세대 대조는 SITE_FENCE_DIR 이 있을 때만 켠다. 없으면 실행 호스트의 만료 인수가 기체를 자동으로 열지 않는다(운영자 확인).
+    println(config.robotFenceDir?.let { "수신자 세대 대조: FENCED (바닥값 파일 $it)" } ?: "수신자 세대 대조: UNFENCED (SITE_FENCE_DIR 없음)")
     println("셀 대역: http://127.0.0.1:${site.cellPort}/cell")
     // 플릿 세계는 같은 서버의 /fleet 다. 실행 호스트는 host.fleet.url(환경 변수 HOST_FLEET_URL)에 이 주소를 주면 플릿 포트를 붙인다.
     println("플릿 세계: http://127.0.0.1:${site.cellPort}/fleet/world (인계 자리 ${site.fleet.places})")

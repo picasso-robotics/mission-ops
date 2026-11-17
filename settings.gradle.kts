@@ -16,6 +16,7 @@ dependencyResolutionManagement {
 // picasso(미들웨어)와 client 는 실행 호스트가 쓴다(S3a 스펙 §7.1). capability 는 실행 호스트가 거부의 조치 탐색 응답 타입을 읽으려고 쓴다.
 // host-kit 은 실행 호스트가 인시던트 고리(승인 호스트, 자격 선언 파일, 번들 쓰기)를 붙이려고 쓴다(picasso H1, 한계 §15.176).
 // fleet-mimic 은 실행 호스트의 모의 실행이 플릿 경로 단위를 프로세스 안의 플릿 미믹으로 돌리려고 쓴다(picasso §15.326).
+// adapter-host 는 현장이 수신자(mimic)의 제어자 세대 바닥값을 파일에 두려고 그 `FileFenceStore` 를 쓴다(picasso ADR 54, §15.330).
 includeBuild("picasso") {
     dependencySubstitution {
         substitute(module("dev.picasso:registry")).using(project(":registry"))
@@ -26,6 +27,7 @@ includeBuild("picasso") {
         substitute(module("dev.picasso:capability")).using(project(":capability"))
         substitute(module("dev.picasso:host-kit")).using(project(":host-kit"))
         substitute(module("dev.picasso:fleet-mimic")).using(project(":fleet-mimic"))
+        substitute(module("dev.picasso:adapter-host")).using(project(":adapter-host"))
     }
 }
 

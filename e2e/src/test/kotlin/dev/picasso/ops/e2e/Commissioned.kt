@@ -51,7 +51,7 @@ object Commissioned {
 
         engineer(stack, "/api/adapters", """{"vendor":"acme","name":"fleet"}""")
         val adapterId = stack.get("/api/adapters")["adapters"].single()["adapterId"].asLong()
-        engineer(stack, "/api/adapters/$adapterId/versions", """{"version":"1.0.0","contractSemver":"0.11.0"}""")
+        engineer(stack, "/api/adapters/$adapterId/versions", """{"version":"1.0.0","contractSemver":"0.12.0"}""")
         val buildId = stack.get("/api/adapters")["adapters"].single()["versions"].single()["adapterVersionId"].asLong()
 
         chosen.values.forEach { (_, model) -> engineer(stack, "/api/profile-revisions", document(model)) }
