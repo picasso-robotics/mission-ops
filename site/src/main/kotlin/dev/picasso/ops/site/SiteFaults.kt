@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpExchange
 import dev.picasso.contracts.v1.ConnectionState
+import dev.picasso.contracts.wire.FencedCall
 import dev.picasso.mimic.cli.MimicCli
 import dev.picasso.mimic.engine.AuthorityOutcome
 import dev.picasso.mimic.engine.ForceOutcome
@@ -41,8 +42,11 @@ sealed interface FaultInjection {
  * [UNSUPPORTED_FAULT] 다.
  *
  * 엔진을 부른 뒤 밀거나 정착시키지 않는다. 열린 스트림에는 다음 시계 진행의 정착(런처는 1초 주기, 시험은 시계 밀기)이 민다.
+ *
+ * `POST /faults` 는 셀 신호 쓰기와 같은 키([SiteHttpFence.CELL])로 요청 헤더의 제어자 세대를 맞댄다. 세대 거부는 409 `STALE_CONTROLLER` 이고 엔진 거부의 409
+ * [FAULT_REFUSED] 와 본문 `error` 로 가른다. 모든 응답에 셀 키의 바닥값 헤더를 싣는다.
  */
-class SiteFaults(private val mimic: MimicCli.Started) {
+class SiteFaults(private val mimic: MimicCli.Started, private val fence: SiteHttpFence = SiteHttpFence()) {
 
     private val json = ObjectMapper()
 
@@ -114,14 +118,19 @@ class SiteFaults(private val mimic: MimicCli.Started) {
     }
 
     private fun respondTo(exchange: HttpExchange) {
-        val (status, body) = when {
-            exchange.requestURI.path != PATH -> 404 to ByteArray(0)
-            exchange.requestMethod != "POST" -> {
-                exchange.responseHeaders.add("Allow", "POST")
-                405 to ByteArray(0)
+        val scope = fence.scope(exchange, SiteHttpFence.CELL)
+        val (status, body) = scope.use {
+            when {
+                scope.malformed != null -> 400 to rejection(BAD_REQUEST, scope.malformed)
+                exchange.requestURI.path != PATH -> 404 to ByteArray(0)
+                exchange.requestMethod != "POST" -> {
+                    exchange.responseHeaders.add("Allow", "POST")
+                    405 to ByteArray(0)
+                }
+                else -> respond(exchange, scope)
             }
-            else -> respond(exchange)
         }
+        scope.stamp()
         if (body.isNotEmpty()) exchange.responseHeaders.add("Content-Type", "application/json")
         exchange.sendResponseHeaders(status, if (body.isEmpty()) -1 else body.size.toLong())
         if (body.isNotEmpty()) exchange.responseBody.write(body)
@@ -133,7 +142,7 @@ class SiteFaults(private val mimic: MimicCli.Started) {
      *
      * `application/json` 만 받는다. 브라우저의 단순 요청(폼·`text/plain`)은 사전 요청 없이 다른 출처에서 올 수 있다.
      */
-    private fun respond(exchange: HttpExchange): Pair<Int, ByteArray> {
+    private fun respond(exchange: HttpExchange, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> {
         val contentType = exchange.requestHeaders.getFirst("Content-Type")?.substringBefore(';')?.trim()
         if (!contentType.equals("application/json", ignoreCase = true)) {
             return 415 to rejection(UNSUPPORTED_MEDIA_TYPE, "Content-Type 이 application/json 이 아니다: ${contentType ?: "없음"}")
@@ -151,9 +160,11 @@ class SiteFaults(private val mimic: MimicCli.Started) {
                 "본문이 {\"robotId\": \"<기체>\", \"kind\": \"<종류>\"} 모양이 아니다. state 는 $CONNECTION 일 때만 문자열로 싣는다",
             )
         }
-        return when (val outcome = inject(robotId!!, kind!!, state)) {
-            is FaultInjection.Accepted -> 200 to json.writeValueAsBytes(outcome.body)
-            is FaultInjection.Refused -> outcome.status to rejection(outcome.error, outcome.detail)
+        return scope.mutation(FencedCall.START) {
+            when (val outcome = inject(robotId!!, kind!!, state)) {
+                is FaultInjection.Accepted -> 200 to json.writeValueAsBytes(outcome.body)
+                is FaultInjection.Refused -> outcome.status to rejection(outcome.error, outcome.detail)
+            }
         }
     }
 

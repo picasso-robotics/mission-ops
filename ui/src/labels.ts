@@ -117,6 +117,9 @@ export const KIND_LABEL: Record<string, string> = {
   NO_RUNNING_TASK: '진행 중 태스크 없음',
   UNSUPPORTED_FAULT: '받지 않는 장애 종류',
   FAULT_REFUSED: 'mimic 엔진이 강제를 거부함',
+  // 현장 HTTP 면의 제어자 세대 거부(신호 쓰기·장애 주입 공통). 옛 실행 호스트의 늦은 변경이거나 세대를 싣지 않은 변경이다.
+  STALE_CONTROLLER: '옛 제어자 세대라 현장이 거절함',
+  FENCE_STORE_FAILED: '현장이 세대 바닥값을 저장하지 못해 받지 않음(바뀐 것 없음)',
   UNSUPPORTED_MEDIA_TYPE: 'JSON 이 아닌 본문',
   FAULT_BAD_REQUEST: '장애 주입 본문 오류',
   RESOLVE_BAD_REQUEST: '판단 본문 오류',

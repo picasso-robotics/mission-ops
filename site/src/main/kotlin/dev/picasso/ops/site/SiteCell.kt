@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import dev.picasso.contracts.wire.FencedCall
 import dev.picasso.mimic.cli.MimicCli
 import dev.picasso.mimic.engine.TaskState
 import java.net.InetAddress
@@ -168,12 +169,19 @@ sealed interface SignalWrite {
  * 실행 호스트는 플릿 단위의 목적지를 이 자리로 관측해 E2 를 세운다. 투영은 훑기([scan])와 `/fleet` 의 쓰기·명령 뒤에 엔진 잠금 아래에서
  * 갈아 끼운다. 플릿 걸음은 시계로 가므로(시계 구동) 훑기가 세계를 읽는 순간 지난 걸음이 따라잡힌다.
  *
+ * ## 제어자 세대 대조([SiteHttpFence])
+ *
+ * 셀 신호 쓰기와 `POST /faults` 는 키 [SiteHttpFence.CELL] 로, 플릿 맡기기·취소는 키 [SiteHttpFence.FLEET] 로 요청 헤더의 세대를 맞댄다. `GET /cell` 은
+ * 맞대지 않는다. 모든 응답에 그 키의 바닥값 헤더를 싣는다. 인수 확인은 `POST /cell/controller/confirm` 이다(본문 `{}`, 세대는 헤더). 기본은 대조 안 함이다.
+ *
  * @param port 0 이면 무작위(시험).
+ * @param httpFence 현장 HTTP 면의 세대 대조(`SITE_HTTP_FENCE`). 기본은 대조 안 함.
  */
 class SiteCell(
     private val mimic: MimicCli.Started,
     private val fixture: CellFixture = CellFixture.STANDARD,
     port: Int = 0,
+    val httpFence: SiteHttpFence = SiteHttpFence(),
 ) : AutoCloseable {
 
     /** 이미 처리한 태스크. 기체마다 태스크 id 공간이 따로이므로 쌍으로 든다. */
@@ -183,7 +191,7 @@ class SiteCell(
     private val clock = requireNotNull(mimic.robotIds.minOrNull()?.let { mimic.instance(it) }) { "기체가 없는 현장이다" }.clock
 
     /** 플릿 세계(picasso `fleet-mimic`). 같은 루프백 서버의 `/fleet` 가 이것을 부른다. */
-    val fleet = SiteFleet(mimic, fixture.handovers, fixture.containers)
+    val fleet = SiteFleet(mimic, fixture.handovers, fixture.containers, fence = httpFence)
 
     @Volatile
     var snapshot: CellSnapshot = CellSnapshot(
@@ -197,7 +205,7 @@ class SiteCell(
     private val json = ObjectMapper()
 
     /** 기체 장애 주입(S4a 스펙 §5). 같은 루프백 서버의 `POST /faults` 가 이것을 부른다. */
-    val faults = SiteFaults(mimic)
+    val faults = SiteFaults(mimic, httpFence)
 
     private val server: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0).apply {
         createContext("/cell", ::handle)
@@ -288,7 +296,23 @@ class SiteCell(
 
     private fun respond(exchange: HttpExchange) {
         val path = exchange.requestURI.path
-        val (status, body) = when {
+        val scope = httpFence.scope(exchange, SiteHttpFence.CELL)
+        // 통과한 신호 쓰기의 표지는 스냅숏을 갈아 끼운 뒤(엔진 잠금을 놓은 뒤) 닫는다.
+        val (status, body) = scope.use { scope.malformed?.let { 400 to rejection(BAD_REQUEST, it) } ?: route(exchange, path, scope) }
+        scope.stamp()
+        if (body.isNotEmpty()) exchange.responseHeaders.add("Content-Type", "application/json")
+        exchange.sendResponseHeaders(status, if (body.isEmpty()) -1 else body.size.toLong())
+        if (body.isNotEmpty()) exchange.responseBody.write(body)
+    }
+
+    private fun route(exchange: HttpExchange, path: String, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> =
+        when {
+            path == CONFIRM -> if (exchange.requestMethod == "POST") {
+                confirm(exchange, scope)
+            } else {
+                exchange.responseHeaders.add("Allow", "POST")
+                405 to ByteArray(0)
+            }
             path == "/cell" -> if (exchange.requestMethod == "GET") {
                 200 to json.writeValueAsBytes(wire(snapshot))
             } else {
@@ -297,16 +321,23 @@ class SiteCell(
             }
             path.startsWith(SIGNALS_PREFIX) && path.length > SIGNALS_PREFIX.length && '/' !in path.substring(SIGNALS_PREFIX.length) ->
                 if (exchange.requestMethod == "POST") {
-                    signal(exchange, path.substring(SIGNALS_PREFIX.length))
+                    signal(exchange, path.substring(SIGNALS_PREFIX.length), scope)
                 } else {
                     exchange.responseHeaders.add("Allow", "POST")
                     405 to ByteArray(0)
                 }
             else -> 404 to ByteArray(0)
         }
-        if (body.isNotEmpty()) exchange.responseHeaders.add("Content-Type", "application/json")
-        exchange.sendResponseHeaders(status, if (body.isEmpty()) -1 else body.size.toLong())
-        if (body.isNotEmpty()) exchange.responseBody.write(body)
+
+    /** `POST /cell/controller/confirm` — 셀 키의 인수 확인. 본문은 JSON 객체(`{}`)이고 세대는 헤더다. 기동 ID 는 플릿 핸들 접두와 같은 값이다. */
+    private fun confirm(exchange: HttpExchange, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> {
+        val contentType = exchange.requestHeaders.getFirst("Content-Type")?.substringBefore(';')?.trim()
+        if (!contentType.equals("application/json", ignoreCase = true)) {
+            return 415 to rejection(UNSUPPORTED_MEDIA_TYPE, "Content-Type 이 application/json 이 아니다: ${contentType ?: "없음"}")
+        }
+        runCatching { json.readTree(exchange.requestBody.readAllBytes()) }.getOrNull()?.takeIf { it.isObject }
+            ?: return 400 to rejection(BAD_REQUEST, "본문이 JSON 객체({})가 아니다")
+        return httpFence.confirmReply(SiteHttpFence.CELL, scope.requested, fleet.boot)
     }
 
     /**
@@ -315,7 +346,7 @@ class SiteCell(
      *
      * `application/json` 만 받는다. 브라우저의 단순 요청(폼·`text/plain`)은 사전 요청 없이 다른 출처에서 올 수 있다.
      */
-    private fun signal(exchange: HttpExchange, name: String): Pair<Int, ByteArray> {
+    private fun signal(exchange: HttpExchange, name: String, scope: SiteHttpFence.Scope): Pair<Int, ByteArray> {
         val contentType = exchange.requestHeaders.getFirst("Content-Type")?.substringBefore(';')?.trim()
         if (!contentType.equals("application/json", ignoreCase = true)) {
             return 415 to rejection(UNSUPPORTED_MEDIA_TYPE, "Content-Type 이 application/json 이 아니다: ${contentType ?: "없음"}")
@@ -323,9 +354,11 @@ class SiteCell(
         val node: JsonNode? = runCatching { json.readTree(exchange.requestBody.readAllBytes()) }.getOrNull()
         val value = node?.takeIf { it.isObject }?.get("value")?.takeIf { it.isTextual }?.asText()
             ?: return 400 to rejection(BAD_REQUEST, "본문이 {\"value\": \"<문자열>\"} 모양이 아니다")
-        return when (val written = write(name, value)) {
-            is SignalWrite.Written -> 200 to json.writeValueAsBytes(wireSignal(written.signal))
-            is SignalWrite.Refused -> written.status to rejection(written.error, written.detail)
+        return scope.mutation(FencedCall.START) {
+            when (val written = write(name, value)) {
+                is SignalWrite.Written -> 200 to json.writeValueAsBytes(wireSignal(written.signal))
+                is SignalWrite.Refused -> written.status to rejection(written.error, written.detail)
+            }
         }
     }
 
@@ -373,6 +406,9 @@ class SiteCell(
         const val NOT_SAFETY_SIGNAL = "NOT_SAFETY_SIGNAL"
 
         private const val SIGNALS_PREFIX = "/cell/signals/"
+
+        /** 셀 면의 제어자 세대 인수 확인. */
+        const val CONFIRM = "/cell/controller/confirm"
 
         /** 계약 카탈로그의 스킬 이름과 파라미터 키. */
         private const val PICK_PLACE = "pick_place"

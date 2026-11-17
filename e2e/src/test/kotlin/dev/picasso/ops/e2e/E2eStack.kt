@@ -36,6 +36,9 @@ import java.time.Instant
  * 수명이다(DB 를 비우면 리스 세대가 1 부터 다시 시작하므로 앞 바닥값이 남으면 새 세대가 모두 거절된다). [restartHost] 는 같은 현장(같은 바닥값)을
  * 쓴다. 이 세트는 미믹에 직접 명령하지 않는다 — 명령은 모두 세대를 싣는 실행 호스트를 거친다.
  *
+ * 현장 HTTP 면(플릿 맡기기·취소, 셀 신호 쓰기, 결함 주입)도 세대를 대조한다(`SITE_HTTP_FENCE=on`, 바닥값은 같은 디렉터리의 `site/`). 이 세트의 변경 HTTP 도
+ * 모두 실행 호스트를 거치므로 세대가 실린다.
+ *
  * 실행 호스트의 시계는 현장 시계(`Site.now()`)다. 시험은 `Site.advance` 로 가상 시각을 실제 시각보다 앞으로 밀고, 미들웨어는
  * E2 시간 윈도우의 기준 시각을 mimic 응답 헤더에서 가져오면서 마감은 호스트 시계로 보므로 둘이 같아야 한다(S3a 스펙 §7.2).
  */
@@ -142,6 +145,7 @@ class E2eStack private constructor(
                         ingestToken = "e2e-ingest",
                         roster = RobotRoster.read(root.resolve(SiteConfig.ROSTER)),
                         fenceDir = fenceDir,
+                        httpFence = true,
                     ),
                 )
             } catch (e: Exception) {

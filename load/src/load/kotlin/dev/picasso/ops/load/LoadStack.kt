@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpServer
 import dev.picasso.adapter.host.FileFenceStore
 import dev.picasso.contracts.wire.ControllerFence
 import dev.picasso.contracts.wire.FenceMode
+import dev.picasso.contracts.wire.FencedCall
 import dev.picasso.mimic.cli.MimicCli
 import dev.picasso.ops.host.HostClock
 import dev.picasso.ops.host.MissionHost
@@ -13,6 +14,8 @@ import dev.picasso.ops.host.MissionHostApplication
 import dev.picasso.ops.host.lease.HostExit
 import dev.picasso.ops.service.OpsApplication
 import dev.picasso.ops.service.store.OpsSchema
+import dev.picasso.ops.site.SiteCell
+import dev.picasso.ops.site.SiteHttpFence
 import org.springframework.boot.web.context.WebServerApplicationContext
 import org.springframework.context.ConfigurableApplicationContext
 import org.testcontainers.containers.PostgreSQLContainer
@@ -39,7 +42,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *   registry 는 띄우지 않는다(측정 경로가 registry 를 부르지 않는다).
  *
  * [fenced] 면 mimic 이 제어자 세대를 대조하고(`FENCED`, picasso ADR 54) 바닥값을 세트마다 새 임시 디렉터리의 `FileFenceStore` 에 둔다(컨테이너 DB 와
- * 같은 수명). 인수 시나리오의 대조 변형만 켠다 — 나머지 측정은 오늘 거동(`UNFENCED`)이다.
+ * 같은 수명). 인수 시나리오의 대조 변형만 켠다 — 나머지 측정은 오늘 거동(`UNFENCED`)이다. 그때 셀 대역 대역도 현장 HTTP 면 대조(`SITE_HTTP_FENCE=on` 과
+ * 같은 [SiteHttpFence], 바닥값은 같은 디렉터리의 `site/`)로 신호 쓰기를 맞대고 인수 확인에 답한다.
  */
 class LoadStack(
     val robots: Int,
@@ -72,6 +76,10 @@ class LoadStack(
     private val fenceDir: Path? = if (fenced) java.nio.file.Files.createTempDirectory("load-fence") else null
     private val fenceStore: FileFenceStore? = fenceDir?.let(::FileFenceStore)
 
+    /** 셀 대역 대역의 현장 HTTP 면 대조. [fenced] 가 아니면 대조하지 않는다(응답 바닥값 0, 인수 확인은 `UNSPECIFIED`). */
+    private val siteFenceStore: FileFenceStore? = fenceDir?.let { FileFenceStore(it.resolve("site")) }
+    private val cellFence = SiteHttpFence(siteFenceStore?.let { ControllerFence(FenceMode.FENCED, it) } ?: ControllerFence())
+
     val mimic: MimicCli.Started = checkNotNull(
         MimicCli().start(
             robots = robotIds.associateWith { ROOT.resolve("picasso/profile/profiles/humanoid-a.json") },
@@ -93,10 +101,20 @@ class LoadStack(
 
     private val cell: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0).apply {
         createContext("/cell") { exchange ->
-            val bytes = (if (exchange.requestMethod == "POST") """{"name":"x","value":"true"}""" else cellBody).toByteArray()
+            exchange.requestBody.readAllBytes()
+            val scope = cellFence.scope(exchange, SiteHttpFence.CELL)
+            val (status, bytes) = scope.use {
+                when {
+                    scope.malformed != null -> 400 to ByteArray(0)
+                    exchange.requestURI.path == SiteCell.CONFIRM -> cellFence.confirmReply(SiteHttpFence.CELL, scope.requested, "load")
+                    exchange.requestMethod == "POST" -> scope.mutation(FencedCall.START) { 200 to """{"name":"x","value":"true"}""".toByteArray() }
+                    else -> 200 to cellBody.toByteArray()
+                }
+            }
+            scope.stamp()
             exchange.responseHeaders.add("Content-Type", "application/json")
-            exchange.sendResponseHeaders(200, bytes.size.toLong())
-            exchange.responseBody.write(bytes)
+            exchange.sendResponseHeaders(status, if (bytes.isEmpty()) -1 else bytes.size.toLong())
+            if (bytes.isNotEmpty()) exchange.responseBody.write(bytes)
             exchange.close()
         }
         start()
@@ -236,6 +254,7 @@ class LoadStack(
         runCatching { callback.stop(0) }
         runCatching { mimic.server.shutdown() }
         runCatching { fenceStore?.close() }
+        runCatching { siteFenceStore?.close() }
         runCatching { fenceDir?.toFile()?.deleteRecursively() }
         runCatching { pg.stop() }
     }

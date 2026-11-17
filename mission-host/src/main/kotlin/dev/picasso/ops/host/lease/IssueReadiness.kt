@@ -84,5 +84,8 @@ fun retreats(mine: Long, snapshot: RobotSnapshot): Boolean {
         floor == mine && (snapshot.fenceStatus == FenceStatus.FENCE_STATUS_VOLATILE || snapshot.fenceStatus == FenceStatus.FENCE_STATUS_UNSPECIFIED)
 }
 
-/** 플릿이 준비되지 않은 까닭. 플릿 HTTP 경로는 세대를 대조하지 않으므로(다음 단계) 지금은 늘 이것이다. */
-const val FLEET_NOT_FENCED = "플릿 수신자 대조 없음(운영자 확인 필요)"
+/**
+ * 플릿이 준비되지 않은 까닭. 현장 플릿 면이 세대를 대조해도(`SITE_HTTP_FENCE=on`) 관측 중 플릿 준비(플릿 인수 확인의 소비·재대조·근거)는 다음 단계라
+ * 지금은 늘 이것이다.
+ */
+const val FLEET_NOT_FENCED = "플릿 준비 확인 없음(운영자 확인 필요)"
