@@ -35,7 +35,8 @@ class HttpEpochHostTest {
             assertTrue(generation > 0)
             eventually("획득 뒤 첫 셀 인수 확인") { bench.confirms().isNotEmpty() }
             assertEquals(generation.toString(), bench.confirms().first())
-            assertEquals(200, bench.bean(SiteFenceConfirmer::class.java).last(SiteFenceConfirmer.CELL)?.status)
+            // 대역이 요청을 적은 뒤 확인기가 응답을 처리해 남기기까지 틈이 있다 — 그 결과를 기다린다.
+            eventually("첫 셀 인수 확인 결과 200") { bench.bean(SiteFenceConfirmer::class.java).last(SiteFenceConfirmer.CELL)?.status == 200 }
 
             // 다음 확인을 대역 안에서 붙잡는다 — 그동안 pump(셀 읽기)와 호스트 잠금을 쓰는 조회가 막히지 않는다.
             val entered = CountDownLatch(1)
