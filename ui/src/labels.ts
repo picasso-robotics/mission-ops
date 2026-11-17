@@ -611,6 +611,26 @@ export const WITHHELD_ISSUE_LABEL: Record<string, string> = {
   IN_DOUBT_LOOKUP: '미확정 조회',
 }
 
+/**
+ * 권위로 막힌 새 로봇 명령(picasso ADR 54, 까닭 `AUTHORITY_NOT_HELD`). 실행 호스트가 만료 인수 뒤 관측 중이라 이 실행이 든 기체 가운데 수신자가
+ * 이 호스트의 세대를 아직 확인하지 않은 기체가 있다(막는 주체가 «인수 확인 대기» 로 시작하고 막는 기체와 까닭이 실림). 같은 까닭의 밀려남·권위 포트
+ * 읽기 실패는 이 문구가 아니라 일반 문구로 보인다. 작업 허가·퇴역과 같은
+ * 자리지만 풀리는 길이 다르다 — 수신자의 자동 확인이나 운영자의 인수 확인이다. 권위만으로 막혔으면 [PERMIT_BLOCK_TEXT] 의 제목과 안내 대신 이것을
+ * 쓰고, 다른 까닭과 섞였으면 [mixed] 를 더한다.
+ */
+export const AUTHORITY_BLOCK_TEXT = {
+  heading: '인수 확인 대기',
+  /** 실행 호스트가 관측 중 아직 열지 않은 기체의 권위 까닭은 막는 주체가 이것으로 시작한다(밀려남·권위 포트 읽기 실패와 가른다). */
+  subjectPrefix: '인수 확인 대기',
+  intro:
+    '실행 호스트가 앞 호스트에게서 넘겨받은 뒤 이 실행의 기체를 아직 열지 않아 새 로봇 명령을 내지 않고 기다립니다. 실패나 운영자 보류가 아닙니다.',
+  resume:
+    '이 실행이 든 기체 모두의 수신자가 이 호스트의 세대를 확인하면 자동으로 다음 pump 에 명령을 냅니다. 대조하지 않는 기체나 플릿 운반이 든 실행은 운영자가 인수 확인(옛 호스트 종료 확인)을 해야 풀립니다.',
+  notStop:
+    '이 대기는 기체를 세우지 않습니다. 이미 나간 명령은 그대로이고, 옛 호스트의 늦은 명령은 대조하는 수신자가 거절합니다.',
+  mixed: '까닭이 인수 확인 대기인 기체는 수신자의 자동 확인이나 운영자의 인수 확인으로 풀립니다.',
+}
+
 /** 허가 판정의 까닭(picasso PermitCause). */
 export const PERMIT_CAUSE_LABEL: Record<string, string> = {
   REPORTED: '원천 보고',
@@ -620,6 +640,16 @@ export const PERMIT_CAUSE_LABEL: Record<string, string> = {
   NOT_COVERED: '허가 원천 없음',
   PORT_FAILED: '허가를 읽지 못함',
   RETIRED: '퇴역',
+  AUTHORITY_NOT_HELD: '권위 없음',
+}
+
+/**
+ * 까닭 한 줄의 라벨. `AUTHORITY_NOT_HELD` 는 막는 주체가 [AUTHORITY_BLOCK_TEXT.subjectPrefix] 로 시작할 때만(관측 중 아직 열지 않은 기체) «인수 확인
+ * 대기» 이고, 그 밖(밀려남·권위 포트 읽기 실패)은 일반 라벨 «권위 없음» 이다.
+ */
+export function permitCauseLabel(reason: { cause: string; subject: string | null }): string {
+  if (reason.cause === 'AUTHORITY_NOT_HELD' && (reason.subject ?? '').startsWith(AUTHORITY_BLOCK_TEXT.subjectPrefix)) return AUTHORITY_BLOCK_TEXT.heading
+  return PERMIT_CAUSE_LABEL[reason.cause] ?? reason.cause
 }
 
 /** 호스트의 플릿 연결(`GET /api/executions/summary` 의 `fleet`)에 따른 덧붙임. 모르면 단정하지 않는다. */

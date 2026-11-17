@@ -1,5 +1,8 @@
 package dev.picasso.ops.site
 
+import dev.picasso.adapter.host.FileFenceStore
+import dev.picasso.contracts.wire.ControllerFence
+import dev.picasso.contracts.wire.FenceMode
 import dev.picasso.harness.revision.HttpTestDesk
 import dev.picasso.harness.revision.RevisionSuites
 import dev.picasso.harness.revision.RevisionTestRunner
@@ -25,6 +28,12 @@ import java.time.Instant
  * `state_as_of` 에서 가져오고 마감은 자기 시계로 보므로, EPOCH 에서 시작하면 둘이 어긋난다. 그 뒤 런처는 [advanceTo] 로
  * 실제 시각을 따라잡는다. [now]·시계 밀기·셀 대역의 훑기·[teach]·장애 주입은 모두 `MimicServer.exclusive` 아래에서 돈다. 가상
  * 시계는 다른 스레드에서 읽을 때 최신 값이 보인다는 보장이 없으므로 잠금이 그 가시성도 맡는다.
+ *
+ * ## 수신자 세대 대조(picasso ADR 54)
+ *
+ * [SiteConfig.fenceDir] 가 있으면 mimic 을 `FENCED` 로 띄우고 기체 바닥값을 [FileFenceStore](내구 저장, 디렉터리 배타 잠금)에 둔다 — 실행 호스트의
+ * 만료 인수가 그 기체를 자동으로 열 자격(`DURABLE_CONFIRMED`)이 여기서 선다. 없으면 `UNFENCED` 다(응답 바닥값 0, 실행 호스트는 그 기체를 운영자
+ * 확인으로 둔다). 기동 순서는 현장 먼저다 — 실행 호스트가 먼저 떠서 세대를 실은 읽기가 대조 안 하는 현장에 닿으면 그 기체를 자동으로 열지 않는다.
  */
 class Site private constructor(
     private val registry: ConfigurableApplicationContext,
@@ -35,7 +44,12 @@ class Site private constructor(
     private val link: RegistryLink,
     val registryUrl: String,
     val robotIds: Set<String>,
+    /** 바닥값 파일 저장. [SiteConfig.fenceDir] 가 없으면 `null`(대조 안 함). 닫으면 디렉터리 잠금을 놓는다. */
+    private val fenceStore: FileFenceStore? = null,
 ) : AutoCloseable {
+
+    /** mimic 이 제어자 세대를 대조하는가(`FENCED`). */
+    val fenced: Boolean get() = fenceStore != null
 
     /** 기체들이 함께 보는 가상 시계. `MimicCli` 가 시계 하나를 만들어 모든 기체에 넘긴다. */
     private val clock = requireNotNull(mimic.instance(robotIds.first())) { "기체가 없는 현장이다" }.clock
@@ -135,7 +149,11 @@ class Site private constructor(
                     // 서버를 내리고 적재 큐를 비운다(MimicCli.Started.close).
                     mimic.close()
                 } finally {
-                    if (registry.isActive) registry.close()
+                    try {
+                        fenceStore?.close()
+                    } finally {
+                        if (registry.isActive) registry.close()
+                    }
                 }
             }
         }
@@ -168,6 +186,15 @@ class Site private constructor(
             val err = StringBuilder()
             // 폴백 디렉터리는 두지 않는다. 생존 보고는 폴백이 없고, S1 은 태스크 관측을 쓰지 않는다.
             val link = RegistryLink.http(registryUrl, config.ingestToken, config.siteId, null)
+            // 수신자 세대 대조. 디렉터리를 다른 현장이 쓰고 있거나 바닥값 파일이 손상이면 여기서 던져 현장이 뜨지 않는다(옛 세대가 통과하지 않게).
+            val fenceStore = try {
+                config.robotFenceDir?.let(::FileFenceStore)
+            } catch (e: Exception) {
+                link.close()
+                registry.close()
+                throw e
+            }
+            val fence = fenceStore?.let { ControllerFence(FenceMode.FENCED, it) } ?: ControllerFence()
             val mimic = try {
                 MimicCli().start(
                     robots = config.roster.associate { it.robotId to config.profile(it) },
@@ -180,14 +207,17 @@ class Site private constructor(
                     link = link,
                     broker = null,
                     site = config.siteId,
+                    fence = fence,
                 )
             } catch (e: Exception) {
                 link.close()
+                fenceStore?.close()
                 registry.close()
                 throw e
             }
             if (mimic == null) {
                 link.close()
+                fenceStore?.close()
                 registry.close()
                 error("mimic 기동 거부: $err")
             }
@@ -199,6 +229,7 @@ class Site private constructor(
                 SiteCell(mimic, config.cell, config.cellPort)
             } catch (e: Exception) {
                 mimic.close()
+                fenceStore?.close()
                 registry.close()
                 throw e
             }
@@ -214,11 +245,12 @@ class Site private constructor(
             } catch (e: Exception) {
                 cell.close()
                 mimic.close()
+                fenceStore?.close()
                 registry.close()
                 throw e
             }
             // ⑧ 가상 시계를 실제 시각까지 한 번 민다(S3a 스펙 §6.1). 한 번에 크게 밀어도 된다(MimicServer.advance).
-            val site = Site(registry, mimic, cell, runner, link, registryUrl, mimic.robotIds)
+            val site = Site(registry, mimic, cell, runner, link, registryUrl, mimic.robotIds, fenceStore)
             try {
                 site.advanceTo(Instant.now())
                 // 플릿 세계의 처음 용기는 셀 대역을 지을 때(가상 시계 EPOCH) 놓였다. 실제 시각까지 민 뒤 그 시각으로 다시 찍는다.

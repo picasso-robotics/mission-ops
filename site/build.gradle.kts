@@ -16,6 +16,9 @@ dependencies {
     // 플릿 세계(SiteFleet). 셀 대역 서버의 `/fleet` 면이 이 미믹 하나를 연다(picasso §15.326). 미믹이 picasso 를 api 로 들어
     // AmrFleetPort·TransportOrder 가 함께 보인다. 그 HTTP 면은 mission-ops 안의 약속이고 picasso 계약이 아니다.
     implementation("dev.picasso:fleet-mimic")
+    // 수신자 세대 대조(picasso ADR 54). `SITE_FENCE_DIR` 이 있으면 mimic 을 FENCED 로 띄우고 바닥값을 이 모듈의 `FileFenceStore` 로 파일에 둔다.
+    // 새로 끌려오는 것은 adapter-core 하나다(나머지는 mimic 이 이미 든다).
+    implementation("dev.picasso:adapter-host")
 
     // registry 는 Spring Boot·Flyway 를 implementation 으로만 쓴다. 런처가 직접 부르므로 여기서도 적는다.
     implementation(platform(libs.spring.boot.bom))

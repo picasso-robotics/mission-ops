@@ -648,10 +648,25 @@ export const faultBlocked = (execution: Execution) => (execution.blockedFaults?.
 /** 작업 허가 값(ADR 52). UNKNOWN 은 막음으로 읽는다. */
 export type WorkPermitValue = 'PERMITTED' | 'INHIBITED' | 'UNKNOWN'
 
-/** 기체 하나에 대한 판단 하나. source·observedAt 은 실행 호스트가 정한 까닭(NOT_COVERED·PORT_FAILED)이면 null 이다. */
+/**
+ * 판단의 까닭(picasso PermitCause). 작업 허가 원천의 것, 실행 호스트가 정한 것(NOT_COVERED·PORT_FAILED), 퇴역(RETIRED), 권위(AUTHORITY_NOT_HELD —
+ * 만료 인수 뒤 아직 열지 않은 기체, 또는 수신자에게서 밀려남). 모르는 값이 와도 그대로 보인다.
+ */
+export type PermitCause =
+  | 'REPORTED'
+  | 'EXPIRED'
+  | 'SESSION_CHANGED'
+  | 'SCOPE_UNKNOWN'
+  | 'NOT_COVERED'
+  | 'PORT_FAILED'
+  | 'RETIRED'
+  | 'AUTHORITY_NOT_HELD'
+
+/** 기체 하나에 대한 판단 하나. source·observedAt 은 실행 호스트가 정한 까닭(NOT_COVERED·PORT_FAILED·RETIRED·AUTHORITY_NOT_HELD)이면 null 이다. */
 export interface PermitReason {
   source: string | null
-  cause: string
+  /** 모르는 까닭도 문자열 그대로 받는다(호스트가 picasso 를 올리면 새 값이 올 수 있다). */
+  cause: PermitCause | (string & {})
   subject: string | null
   resumeBasis: string
   observedAt: string | null

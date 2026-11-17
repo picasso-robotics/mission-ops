@@ -90,8 +90,9 @@ open class MissionHostApplication {
         @Value("\${spring.datasource.url}") url: String,
         @Value("\${spring.datasource.username}") username: String,
         @Value("\${spring.datasource.password}") password: String,
+        @Value("\${host.readiness.unread-retry}") unreadRetry: Duration,
     ): HostLeadership = HostLeadership(
-        HostLease("mw-${java.util.UUID.randomUUID()}", timing, LeaseConnections.direct(url, username, password, timing)), timing, exit,
+        HostLease("mw-${java.util.UUID.randomUUID()}", timing, LeaseConnections.direct(url, username, password, timing)), timing, exit, unreadRetry,
     )
 
     /** DB 쓰기 펜싱(V19). 기록 저장소 둘의 쓰기가 이것을 지난다. 리스 불일치를 보면 리더를 잃음으로 넘긴다. */
@@ -115,12 +116,20 @@ open class MissionHostApplication {
      *
      * 출발·취소는 [IssuingRobotPort] 의 송신 스레드에서 gRPC 호출 바로 앞에 리더를 확인한다([GatedRobotPort], 송신 직전 로컬 권위 확인).
      *
-     * 시험은 [builder] 로 다른 포트를 먼저 넣고, 그러면 이 빈은 만들어지지 않는다.
+     * gRPC 클라이언트는 요청마다 리스 세대를 싣고([clientPort] — 대기·잃음이면 0), 수신자가 더 높은 바닥값을 알려 오면(밀려남) 리더를 잃음으로
+     * 넘긴다([HostLeadership.superseded]). 수신자가 세대를 대조할 때만 뜻이 있다(picasso ADR 54).
+     *
+     * 시험은 [builder] 로 다른 포트를 먼저 넣거나([RobotWiring]) 배선을 바꾸고, 그러면 이 빈의 기본 배선은 쓰이지 않는다.
      */
     @Bean(destroyMethod = "close")
     @ConditionalOnMissingBean(RobotPort::class)
-    open fun robotPort(channel: ManagedChannel, clock: HostClock, leadership: HostLeadership): RobotPort =
-        HostRobotPort(GatedRobotPort(ClientRobotPort(PicassoClient(channel, CLIENT_ID)), leadership), clock)
+    open fun robotPort(
+        channel: ManagedChannel,
+        clock: HostClock,
+        leadership: HostLeadership,
+        wiring: org.springframework.beans.factory.ObjectProvider<RobotWiring>,
+    ): RobotPort = wiring.ifAvailable?.port(leadership, clock)
+        ?: HostRobotPort(GatedRobotPort(clientPort(channel, leadership::controllerEpoch, leadership::superseded), leadership), clock)
 
     /**
      * 플릿 포트(`host.fleet.url`). 비우면 `AmrFleetPort.None` 이다 — 플릿 운반 단위가 든 계획을 받지 않는다(`FLEET_PORT_ABSENT`). 값이 있으면 현장
@@ -325,6 +334,16 @@ open class MissionHostApplication {
         const val CLIENT_ID = "mission-host"
 
         /**
+         * 수신자 하나에 붙는 gRPC 기체 포트. 요청 머리말에 [epoch] 를 싣고(picasso `PicassoClient` 는 처음 본 0 아닌 값을 붙잡는다), 수신자가 이 세대보다
+         * 높은 바닥값을 알려 오면 [superseded] 를 한 번 부른다(밀려남만 — 세대 0·범위 밖·자격 없음 거절은 부르지 않는다).
+         */
+        fun clientPort(channel: io.grpc.Channel, epoch: () -> Long, superseded: (String, Long, Long) -> Unit): ClientRobotPort =
+            ClientRobotPort(
+                PicassoClient(channel, CLIENT_ID, controllerEpoch = epoch),
+                onSuperseded = ClientRobotPort.Superseded { robotId, mine, floor -> superseded(robotId, mine, floor) },
+            )
+
+        /**
          * 플릿 주소에서 포트를 짓는다. 비어 있으면 [AmrFleetPort.None] 이다(스위치 값 없음 — 주소가 곧 선언). 주소가 있으면 기동 탐침
          * ([HttpFleetPort.probe])을 한 번 한다 — 4xx 등(예: 다른 서버, `/fleet` 면이 없는 현장의 404·405)이면 오설정이라 기동을 멈춘다. 안 닿거나 5xx 면
          * 일시 장애로 보아 경고만 남기고 뜬다(현장이 늦게 뜨거나 잠시 아플 수 있다). 맡기기·취소는 송신 스레드에서 [authority] 를 확인한다
@@ -361,13 +380,15 @@ open class MissionHostApplication {
          * @param retention 주면 [MissionHost.RETENTION] 대신 이것을 미들웨어 보존 상한으로 쓴다(호스트 시험이 작은 놓은 작업 지시 표시 상한을 넣는다).
          * @param fleet 주면 `host.fleet.url` 대신 이것을 플릿 포트로 쓴다(호스트 시험이 프로세스 안의 플릿 미믹을 넣는다). 닫지 않는다.
          * @param exit 주면 리스를 잃었을 때 프로세스를 끝내는 대신 이것을 부른다(시험이 같은 JVM 에서 잃음을 본다).
+         * @param wiring 주면 기본 기체 포트 배선 대신 이것으로 짓는다([RobotWiring] — 리더를 받아 세대 공급을 잇는다). [robots] 와 함께 주지 않는다.
          */
         fun builder(
             clock: HostClock? = null, robots: RobotPort? = null, retention: Retention? = null, fleet: AmrFleetPort? = null, exit: HostExit? = null,
+            wiring: RobotWiring? = null,
         ): SpringApplicationBuilder {
             val builder = SpringApplicationBuilder(MissionHostApplication::class.java)
                 .properties("spring.config.name=mission-host")
-            if (clock != null || robots != null || retention != null || fleet != null || exit != null) {
+            if (clock != null || robots != null || retention != null || fleet != null || exit != null || wiring != null) {
                 builder.initializers(
                     ApplicationContextInitializer<ConfigurableApplicationContext> {
                         clock?.let { c -> it.beanFactory.registerSingleton("hostClock", c) }
@@ -375,12 +396,22 @@ open class MissionHostApplication {
                         retention?.let { r -> it.beanFactory.registerSingleton("hostRetention", r) }
                         fleet?.let { f -> it.beanFactory.registerSingleton("testFleetPort", f) }
                         exit?.let { e -> it.beanFactory.registerSingleton("hostExit", e) }
+                        wiring?.let { w -> it.beanFactory.registerSingleton("testRobotWiring", w) }
                     },
                 )
             }
             return builder
         }
     }
+}
+
+/**
+ * 기체 포트를 리더와 함께 짓는 배선. 기본 배선([MissionHostApplication.robotPort])은 같은 기계의 mimic 하나에 붙는다. 시험이 수신자를 기체마다 달리
+ * 두거나(대조하는 수신자와 안 하는 수신자) 가짜 포트를 넣을 때 [MissionHostApplication.builder] 로 넘긴다 — 세대 공급([HostLeadership.controllerEpoch])과
+ * 밀려남([HostLeadership.superseded])을 운영 배선과 같은 함수([MissionHostApplication.clientPort])로 잇는다. 닫는 것은 기체 포트 빈의 `close` 다.
+ */
+fun interface RobotWiring {
+    fun port(leadership: HostLeadership, clock: HostClock): RobotPort
 }
 
 fun main(args: Array<String>) {
