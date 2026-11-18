@@ -73,7 +73,7 @@ class HttpEpochHostTest {
 
             bench.cellFloor = generation + 1
             bench.awaitLeader(LeaderState.LOST, Duration.ofSeconds(10))
-            assertTrue(bench.leadership.lostReason!!.contains("robot=셀"), bench.leadership.lostReason)
+            assertTrue(bench.leadership.lostReason!!.contains("대상=셀"), bench.leadership.lostReason)
             eventually("종료 훅") { bench.exits.isNotEmpty() }
         }
     }
@@ -100,7 +100,7 @@ class HttpEpochHostTest {
             assertEquals(409, relayed.status, "«현장이 안 닿음»(503 CELL_SILENT)으로 접지 않는다")
             assertEquals(HostBench.JSON.readTree(stale), relayed.body)
             assertEquals(LeaderState.LOST, bench.leadership.state)
-            assertTrue(bench.leadership.lostReason!!.contains("robot=셀"), bench.leadership.lostReason)
+            assertTrue(bench.leadership.lostReason!!.contains("대상=셀"), bench.leadership.lostReason)
             assertEquals(generation.toString(), bench.cellEpochs.last { it.first == "/cell/signals/lot_code" }.second)
         }
     }

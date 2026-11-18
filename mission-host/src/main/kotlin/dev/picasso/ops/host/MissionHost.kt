@@ -731,6 +731,21 @@ class MissionHost(
         (robots as? HostRobotPort)?.onOtherRead = { robot, snapshot, seq -> leadership.observePrefetched(robot, snapshot, seq) }
         // 관측 중 미리 읽은 값이 없는 미준비 기체는 첫 관측 뒤로는 기체별 간격마다 한 번만 잠금 아래에서 동기로 읽는다.
         (robots as? HostRobotPort)?.unreadFallback = leadership::allowUnreadFallback
+        // 플릿 인수 확인의 답(호스트 잠금 밖의 확인 스레드)과 플릿 읽기 응답의 바닥값을 준비 판정에 넘긴다(HA 3단계 PR B2).
+        val fleetHost = fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort
+        leadership.fleetConfirmable(fleetHost?.confirm != null)
+        fleetHost?.onConfirm = { seq, answer ->
+            leadership.observeFleetConfirm(seq, answer, fleetHost.handleBoots(), clock.now())
+            answer?.takeIf { it.status == 200 }?.receiverBootId?.let { boot ->
+                // 더 뒤의 확인이 본 기동만 남긴다(확인 순번 단조).
+                lastFleetBoot.accumulateAndGet(ObservedBoot(boot, seq)) { prev, next -> if (prev == null || next!!.seq > prev.seq) next else prev }
+            }
+            persistFleetRestart(fleetHost.url)
+            noteFleetBoot(fleetHost.url, lastFleetBoot.get())
+        }
+        // 발행에 든 순간 그 시점의 확인 기동을 곧바로 기준으로 적는다(다음 확인을 기다리는 창을 두지 않는다). 그 기동을 본 확인의 순번을 싣는다.
+        if (fleetHost != null) leadership.onIssuing = { noteFleetBoot(fleetHost.url, lastFleetBoot.get()) }
+        fleetHost?.onReadFloor = leadership::observeFleetFloor
     }
 
     /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
@@ -927,6 +942,8 @@ class MissionHost(
      * 다시 읽어 실행을 다시 짓는다. 그 뒤 리더가 발행([LeaderState.ISSUING]) 또는 관측([LeaderState.HOLDING])에 들고 pump 가 시작한다.
      */
     override fun acquired(acquired: Acquired) {
+        // 앞 근거의 현장 플릿 기동 ID 를 기준으로 둔다 — 이번 확인의 기동 ID 가 다르면 현장이 그 사이 다시 떴다(운영자 확인).
+        readFleetBaseline()
         lock.withLock { catalog.restore(store.activeVersions()) }
         restore()
         leadership.reconciled()
@@ -990,7 +1007,18 @@ class MissionHost(
      */
     private fun refreshRequirements() {
         leadership.requirements = middleware.executions().filter { it.physicalState.pumps }.map { e ->
-            Requirement(e.executionId, e.order.jobOrderId, e.robots.toSet(), e.units.any { it.route == Route.FLEET })
+            // 요구 기체는 기체 단위를 맡은 기체뿐이다 — 플릿 전용 실행은 플릿 준비만 요구한다. 발행 관문은 실행의 기체 전부로 묻는다(subjects).
+            Requirement(
+                e.executionId, e.order.jobOrderId,
+                e.units.filter { it.route != Route.FLEET }.mapTo(LinkedHashSet()) { e.robotOf(it) },
+                e.units.any { it.route == Route.FLEET },
+                subjects = e.robots.toSet(),
+            )
+        }
+        // 관측 중 플릿 준비의 재대조가 다시 읽을 운반 참조(끝나지 않은 플릿 단위). 형식은 picasso 의 태스크 id(`작업지시#단위`, 재작업이면 `@r<시도>`)다.
+        (fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort)?.references = middleware.executions().filter { it.physicalState.pumps }.flatMapTo(LinkedHashSet()) { e ->
+            e.units.filter { it.route == Route.FLEET && it.state in OPEN_FLEET_UNIT }
+                .map { "${e.order.jobOrderId}#${it.unitId}" + if (it.attempt > 0) "@r${it.attempt}" else "" }
         }
     }
 
@@ -1008,6 +1036,113 @@ class MissionHost(
                 leadership.dropCandidate(ready.robotId)
                 log.warn("기체 {} 의 자동 확인 근거를 적지 못해 열지 않는다(다음 라운드에 다시 읽는다): {}", ready.robotId, e.toString())
             }
+        }
+    }
+
+    /**
+     * 확인 뒤에 보낸 플릿 읽기로 한 pump 의 재대조를 마친 플릿 후보를 연다(HA 3단계 PR B2). 그 pump 에서 미들웨어가 물은 플릿 읽기가 모두 그 라운드에서
+     * 다시 읽은 성공한 답이었고(빠진 것·실패 없음), 그 라운드가 확인 경계보다 뒤에 열렸고 쓴 답의 순번이 모두 경계보다 클 때만 근거(리스 가드 안)를 적고
+     * 래치한다. 적지 못하면 후보를 그대로 두고 다음 pump 가 다시 읽는다. 시간으로 기다리지 않는다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun publishFleetReadiness(result: dev.picasso.ops.host.fleet.HostFleetPort.RoundResult?) {
+        val candidate = leadership.fleetCandidate() ?: return
+        // 기동 기준을 읽기 전에는 열지 않는다(인수 직전 재시작을 못 가른다).
+        if (!fleetBaselineRead) return
+        if (result == null || !result.complete || result.opened <= candidate.boundary) return
+        if (result.minSeq != null && result.minSeq <= candidate.boundary) return
+        val fleetHost = fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort ?: return
+        // 래치 직전에 아는 운반 핸들(이번 pump 가 물은 것 포함)의 기동과 다시 견준다 — 확인이 핸들을 알기 전에 왔어도 재시작을 잡는다.
+        if (!leadership.fleetBootsAgree(candidate, fleetHost.handleBoots())) {
+            persistFleetRestart(fleetHost.url)
+            return
+        }
+        try {
+            records.recordFleetReadiness(
+                candidate.generation, instanceId, fleetHost.url, candidate.bootId, candidate.floor, candidate.fenceStatus, candidate.boundary,
+                candidate.observedAt,
+            )
+            // 근거 행은 «래치 시도» 다 — 적은 뒤 래치가 거짓이면(그 사이 후보가 바뀌거나 잃음·재시작) 행은 그대로 남고(덧붙이기 전용) 열리지 않는다.
+            if (!leadership.latchFleet(candidate)) {
+                log.warn("플릿 자동 확인 근거(확인 순번 {})를 적었으나 그 사이 후보가 바뀌어 열지 않았다 — 근거 행은 래치 시도로 남는다", candidate.boundary)
+            }
+        } catch (e: Exception) {
+            log.warn("플릿 자동 확인 근거를 적지 못해 열지 않는다(다음 pump 에 다시 재대조한다): {}", e.toString())
+        }
+    }
+
+    /**
+     * 기동 ID 기준을 읽었는가. 그 전에는 확인 답을 기록하지 않고(이번 확인이 기준을 덮어 인수 직전 재시작이 지워지지 않게) 플릿을 래치하지 않는다. 획득 때
+     * 읽고, 실패하면 pump 마다 다시 읽는다 — 읽기가 계속 실패하면 이번 보유의 플릿은 운영자 확인으로만 열린다.
+     */
+    @Volatile
+    private var fleetBaselineRead = false
+
+    private fun readFleetBaseline() {
+        if (fleetBaselineRead) return
+        try {
+            leadership.fleetBootBaseline(records.latestFleetBoot())
+            fleetBaselineRead = true
+        } catch (e: Exception) {
+            log.warn("앞 보유자들이 본 현장 플릿 기동 ID 를 읽지 못했다(다음 pump 에 다시 읽는다, 그때까지 플릿을 열지 않는다): {}", e.toString())
+        }
+    }
+
+    /** 확인이 본 현장 플릿 기동 ID 와 그 확인의 요청 순번. */
+    private data class ObservedBoot(val bootId: String, val seq: Long)
+
+    /** 확인 스레드가 마지막으로(가장 큰 확인 순번으로) 본 현장 플릿 기동(발행에 드는 순간 곧바로 적는다). */
+    private val lastFleetBoot = java.util.concurrent.atomic.AtomicReference<ObservedBoot?>(null)
+
+    /** 시험 갈고리: 발행 중 기동 기록을 쓰기 직전(값을 정한 뒤)에 부른다. */
+    @Volatile
+    internal var beforeFleetBootWrite: ((String) -> Unit)? = null
+
+    /** 재시작 판정의 기준 기동을 적었는가. */
+    @Volatile
+    private var fleetRestartPersisted = false
+
+    /**
+     * 이번 보유가 현장 재시작을 판정했으면 그 판정의 기준 기동(앞 장부의 기동)을 기동 기준 표에 적는다(관측 중에도, 한 번). 이 보유자가 운영자 확인 전에 죽고
+     * 다음 보유자가 옛 핸들을 찾지 못해도 기준이 그 옛 기동이라 같은 재시작을 본다. 막는 쪽으로만 작용한다. 실패하면 다음 확인·pump 에 다시 적는다.
+     */
+    private fun persistFleetRestart(fleetId: String) {
+        if (fleetRestartPersisted || !fleetBaselineRead) return
+        // 발행 중(운영자 확인 뒤)에는 적지 않는다 — 그때는 지금 기동이 기준이다(발행 중 기록이 같은 세대에서 늘 앞선다).
+        if (leadership.state == dev.picasso.ops.host.lease.LeaderState.ISSUING) return
+        val basis = leadership.fleetRestartBasis() ?: return
+        val generation = leadership.claim()?.generation ?: return
+        try {
+            records.recordFleetBoot(generation, instanceId, fleetId, basis, observedSeq = 0, restartBasis = true)
+            fleetRestartPersisted = true
+            log.info("현장 플릿 재시작 판정의 기준 기동 {} 을 적었다(다음 보유자도 재시작을 본다)", basis)
+        } catch (e: Exception) {
+            log.warn("재시작 판정의 기준 기동을 적지 못했다(다시 적는다): {}", e.toString())
+        }
+    }
+
+    /** 이 프로세스가 적은 현장 플릿 기동 가운데 확인 순번이 가장 큰 것. */
+    private val fleetBootNoted = java.util.concurrent.atomic.AtomicReference<ObservedBoot?>(null)
+
+    /**
+     * 확인 스레드가 본 현장 플릿 기동 ID 를 적는다(V21 `host_fleet_receiver_boot`, 리스 가드 안, 바뀔 때만). 발행 중(`ISSUING`)에도 적어 «앞 보유자들이 본
+     * 마지막 기동» 이 최신으로 남는다 — 정상 운영 중의 현장 재시작이 다음 인수의 재시작 판정을 오염시키지 않고, 인수 직전(마지막 기록 뒤)의 재시작은 잡힌다.
+     * 실패는 다음 확인에서 다시 적는다. 그 기동을 본 확인의 순번을 함께 적는다 — 발행에 든 순간의 기록과 확인 스레드의 기록이 경쟁해 옛 기동이 늦게 들어가도
+     * 다음 보유자는 순번이 큰(더 뒤에 본) 기동을 고른다(행 순서에 기대지 않는다).
+     */
+    private fun noteFleetBoot(fleetId: String, observed: ObservedBoot?) {
+        val bootId = observed?.bootId
+        if (bootId == null || !fleetBaselineRead || bootId == fleetBootNoted.get()?.bootId) return
+        // 발행 중(정상 종료 인수·운영자 확인 뒤)에만 적는다 — 관측 중의 확인 기동은 재대조가 뒤늦게 재시작을 잡을 수 있어 다음 보유자의 기준으로 확정하지
+        // 않는다(관측 중 자동으로 연 기동은 근거 행이 담는다).
+        if (leadership.state != dev.picasso.ops.host.lease.LeaderState.ISSUING) return
+        val generation = leadership.claim()?.generation ?: return
+        try {
+            beforeFleetBootWrite?.invoke(bootId)
+            records.recordFleetBoot(generation, instanceId, fleetId, bootId, observed.seq)
+            // 늦게 들어간 옛 관측이 «마지막으로 적은 기동» 을 되돌리지 않는다.
+            fleetBootNoted.accumulateAndGet(observed) { prev, next -> if (prev == null || next!!.seq > prev.seq) next else prev }
+        } catch (e: Exception) {
+            log.warn("현장 플릿 기동 ID 를 적지 못했다(다음 확인에 다시 적는다): {}", e.toString())
         }
     }
 
@@ -1189,6 +1324,11 @@ class MissionHost(
         if (state != LeaderState.HOLDING && state != LeaderState.ISSUING) return
         try {
             val cell = cellBand.fetch()
+            // 관측 중 플릿 후보가 있으면 앞 pump 가 물은 플릿 읽기를 지금(잠금 밖) 다시 읽는다 — 확인 경계보다 뒤에 보낸 답만 그 pump 의 재대조에 쓴다.
+            val fleetHost = fleetPort as? dev.picasso.ops.host.fleet.HostFleetPort
+            if (fleetHost != null && !fleetBaselineRead && leadership.claim() != null) readFleetBaseline()
+            if (fleetHost != null) persistFleetRestart(fleetHost.url)
+            val fresh = if (fleetHost != null && leadership.fleetCandidate() != null && fleetHost.roundDue()) fleetHost.readFresh() else null
             // 작업 허가 줄의 관측 시각은 이 층이 셀 대역을 읽은 시각이다. 잠금을 기다린 시간은 관측의 나이에 든다.
             val fetchedAt = clock.now()
             lock.withLock {
@@ -1210,8 +1350,11 @@ class MissionHost(
                 // 관측 중이면 미리 읽기가 준비를 보인 미준비 기체를 지금 읽는다(그 읽기만 준비 판정에 간다).
                 // 관측 중에는 출발을 앞둔 기체도 열렸거나 미리 읽기가 준비를 보인 것만 지금 읽는다(준비가 설 수 없는 기체는 어차피 출발하지 못한다).
                 (robots as? HostRobotPort)?.readNowFor(startingRobots().filterTo(HashSet(), leadership::mayReadNow) + leadership.freshTargets())
+                fleetHost?.beginPump(fresh)
                 middleware.pump()
+                val reconciled = fleetHost?.endPump()
                 publishReadiness()
+                publishFleetReadiness(reconciled)
                 pumpedAt = at
                 // 기록이 커밋된 뒤 사본을 확인하고 파일을 게시하며, 그 뒤에 정착한 실행을 놓는다([recordAfterPump]).
                 recordAfterPump()
@@ -3302,6 +3445,12 @@ class MissionHost(
 
         /** pump 주기(T5). 셀 대역이 채운 슬롯을 E2 마감(15초)보다 훨씬 짧게 다시 읽는다. */
         val PUMP_PERIOD: Duration = Duration.ofMillis(250)
+
+        /** 끝나지 않은 플릿 단위의 상태(관측 중 플릿 준비의 재대조가 그 운반을 다시 찾는다). */
+        private val OPEN_FLEET_UNIT: Set<dev.picasso.middleware.UnitState> = setOf(
+            dev.picasso.middleware.UnitState.PENDING, dev.picasso.middleware.UnitState.IN_DOUBT, dev.picasso.middleware.UnitState.RUNNING,
+            dev.picasso.middleware.UnitState.VERIFYING, dev.picasso.middleware.UnitState.OPERATOR_HOLD,
+        )
 
         /**
          * `FAILED`·`UNVERIFIED` 로 정착한 실행을 놓기 전에 두는 폭의 기본값(`host.settled.revisable-retention`). 그 안에서는 같은 작업 지시 id
