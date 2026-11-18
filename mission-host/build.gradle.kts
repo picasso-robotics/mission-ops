@@ -3,6 +3,8 @@
 // 그 검사는 이 모듈에 걸지 않는다.
 plugins {
     application
+    // 실제 수신자 시험 고정물(시험 어댑터·`adapter-host` 수신자). mission-host 시험과 `load` 의 측정 변형이 같은 것을 쓴다 — 베끼지 않는다.
+    `java-test-fixtures`
 }
 
 application {
@@ -40,6 +42,11 @@ dependencies {
     testImplementation(testFixtures("dev.picasso:registry"))
     // 수신 측 세대 대조 시험(HA 3단계)이 mimic 의 바닥값을 운영과 같은 파일 저장(`FileFenceStore`)에 둔다. 운영 코드는 쓰지 않는다.
     testImplementation("dev.picasso:adapter-host")
+    // 실제 수신자 시험 고정물(`ReceiverFixture.kt`)이 시험 안 `adapter-host` 를 띄우고 기체 프로파일을 읽는다(`ProfileDocument`).
+    // 기체마다 수신자를 가르는 `RoutedRobotPort` 는 미들웨어의 `RobotPort` 를 쓴다.
+    testFixturesApi("dev.picasso:adapter-host")
+    testFixturesImplementation("dev.picasso:profile-model")
+    testFixturesImplementation("dev.picasso:picasso")
 }
 
 // 저장소 루트에서 돈다. 모의 실행 프로파일·스키마 경로(host.mock-run.*)가 루트 기준이다(site 의 run 과 같음).

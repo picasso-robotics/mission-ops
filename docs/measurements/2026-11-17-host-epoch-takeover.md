@@ -19,7 +19,7 @@
 | Postgres | 16.15 (Testcontainers, `fsync=off`, 세트마다 새 컨테이너), JDBC 왕복 `SELECT 1` p50 0.21~0.38 ms |
 | 수신자 | mimic `FENCED`, 바닥값은 picasso `adapter-host` 의 `FileFenceStore`(세트마다 새 임시 디렉터리) |
 
-**미믹 기준이다.** 미믹의 인수 확인(`GetSnapshot`)은 정리 대기가 0 이고 결과를 모르는 송신이 없어 늘 곧바로 `DURABLE_CONFIRMED` 로 답한다. 실제 수신자(`adapter-host`)는 앞 세대로 통과한 명령이 닫히기를 정리 대기(`fenceWait`)만큼 기다릴 수 있고, 그 대기는 호스트 잠금 아래의 pump 를 늦춘다 — 아래 수치에 그 몫은 없다.
+**미믹 기준이다.** 미믹의 인수 확인(`GetSnapshot`)은 정리 대기가 0 이고 결과를 모르는 송신이 없어 늘 곧바로 `DURABLE_CONFIRMED` 로 답한다. 실제 수신자(`adapter-host`)는 앞 세대로 통과한 명령이 닫히기를 정리 대기(`fenceWait`)만큼 기다릴 수 있고, 그 대기는 호스트 잠금 아래의 pump 를 늦춘다 — 아래 수치에 그 몫은 없다(그 몫은 [실제 수신자 측정](2026-11-19-adapter-host-receiver.md)).
 
 ## 회차
 

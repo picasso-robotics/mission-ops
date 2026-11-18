@@ -14,6 +14,8 @@ dependencies {
     "loadImplementation"("dev.picasso:mimic")
     // 인수 시나리오의 대조 변형(takeoverfenced)이 mimic 바닥값을 운영과 같은 파일 저장(`FileFenceStore`)에 둔다.
     "loadImplementation"("dev.picasso:adapter-host")
+    // 실제 수신자 변형(takeoverreceiver)이 mission-host 시험 고정물의 수신자(`adapter-host`)·시험 어댑터를 쓴다. 기체 프로파일은 그 고정물이 읽는다.
+    "loadImplementation"(testFixtures(project(":mission-host")))
     // 플릿 변형(takeoverfleet)이 현장 플릿 세계(SiteFleet 의 AmrFleetMimic)를 직접 본다(맡긴 수·운반 상태).
     "loadImplementation"("dev.picasso:fleet-mimic")
     // Testcontainers Postgres. registry testFixtures 의 PostgresSupport 는 pg_stat_statements 를 싣지 않아 컨테이너만 같은 판으로 따로 띄운다.

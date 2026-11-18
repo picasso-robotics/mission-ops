@@ -3,15 +3,15 @@ package dev.picasso.ops.load
 import java.lang.management.ManagementFactory
 
 /**
- * `./gradlew :load:loadBench --args="<시나리오…> [quick]"`. 시나리오는 stations·delivery·pump·pumpscale·explain·list·takeover·takeoverfenced·takeoverfleet·all 이다.
+ * `./gradlew :load:loadBench --args="<시나리오…> [quick]"`. 시나리오는 stations·delivery·pump·pumpscale·explain·list·takeover·takeoverfenced·takeoverfleet·takeoverreceiver·all 이다.
  * list(실행 목록 크기, 실행 10000 까지 쌓음)와 pumpscale(기체 100·200)과 takeover(비정상 종료 뒤 만료 인수 공백, 기본 리스 만료 30초를 회차마다 기다림)와
- * takeoverfenced(같은 인수를 대조하는 수신자로, 첫 기체 열림·첫 명령 수락까지)와 takeoverfleet(플릿 전용 실행의 관측 중 플릿 준비, 확인·재대조·근거·첫 플릿 수락까지)는
+ * takeoverfenced(같은 인수를 대조하는 수신자로, 첫 기체 열림·첫 명령 수락까지)와 takeoverfleet(플릿 전용 실행의 관측 중 플릿 준비, 확인·재대조·근거·첫 플릿 수락까지)와 takeoverreceiver(실제 수신자 adapter-host 의 정리 대기가 pump·조회를 늦추는 몫)는
  * all 에 들지 않는다.
- * `quick` 을 붙이면 규모를 줄여 배선만 확인한다. 결과는 `load/build/load/<시나리오>.md` 와 표준 출력에 같이 남는다.
+ * `quick` 을 붙이면 규모를 줄여 배선만 확인한다. takeoverreceiver 에 `shared` 를 붙이면 공유 링크 세트만 잰다. 결과는 `load/build/load/<시나리오>.md` 와 표준 출력에 같이 남는다.
  */
 fun main(args: Array<String>) {
     val quick = "quick" in args
-    val chosen = args.filter { it != "quick" }.ifEmpty { listOf("all") }
+    val chosen = args.filter { it != "quick" && it != "shared" }.ifEmpty { listOf("all") }
     val all = "all" in chosen
     val env = Report("environment")
     val os = ManagementFactory.getOperatingSystemMXBean()
@@ -86,6 +86,20 @@ fun main(args: Array<String>) {
             )
         },
         if (quick) listOf(1, 2) else listOf(1, 10, 50),
+    )
+    // 실제 수신자(adapter-host)의 정리 대기가 pump·잠금 쓰는 조회를 늦추는 몫(mo26). all 에 들지 않는다.
+    if ("takeoverreceiver" in chosen) TakeoverReceiverLoad.run(
+        Report("takeoverreceiver"),
+        if (quick) {
+            listOf(TakeoverReceiverLoad.Config(java.time.Duration.ofSeconds(1), 1, shared = false))
+        } else if ("shared" in args) {
+            // 공유 링크 세트만(검토 뒤 그 줄만 다시 잴 때).
+            listOf(0L, 1L, 5L).map { TakeoverReceiverLoad.Config(java.time.Duration.ofSeconds(it), 4, true) }
+        } else {
+            val waits = listOf(0L, 1L, 5L).map { java.time.Duration.ofSeconds(it) }
+            waits.flatMap { w -> listOf(TakeoverReceiverLoad.Config(w, 1, false), TakeoverReceiverLoad.Config(w, 4, false), TakeoverReceiverLoad.Config(w, 4, true)) } +
+                TakeoverReceiverLoad.Config(java.time.Duration.ofSeconds(5), 4, shared = false, hold = false)
+        },
     )
     System.exit(0)
 }

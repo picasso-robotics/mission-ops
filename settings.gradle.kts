@@ -17,6 +17,7 @@ dependencyResolutionManagement {
 // host-kit 은 실행 호스트가 인시던트 고리(승인 호스트, 자격 선언 파일, 번들 쓰기)를 붙이려고 쓴다(picasso H1, 한계 §15.176).
 // fleet-mimic 은 실행 호스트의 모의 실행이 플릿 경로 단위를 프로세스 안의 플릿 미믹으로 돌리려고 쓴다(picasso §15.326).
 // adapter-host 는 현장이 수신자(mimic)의 제어자 세대 바닥값을 파일에 두려고 그 `FileFenceStore` 를 쓴다(picasso ADR 54, §15.330).
+// profile-model 은 실제 수신자(adapter-host) 시험·측정이 기체 프로파일(`ProfileDocument`)을 읽으려고 쓴다. 다른 모듈의 api 경유로 우연히 보이던 것을 명시한다.
 includeBuild("picasso") {
     dependencySubstitution {
         substitute(module("dev.picasso:registry")).using(project(":registry"))
@@ -28,6 +29,7 @@ includeBuild("picasso") {
         substitute(module("dev.picasso:host-kit")).using(project(":host-kit"))
         substitute(module("dev.picasso:fleet-mimic")).using(project(":fleet-mimic"))
         substitute(module("dev.picasso:adapter-host")).using(project(":adapter-host"))
+        substitute(module("dev.picasso:profile-model")).using(project(":profile-model"))
     }
 }
 
