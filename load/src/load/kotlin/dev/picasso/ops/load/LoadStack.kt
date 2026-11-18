@@ -55,6 +55,8 @@ class LoadStack(
     private val hostArgs: List<String> = emptyList(),
     val fenced: Boolean = false,
     val fleet: Boolean = false,
+    /** 주면 기체 포트를 이것으로 짓는다(실제 수신자 변형 — mimic 대신 하네스 안 `adapter-host`). 기본은 mimic 에 붙는 운영 배선이다. */
+    private val wiring: dev.picasso.ops.host.RobotWiring? = null,
 ) : AutoCloseable {
 
     val pg: PostgreSQLContainer<*> = PostgreSQLContainer("postgres:16-alpine")
@@ -148,7 +150,7 @@ class LoadStack(
     fun now(): Instant = mimic.server.exclusive { mimic.instance(robotIds.first())!!.clock.now() }
 
     /** 실행 호스트 하나를 이 세트의 DB·mimic·셀 대역에 띄운다. [hostArgs] 는 기본 인자 뒤에 붙는다(뒤가 이긴다). */
-    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, exit = LOST).run(
+    fun startHost(): ConfigurableApplicationContext = MissionHostApplication.builder(HostClock { now() }, exit = LOST, wiring = wiring).run(
         "--server.port=0",
         "--host.mimic.port=${mimic.server.port}",
         "--host.cell.url=http://127.0.0.1:${cell.address.port}",

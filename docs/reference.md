@@ -483,6 +483,17 @@ Kotlin 네 모듈은 2026-11-02에 `feat/retirement-port` 브랜치의 `<모듈>
 
 모듈마다 잰 때가 달라 합계를 내지 않습니다.
 
+### 부하 측정 하네스의 인수 변형
+
+`load` 모듈은 `build`·CI 에 들지 않는 측정 하네스입니다(`./gradlew :load:loadBench --args="<시나리오…> [quick]"`, 결과는 `load/build/load/<시나리오>.md`). 실행 호스트 인수를 재는 변형은 `all` 에 들지 않습니다.
+
+| 시나리오 | 수신자 | 재는 것 | 결과 문서 |
+|---|---|---|---|
+| `takeover` | mimic(대조 안 함) | 비정상 종료 뒤 마지막 리스 갱신 → 리빌드 완료·재부착 | [2026-11-16](measurements/2026-11-16-host-takeover.md) |
+| `takeoverfenced` | mimic `FENCED` + 파일 바닥값 | 리스 만료 → 첫 기체 열림·첫 명령 수락(관측 중) | [2026-11-17](measurements/2026-11-17-host-epoch-takeover.md) |
+| `takeoverfleet` | mimic·현장 대역 `FENCED` | 관측 중 플릿 확인·재대조·근거·첫 플릿 수락 | [2026-11-18](measurements/2026-11-18-fleet-readiness.md) |
+| `takeoverreceiver` | 하네스 안 picasso `adapter-host`(`FENCED` + 파일 바닥값) + 시험 어댑터(mission-host 시험 고정물 `ReceiverFixture.kt`) | 앞 세대 접수가 벤더 호출 안에 걸린 채 인수할 때 정리 대기(0·1·5초) × 기체 수(1·4) × 수신자(기체마다 하나 / 한 수신자에 기체 전부, 링크 공유)별 복원·관측·발행 구간의 pump 한 바퀴·복원 재대조 연속 작업 최대와 `GET /host/executions` 지연 | [2026-11-19](measurements/2026-11-19-adapter-host-receiver.md) |
+
 ### E2E 통합 시험 내부 구조
 
 현장 가상 시계를 시험이 직접 진행합니다. 호스트 기동 전에 `ops` 스키마를 올려 설정 버전 1 적용 상태로 시작합니다.

@@ -4,7 +4,7 @@ import dev.picasso.contracts.v1.TaskHandle
 import dev.picasso.middleware.RobotPort
 
 /**
- * 기체마다 다른 수신자로 보내는 시험용 포트. 수신자 둘(대조하는 mimic 과 안 하는 mimic)을 한 실행 호스트에 붙일 때 쓴다 — 운영 배선은 같은 기계의
+ * 기체마다 다른 수신자로 보내는 시험용 포트. 수신자 둘(대조하는 mimic 과 안 하는 mimic, 또는 mimic 과 실제 수신자 `adapter-host`)을 한 실행 호스트에 붙일 때 쓴다(시험 고정물이라 `load` 의 측정 변형도 쓴다) — 운영 배선은 같은 기계의
  * mimic 하나에 붙는다. 기체마다 [routes] 의 포트로 그대로 넘긴다. 없는 기체는 `IllegalArgumentException` 이다.
  */
 class RoutedRobotPort(private val routes: Map<String, RobotPort>) : RobotPort {

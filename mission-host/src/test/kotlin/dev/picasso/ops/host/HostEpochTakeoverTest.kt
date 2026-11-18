@@ -408,7 +408,7 @@ class HostEpochTakeoverTest {
         }
     }
 
-    private companion object {
+    internal companion object {
         const val OUT = "OUT-07"
         const val IN = "LINE-IN-03"
         const val CONTAINER = "HU-1042"
