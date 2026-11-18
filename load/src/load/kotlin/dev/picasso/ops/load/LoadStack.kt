@@ -15,6 +15,7 @@ import dev.picasso.ops.host.lease.HostExit
 import dev.picasso.ops.service.OpsApplication
 import dev.picasso.ops.service.store.OpsSchema
 import dev.picasso.ops.site.SiteCell
+import dev.picasso.ops.site.SiteFleet
 import dev.picasso.ops.site.SiteHttpFence
 import org.springframework.boot.web.context.WebServerApplicationContext
 import org.springframework.context.ConfigurableApplicationContext
@@ -44,12 +45,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * [fenced] 면 mimic 이 제어자 세대를 대조하고(`FENCED`, picasso ADR 54) 바닥값을 세트마다 새 임시 디렉터리의 `FileFenceStore` 에 둔다(컨테이너 DB 와
  * 같은 수명). 인수 시나리오의 대조 변형만 켠다 — 나머지 측정은 오늘 거동(`UNFENCED`)이다. 그때 셀 대역 대역도 현장 HTTP 면 대조(`SITE_HTTP_FENCE=on` 과
  * 같은 [SiteHttpFence], 바닥값은 같은 디렉터리의 `site/`)로 신호 쓰기를 맞대고 인수 확인에 답한다.
+ *
+ * [fleet] 면 같은 대역 서버에 현장 플릿 세계 면(`/fleet`, 현장의 [SiteFleet] 그대로 — 인계 자리 `OUT-07`·`LINE-IN-03`, 처음 용기 `HU-1042`, 시계는 mimic
+ * 가상 시계라 하네스가 밀지 않으면 운반이 걷지 않음)을 붙이고 실행 호스트의 `host.fleet.url` 을 그리로 둔다. 대조는 [fenced] 를 따른다(키 `fleet`).
  */
 class LoadStack(
     val robots: Int,
     withOps: Boolean = true,
     private val hostArgs: List<String> = emptyList(),
     val fenced: Boolean = false,
+    val fleet: Boolean = false,
 ) : AutoCloseable {
 
     val pg: PostgreSQLContainer<*> = PostgreSQLContainer("postgres:16-alpine")
@@ -99,6 +104,12 @@ class LoadStack(
     @Volatile
     var cellBody: String = cell(0)
 
+    /** 현장 플릿 세계([fleet] 일 때만). 하네스가 맡긴 수·운반 상태를 본다. */
+    val fleetSite: SiteFleet? = if (fleet) SiteFleet(mimic, listOf("OUT-07", "LINE-IN-03"), mapOf("OUT-07" to "HU-1042"), fence = cellFence) else null
+
+    /** 대역의 현장 HTTP 면 대조(거절 수를 본다). */
+    val httpFence: SiteHttpFence get() = cellFence
+
     private val cell: HttpServer = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0).apply {
         createContext("/cell") { exchange ->
             exchange.requestBody.readAllBytes()
@@ -117,6 +128,7 @@ class LoadStack(
             if (bytes.isNotEmpty()) exchange.responseBody.write(bytes)
             exchange.close()
         }
+        fleetSite?.let { world -> createContext(SiteFleet.PATH) { exchange -> world.handle(exchange) {} } }
         start()
     }
 
@@ -147,6 +159,7 @@ class LoadStack(
         "--host.mock-run.schema=${ROOT.resolve("picasso/profile/schema/capability-profile.schema.json")}",
         "--host.work-permit.mapping=",
         "--host.registry.url=",
+        "--host.fleet.url=${if (fleet) "http://127.0.0.1:${cell.address.port}" else ""}",
         "--logging.level.root=WARN",
         *hostArgs.toTypedArray(),
     )

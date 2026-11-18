@@ -290,6 +290,30 @@ class HttpEpochTest {
         }
     }
 
+    @Test
+    fun `준비 해제 판정에는 바닥값 헤더가 실린 성공 응답과 세대 거부만 넘기고 헤더 없는 오류·그 밖의 오류는 넘기지 않는다`() {
+        Stub().use { stub ->
+            val port = HttpFleetPort(stub.url, epoch = epoch("플릿") { 7 })
+            val floors = CopyOnWriteArrayList<Long>()
+            port.onResponseFloor = { floors += it }
+            val path = "/fleet/transports/b%3Atr-1"
+            stub.replies[path] = Triple(503, "", null)
+            runCatching { port.status(handle) }
+            stub.replies[path] = Triple(503, """{"error":"OTHER"}""", 0)
+            runCatching { port.status(handle) }
+            stub.replies[path] = Triple(404, "", 7)
+            runCatching { port.status(handle) }
+            stub.replies[path] = Triple(200, """{"state":"ACCEPTED","holding":false}""", null)
+            port.status(handle)
+            assertTrue(floors.isEmpty(), "읽기 실패·헤더 없는 응답을 바닥값으로 넘겼다: $floors")
+            stub.replies[path] = Triple(200, """{"state":"ACCEPTED","holding":false}""", 7)
+            port.status(handle)
+            stub.replies[path] = Triple(409, stale(7, 7), 7)
+            runCatching { port.status(handle) }
+            assertEquals(listOf(7L, 7L), floors.toList())
+        }
+    }
+
     private fun <T : Any> eventually(read: () -> T?): T {
         val deadline = Instant.now().plusSeconds(5)
         while (true) {

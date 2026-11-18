@@ -124,6 +124,19 @@ data class LeaseGrantRow(
     val alive: Boolean,
 )
 
+/** 플릿 자동 확인 근거 한 줄(V21 `host_fleet_readiness_evidence`). */
+data class FleetReadinessEvidenceRow(
+    val generation: Long,
+    val instanceId: String,
+    val fleetId: String,
+    val receiverBootId: String,
+    val floor: Long,
+    val fenceStatus: String,
+    val confirmSeq: Long,
+    val observedAt: Instant,
+    val recordedAt: Instant,
+)
+
 /** 자동 확인 근거 한 줄(V20 `host_readiness_evidence`). */
 data class ReadinessEvidenceRow(
     val generation: Long,
@@ -1621,6 +1634,92 @@ class HostRecords(
             .param("observedAt", OffsetDateTime.ofInstant(observedAt, ZoneOffset.UTC))
             .update()
     }
+
+    /**
+     * 플릿 자동 확인 근거를 적는다(V21, 리스 가드 안). 같은 확인의 재시도(같은 세대·기동·확인 순번)는 한 줄이다(멱등). [confirmSeq] 는 재대조 경계였던
+     * 인수 확인 요청의 순번이다.
+     */
+    fun recordFleetReadiness(
+        generation: Long, instanceId: String, fleetId: String, bootId: String, floor: Long, fenceStatus: String, confirmSeq: Long, observedAt: Instant,
+    ) {
+        writes.sql(
+            """
+            INSERT INTO mission.host_fleet_readiness_evidence
+                (generation, instance_id, fleet_id, receiver_boot_id, controller_floor, fence_status, confirm_seq, observed_at)
+            VALUES (:generation, :instanceId, :fleetId, :bootId, :floor, :status, :seq, :observedAt)
+            ON CONFLICT (generation, receiver_boot_id, confirm_seq) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("fleetId", fleetId)
+            .param("bootId", bootId)
+            .param("floor", floor)
+            .param("status", fenceStatus)
+            .param("seq", confirmSeq)
+            .param("observedAt", OffsetDateTime.ofInstant(observedAt, ZoneOffset.UTC))
+            .update()
+    }
+
+    /** 플릿 자동 확인 근거(적은 순서). [generation] 을 주면 그 세대만. */
+    fun fleetReadinessEvidence(generation: Long? = null): List<FleetReadinessEvidenceRow> =
+        jdbc.sql(
+            """
+            SELECT generation, instance_id, fleet_id, receiver_boot_id, controller_floor, fence_status, confirm_seq, observed_at, recorded_at
+            FROM mission.host_fleet_readiness_evidence WHERE (CAST(:generation AS BIGINT) IS NULL OR generation = :generation) ORDER BY evidence_id
+            """.trimIndent(),
+        )
+            .param("generation", generation, java.sql.Types.BIGINT)
+            .query { rs, _ ->
+                FleetReadinessEvidenceRow(
+                    rs.getLong("generation"), rs.getString("instance_id"), rs.getString("fleet_id"), rs.getString("receiver_boot_id"),
+                    rs.getLong("controller_floor"), rs.getString("fence_status"), rs.getLong("confirm_seq"), instant(rs, "observed_at"),
+                    instant(rs, "recorded_at"),
+                )
+            }
+            .list()
+
+    /**
+     * 확인 스레드가 본 현장 플릿 기동 ID 한 줄을 적는다(V21 `host_fleet_receiver_boot`, 리스 가드 안). [observedSeq] 는 그 기동을 본 확인의 요청 순번이다
+     * (재시작 기준은 0). 같은 세대·기동·종류·순번은 한 줄이다(멱등).
+     */
+    fun recordFleetBoot(generation: Long, instanceId: String, fleetId: String, bootId: String, observedSeq: Long, restartBasis: Boolean = false) {
+        writes.sql(
+            """
+            INSERT INTO mission.host_fleet_receiver_boot (generation, instance_id, fleet_id, receiver_boot_id, kind, observed_seq)
+            VALUES (:generation, :instanceId, :fleetId, :bootId, :kind, :observedSeq)
+            ON CONFLICT (generation, receiver_boot_id, kind, observed_seq) DO NOTHING
+            """.trimIndent(),
+        )
+            .param("kind", if (restartBasis) "RESTART_BASIS" else "ISSUING")
+            .param("observedSeq", if (restartBasis) 0L else observedSeq)
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("fleetId", fleetId)
+            .param("bootId", bootId)
+            .update()
+    }
+
+    /**
+     * 앞 보유자들이 마지막으로 믿은 현장 플릿 기동 ID — 새 보유자가 현장 재시작을 가르는 기준. 기동 기록(V21 `host_fleet_receiver_boot`)과 자동 확인 근거
+     * 가운데 **가장 높은 세대**의 것이고, 같은 세대 안에서는 발행 중 기록 > 자동 확인 근거 > 재시작 판정의 기준 기록 순, 같은 종류 안에서는 그 기동을 본
+     * 확인의 관측 순번이 큰 것이다(기록 시각·행 번호가 아니라 세대·종류·관측 순번으로 고른다 — 늦게 재시도된 재시작 기준이나 쓰기 직전에 멈췄다 늦게 들어간
+     * 옛 기동이 더 뒤에 본 기동을 덮지 않게). 없으면 `null`.
+     */
+    fun latestFleetBoot(): String? =
+        jdbc.sql(
+            """
+            SELECT receiver_boot_id FROM (
+                SELECT generation, receiver_boot_id, CASE kind WHEN 'ISSUING' THEN 2 ELSE 0 END AS rank, observed_seq AS seq, boot_id AS id
+                FROM mission.host_fleet_receiver_boot
+                UNION ALL
+                SELECT generation, receiver_boot_id, 1 AS rank, confirm_seq AS seq, evidence_id AS id FROM mission.host_fleet_readiness_evidence
+            ) b ORDER BY generation DESC, rank DESC, seq DESC, id DESC LIMIT 1
+            """.trimIndent(),
+        )
+            .query(String::class.java)
+            .optional()
+            .orElse(null)
 
     /** 그 세대의 자동 확인 근거(기체 이름 순). */
     fun readinessEvidence(generation: Long): List<ReadinessEvidenceRow> =

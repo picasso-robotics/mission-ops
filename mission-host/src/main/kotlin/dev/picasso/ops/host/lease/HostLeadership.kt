@@ -359,8 +359,7 @@ class HostLeadership(
         else requirements.flatMapTo(sortedSetOf()) { it.robots }.filterTo(sortedSetOf()) { !ready.containsKey(it) && (it in prefetchConfirmed || dueForRetry(it)) }
 
     /**
-     * **공통 판정 함수.** 요구 [requirement] 가 아직 준비되지 않은 까닭들(비면 준비). 기체는 래치된 준비만 준비로 친다. 플릿은 이 단계에서
-     * 준비가 설 수 없다([FLEET_NOT_FENCED]).
+     * **공통 판정 함수.** 요구 [requirement] 가 아직 준비되지 않은 까닭들(비면 준비). 기체·플릿 모두 래치된 준비만 준비로 친다([fleetReadiness]).
      */
     fun blockers(requirement: Requirement): List<String> = buildList {
         requirement.robots.sorted().forEach { robot ->
@@ -369,7 +368,192 @@ class HostLeadership(
                 is Readiness.Waiting -> add("실행 ${requirement.executionId}(작업 지시 ${requirement.jobOrderId})의 기체 $robot: ${r.reason.text}")
             }
         }
-        if (requirement.fleet) add("실행 ${requirement.executionId}(작업 지시 ${requirement.jobOrderId})의 플릿: $FLEET_NOT_FENCED")
+        if (requirement.fleet) {
+            when (val f = fleetReadiness()) {
+                is FleetReadiness.Ready -> Unit
+                is FleetReadiness.Waiting -> add("실행 ${requirement.executionId}(작업 지시 ${requirement.jobOrderId})의 플릿: ${f.reason.text}")
+            }
+        }
+    }
+
+    // ── 플릿 준비(HA 3단계 PR B2). 기체를 가장하지 않는 별도 슬롯 하나 — 이 세대 안에서만 뜻이 있다(프로세스 하나는 세대 하나).
+
+    private val fleetLock = Any()
+
+    /** 래치된 플릿 준비. 후퇴·휘발·대조 끔·기동 ID 변경을 보이면 푼다. */
+    private var fleetReady: FleetReadiness.Ready? = null
+
+    /** 확인됐고 재대조·근거를 기다리는 후보. 같은 세대의 확인이 되풀이돼도 경계([FleetCandidate.boundary])를 옮기지 않는다. */
+    private var fleetCandidate: FleetCandidate? = null
+
+    /** 래치되지 않았을 때 보이는 까닭. */
+    private var fleetWaiting: FleetReadiness.Waiting = FleetReadiness.Waiting(FleetWaitReason.NO_CONFIRM)
+
+    /** 현장 플릿 면의 기동 ID 기준 — 앞 근거(이전 세대)의 것이거나 이번 보유에서 처음 본 것. 다르면 재시작이다. */
+    private var fleetBoot: String? = null
+
+    /** 이번 보유에서 현장 재시작을 보았다 — 재확인 성공으로 지우지 않는다(운영자 확인 뒤 전역 발행으로만 열린다). */
+    private var fleetRestarted = false
+
+    /**
+     * 플릿 인수 확인을 부를 수 있는 배선인가(현장 플릿 면). 실행 호스트가 기동 때 정한다. 아니면 까닭은 늘 [FleetWaitReason.NO_CONFIRM] 이다.
+     */
+    fun fleetConfirmable(confirmable: Boolean) = synchronized(fleetLock) {
+        if (fleetReady == null && fleetCandidate == null && fleetWaiting.reason in setOf(FleetWaitReason.NO_CONFIRM, FleetWaitReason.UNREAD)) {
+            fleetWaiting = FleetReadiness.Waiting(if (confirmable) FleetWaitReason.UNREAD else FleetWaitReason.NO_CONFIRM)
+        }
+    }
+
+    /** 앞 근거(이전 세대)의 현장 기동 ID. 재대조 전에 실행 호스트가 넣는다. 이번 확인의 기동 ID 가 다르면 재시작이다. */
+    fun fleetBootBaseline(bootId: String?) = synchronized(fleetLock) {
+        if (bootId == null) return@synchronized
+        val seen = fleetBoot
+        if (seen == null) {
+            fleetBoot = bootId
+        } else if (seen != bootId) {
+            // 이번 보유의 확인이 먼저 닿아 기준이 섰는데 앞 근거와 다르다 — 그 사이 현장이 다시 떴다.
+            fleetRestarted = true
+            fleetRestartBasis = fleetRestartBasis ?: bootId
+            releaseFleet(FleetReadiness.Waiting(FleetWaitReason.RECEIVER_RESTARTED, null, null, seen))
+        }
+    }
+
+    /** 이번 보유에서 현장 재시작을 보았는가(재확인 성공으로 지우지 않는다). */
+    fun fleetRestartSeen(): Boolean = synchronized(fleetLock) { fleetRestarted }
+
+    /**
+     * 재시작을 판정한 기준 기동(앞 보유자들이 믿은 장부의 기동 — 기준 기동이나 아는 운반 핸들의 기동). 실행 호스트가 이것을 기동 기준 표에 적어(관측 중에도) 이
+     * 보유자가 운영자 확인 전에 죽어도 다음 보유자가 같은 재시작을 본다. 재시작을 보지 않았으면 `null`.
+     */
+    fun fleetRestartBasis(): String? = synchronized(fleetLock) { fleetRestartBasis }
+
+    private var fleetRestartBasis: String? = null
+
+    /** 발행([LeaderState.ISSUING])에 든 순간(정상 종료 인수·운영자 확인) 부를 것. 실행 호스트가 그 시점의 확인 기동을 곧바로 기준으로 적는다. */
+    @Volatile
+    var onIssuing: (() -> Unit)? = null
+
+    /** 플릿 준비. 래치됐으면 그것, 아니면 까닭(후보가 있으면 [FleetWaitReason.RECONCILING]). */
+    fun fleetReadiness(): FleetReadiness = synchronized(fleetLock) {
+        fleetReady ?: fleetCandidate?.let { FleetReadiness.Waiting(FleetWaitReason.RECONCILING, it.floor, it.fenceStatus, it.bootId) } ?: fleetWaiting
+    }
+
+    /** 재대조를 기다리는 후보(관측 중에만). pump 가 이것이 있으면 확인 뒤에 보낸 플릿 읽기로 한 라운드를 돈다. */
+    fun fleetCandidate(): FleetCandidate? = synchronized(fleetLock) { fleetCandidate?.takeIf { state == LeaderState.HOLDING && fleetReady == null } }
+
+    /**
+     * 플릿 인수 확인의 답 하나를 본다(호스트 잠금 밖의 확인 스레드). [seq] 는 그 확인 요청의 순번(플릿 읽기와 같은 순번), [answer] 는 답(안 닿으면 `null`),
+     * [handleBoots] 는 이 호스트가 아는 운반 핸들의 기동 접두다(복원한 핸들이 다른 기동의 것이면 재시작). 재대조·관측 중에만 뜻이 있다.
+     *
+     * - 기동 ID 가 기준과 다르면 재시작 — 래치·후보를 풀고 [FleetWaitReason.RECEIVER_RESTARTED] 로 둔다(뒤의 확인 성공으로 지우지 않는다).
+     * - 바닥값 = 내 세대 ∧ `DURABLE_CONFIRMED` 면 후보(이미 후보면 경계를 그대로 둔다). 래치돼 있으면 그대로다.
+     * - 바닥값 < 내 세대(0 포함)·`VOLATILE`·`UNSPECIFIED` 는 래치를 풀고 후보를 버린다. `DURABLE_PENDING` 은 래치를 풀지 않고(같은 세대의 미확정) 후보만 버린다.
+     * - 안 닿음·5xx 는 아무것도 풀지 않는다. 4xx(옛 현장)는 미준비 까닭만 둔다. 바닥값이 더 높으면 밀려남(클라이언트가 이미 잃음으로 넘김).
+     */
+    fun observeFleetConfirm(seq: Long, answer: dev.picasso.ops.host.lease.ControllerConfirmation?, handleBoots: Set<String>, at: java.time.Instant) {
+        val s = state
+        if (s != LeaderState.RECONCILING && s != LeaderState.HOLDING) return
+        val mine = lease.generation ?: return
+        synchronized(fleetLock) {
+            if (answer == null || answer.status in 500..599) {
+                if (fleetReady == null && fleetCandidate == null && !fleetRestarted) fleetWaiting = FleetReadiness.Waiting(FleetWaitReason.UNREAD)
+                return
+            }
+            if (answer.status != 200) {
+                // 4xx: 현장이 플릿 인수 확인을 모른다(옛 현장으로 바뀜 포함) — 래치·후보도 푼다. 409(세대 거부)의 밀려남은 클라이언트가 이미 잃음으로 넘겼다.
+                if (answer.status in 400..499 && !fleetRestarted) releaseFleet(FleetReadiness.Waiting(FleetWaitReason.UNSUPPORTED))
+                return
+            }
+            val floor = answer.floor ?: 0L
+            val status = answer.fenceStatus.orEmpty()
+            val boot = answer.receiverBootId
+            if (boot != null) {
+                if (fleetBoot == null) fleetBoot = boot
+                if (boot != fleetBoot || handleBoots.any { it != boot }) {
+                    fleetRestartBasis = fleetRestartBasis ?: (fleetBoot?.takeIf { it != boot } ?: handleBoots.firstOrNull { it != boot })
+                    if (!fleetRestarted) log.warn("플릿 현장 기동 ID 가 바뀌었다({} → {}, 핸들 기동 {}) — 플릿 준비를 풀고 운영자 확인을 기다린다", fleetBoot, boot, handleBoots)
+                    fleetRestarted = true
+                }
+            }
+            if (fleetRestarted) {
+                releaseFleet(FleetReadiness.Waiting(FleetWaitReason.RECEIVER_RESTARTED, floor, status, boot))
+                return
+            }
+            if (floor > mine) return
+            val waiting = when {
+                floor == 0L || status == "UNSPECIFIED" -> FleetReadiness.Waiting(FleetWaitReason.UNFENCED, floor, status, boot)
+                floor < mine -> FleetReadiness.Waiting(FleetWaitReason.FLOOR_MISMATCH, floor, status, boot)
+                status == "VOLATILE" -> FleetReadiness.Waiting(FleetWaitReason.VOLATILE, floor, status, boot)
+                status == "DURABLE_PENDING" -> FleetReadiness.Waiting(FleetWaitReason.DURABLE_PENDING, floor, status, boot)
+                status == "DURABLE_CONFIRMED" && boot != null -> null
+                else -> FleetReadiness.Waiting(FleetWaitReason.UNREAD, floor, status, boot)
+            }
+            if (waiting == null) {
+                if (fleetReady == null && fleetCandidate == null) fleetCandidate = FleetCandidate(mine, seq, floor, status, checkNotNull(boot), at)
+                return
+            }
+            if (waiting.reason == FleetWaitReason.DURABLE_PENDING) {
+                // 같은 세대의 미확정은 래치를 풀지 않는다(래치 뒤 낮은 세대로 통과한 변경은 없다). 후보는 확인이 아니므로 버린다.
+                fleetCandidate = null
+                if (fleetReady == null) fleetWaiting = waiting
+                return
+            }
+            releaseFleet(waiting)
+        }
+    }
+
+    /**
+     * 플릿 읽기 응답 하나의 바닥값을 본다(그 요청의 순번 [seq]). 래치·후보의 경계보다 뒤에 보낸 요청의 응답이 바닥값 후퇴(내 세대보다 낮음, 0 포함)를
+     * 보이면 푼다. 더 높으면 밀려남(클라이언트가 이미 잃음으로 넘김). 경계보다 앞에 보낸 요청의 늦은 응답으로는 풀지 않는다.
+     */
+    fun observeFleetFloor(seq: Long, floor: Long) {
+        if (state != LeaderState.HOLDING) return
+        val mine = lease.generation ?: return
+        synchronized(fleetLock) {
+            // 응답 역전: 이미 반영한 것보다 앞 순번으로 보낸 요청의 늦은 응답은 해제 근거가 아니다(높은 바닥값의 잃음은 클라이언트가 순번 무관하게 본다).
+            if (seq <= fleetFloorSeq) return
+            fleetFloorSeq = seq
+            if (floor >= mine) return
+            val basis = fleetReady?.boundary ?: fleetCandidate?.boundary ?: return
+            if (seq <= basis) return
+            releaseFleet(FleetReadiness.Waiting(if (floor == 0L) FleetWaitReason.UNFENCED else FleetWaitReason.FLOOR_MISMATCH, floor, null, null))
+        }
+    }
+
+    /** 바닥값을 반영한 플릿 읽기 응답의 가장 큰 요청 순번. */
+    private var fleetFloorSeq = 0L
+
+    private fun releaseFleet(waiting: FleetReadiness.Waiting) {
+        fleetCandidate = null
+        fleetWaiting = waiting
+        if (fleetReady != null) {
+            fleetReady = null
+            log.warn("플릿 준비를 푼다 — {} (바닥값 {}, {}, 세대 {})", waiting.reason.text, waiting.floor, waiting.fenceStatus, lease.generation)
+        }
+    }
+
+    /**
+     * 래치 직전의 기동 재비교: 후보의 기동 ID 가 이 호스트가 아는 운반 핸들의 기동 접두([handleBoots], 복원한 핸들 포함)와 모두 같은가. 다르면 현장이
+     * 그 운반을 맡긴 뒤 다시 떴다 — 재시작으로 두고(재확인 성공으로 지우지 않음) 거짓이다. 확인 답이 핸들을 알기 전에(재대조 중 첫 확인) 왔어도 이것이 잡는다.
+     */
+    fun fleetBootsAgree(candidate: FleetCandidate, handleBoots: Set<String>): Boolean = synchronized(fleetLock) {
+        if (handleBoots.all { it == candidate.bootId }) return@synchronized !fleetRestarted
+        log.warn("플릿 후보의 현장 기동 ID({})가 아는 운반 핸들의 기동({})과 다르다 — 플릿 준비를 열지 않고 운영자 확인을 기다린다", candidate.bootId, handleBoots)
+        fleetRestarted = true
+        fleetRestartBasis = fleetRestartBasis ?: handleBoots.firstOrNull { it != candidate.bootId }
+        releaseFleet(FleetReadiness.Waiting(FleetWaitReason.RECEIVER_RESTARTED, candidate.floor, candidate.fenceStatus, candidate.bootId))
+        false
+    }
+
+    /**
+     * 재대조를 마친 후보를 래치한다(근거를 적은 뒤). [candidate] 가 지금 후보와 같고 관측 중이며 재시작을 보지 않았을 때만이다. 래치했는가.
+     */
+    fun latchFleet(candidate: FleetCandidate): Boolean = synchronized(fleetLock) {
+        if (state != LeaderState.HOLDING || lease.generation != candidate.generation || fleetRestarted || fleetCandidate != candidate) return false
+        fleetCandidate = null
+        fleetReady = FleetReadiness.Ready(candidate.floor, candidate.fenceStatus, candidate.bootId, candidate.boundary, candidate.observedAt)
+        log.info("플릿 준비(세대 {}, 바닥값 {}, {}, 기동 {}, 확인 순번 {})", candidate.generation, candidate.floor, candidate.fenceStatus, candidate.bootId, candidate.boundary)
+        true
     }
 
     /**
@@ -380,7 +564,7 @@ class HostLeadership(
         if (mayIssue()) return Authority.Held
         val s = state
         if (s != LeaderState.HOLDING || !lease.withinDeadline()) return Authority.NotHeld("발행하는 리더가 아니다: $s")
-        val holding = requirements.filter { robotId in it.robots }
+        val holding = requirements.filter { robotId in it.subjects || robotId in it.robots }
         val reasons = if (holding.isEmpty()) {
             when (val r = readinessOf(robotId)) {
                 is Readiness.Ready -> emptyList()
@@ -395,12 +579,20 @@ class HostLeadership(
     /** 미들웨어 발행 관문의 첫째 입력(picasso `AuthorityPort`). 메모리만 읽는다(I/O 없음). */
     val authorityPort: AuthorityPort = AuthorityPort { robots -> robots.associateWith(::authorityOf) }
 
-    /** 기체 단위 송신 직전 확인: 전역 발행이거나, 관측 중 그 기체가 든 실행들의 요구가 모두 준비다. 취소도 같다. */
-    override fun mayIssue(robotId: String): Boolean = authorityOf(robotId) == Authority.Held
+    /**
+     * 기체 단위 송신 직전 확인: 전역 발행이거나, 관측 중 **그 기체 자신의 래치** ∧ 그 기체가 든(기체 단위로든 발행 관문의 기체로든) 실행들의 요구가 모두
+     * 준비다. 취소도 같다. 플릿 전용 실행에 묶인 기체는 미들웨어 발행 관문([authorityOf])에서는 플릿 준비만으로 쥐지만, 그 기체로 실제 명령이 나가는
+     * 이 확인은 그 기체의 수신자 확인을 늘 요구한다(같은 pump 안의 재할당, 실행 밖에서 그 기체를 겨누는 취소).
+     */
+    override fun mayIssue(robotId: String): Boolean {
+        if (mayIssue()) return true
+        if (readinessOf(robotId) !is Readiness.Ready) return false
+        return authorityOf(robotId) == Authority.Held
+    }
 
     /**
      * 운반 송신 직전 확인: 전역 발행이거나, 관측 중 참조(태스크 id `작업지시#단위`)로 되짚은 실행의 «플릿 준비 ∧ 그 실행의 기체 전부 준비».
-     * 되짚지 못하면 막는다. 플릿 준비는 이 단계에서 서지 않으므로 관측 중의 운반은 늘 막힌다.
+     * 되짚지 못하면 막는다. 플릿 준비는 래치된 준비([fleetReadiness])만 친다.
      */
     override fun mayDispatch(reference: String): Boolean {
         if (mayIssue()) return true
@@ -416,7 +608,7 @@ class HostLeadership(
      */
     fun superseded(robotId: String, mine: Long, floor: Long) {
         if (mine <= 0 || floor <= mine) return
-        lost("수신자가 더 높은 세대로 넘겨받았다고 알렸다: robot=$robotId 내 세대 $mine 바닥값 $floor")
+        lost("수신자가 더 높은 세대로 넘겨받았다고 알렸다: 대상=$robotId 내 세대 $mine 바닥값 $floor")
     }
 
     /** DB 쓰기 가드가 쓸 (보유자, 세대). 리스를 쥐고 발행 쪽 상태(재대조·관측·발행)일 때만 있다 — 정상 종료 중·잃음에는 없다. */
@@ -452,7 +644,10 @@ class HostLeadership(
      */
     fun reconciled() {
         val next = if (acquired?.graceful == true && marked()) LeaderState.ISSUING else LeaderState.HOLDING
-        if (stateRef.compareAndSet(LeaderState.RECONCILING, next)) log.info("리더 상태 {} (세대 {})", next, lease.generation)
+        if (stateRef.compareAndSet(LeaderState.RECONCILING, next)) {
+            log.info("리더 상태 {} (세대 {})", next, lease.generation)
+            if (next == LeaderState.ISSUING) onIssuing?.invoke()
+        }
     }
 
     /**
@@ -466,7 +661,7 @@ class HostLeadership(
             lost("발행 표시를 적지 못했다(이 세대의 리스가 아니다)")
             return false
         }
-        return stateRef.compareAndSet(LeaderState.HOLDING, LeaderState.ISSUING)
+        return stateRef.compareAndSet(LeaderState.HOLDING, LeaderState.ISSUING).also { if (it) onIssuing?.invoke() }
     }
 
     private fun marked(): Boolean = try {

@@ -125,7 +125,6 @@ class HostEpochTakeoverTest {
                 old.stall.close()
                 bench.awaitLeader(LeaderState.HOLDING, TIMING.expiry.plusSeconds(10), next)
                 bench.eventually("새 보유자가 humanoid-01 을 연다") { next.readinessOf(HUMANOID) is Readiness.Ready }
-                val history = bench.history(HUMANOID)
                 // 멎은 옛 능동은 아직 자기가 발행 중이라고 안다(세대 1). 그 사이 송신 직전 확인을 지난 출발 하나가 하위 포트로 곧바로 나간다.
                 assertEquals(LeaderState.ISSUING, old.state)
                 assertEquals(1L, old.controllerEpoch())
@@ -135,8 +134,9 @@ class HostEpochTakeoverTest {
                 assertTrue(reply.hasRejection(), reply.toString())
                 assertEquals(RejectionCode.REJECTION_CODE_STALE_CONTROLLER, reply.rejection.code)
                 assertEquals(1L to 2L, reply.rejection.requestedControllerEpoch to reply.rejection.controllerEpochFloor)
-                // 수신자는 벤더도 장부도 건드리지 않았다.
-                assertEquals(history, bench.history(HUMANOID))
+                // 수신자는 벤더도 장부도 건드리지 않았다 — 거절된 태스크가 이력에 없다. 새 보유자는 humanoid-01 을 열어 exec-1 을 이어 가므로 이력 전체는
+                // 정당하게 자랄 수 있어 비교하지 않는다(가상 시계를 밀지 않아 T1 이 끝나지 않으므로 새 보유자가 T2.travel 을 내지는 않는다).
+                bench.eventually("거절된 출발이 이력에 없음") { "JO-1#T2.travel" !in bench.history(HUMANOID).keys }
                 // 밀려남(바닥값 2 > 내 세대 1)은 잃음으로 간다.
                 assertEquals(LeaderState.LOST, old.state)
                 assertTrue(old.lostReason!!.startsWith("수신자가 더 높은 세대로 넘겨받았다고 알렸다"), old.lostReason)
@@ -321,14 +321,14 @@ class HostEpochTakeoverTest {
             // 기체는 준비지만 그 기체가 든 실행에 플릿 단위가 있어 권위를 쥐지 않는다.
             val refused = bench.leadership.authorityOf(QUADRUPED)
             assertIs<dev.picasso.middleware.Authority.NotHeld>(refused)
-            assertTrue("의 플릿: ${dev.picasso.ops.host.lease.FLEET_NOT_FENCED}" in refused.reason, refused.reason)
+            assertTrue("의 플릿: ${dev.picasso.ops.host.lease.FleetWaitReason.NO_CONFIRM.text}" in refused.reason, refused.reason)
             val execution = bench.get("/host/leader")["readiness"]["executions"].single()
             assertEquals(listOf("JO-F", "true", "false"), listOf(execution["jobOrderId"].asText(), execution["fleet"].asText(), execution["ready"].asText()))
             assertTrue(execution["blockers"].any { "플릿" in it.asText() }, execution.toString())
             bench.idlePumps(4)
             assertEquals(1 to 0, fleet.dispatched.get() to fleet.cancelled.get())
-            // 기체 쪽에도 새 명령이 나가지 않았다.
-            assertEquals(history, bench.history(QUADRUPED))
+            // 기체 쪽에도 새 명령이 나가지 않았다 — 새 태스크가 없다(태스크 상태의 정당한 진행과 경쟁하지 않게 태스크 id 만 본다).
+            assertEquals(history.keys, bench.history(QUADRUPED).keys)
             assertEquals(LeaderState.HOLDING, bench.leadership.state)
         }
     }

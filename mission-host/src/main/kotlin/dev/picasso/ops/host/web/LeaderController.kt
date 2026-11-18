@@ -3,7 +3,7 @@ package dev.picasso.ops.host.web
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.picasso.middleware.CommandNotSent
 import dev.picasso.ops.host.lease.HostLeadership
-import dev.picasso.ops.host.lease.FLEET_NOT_FENCED
+import dev.picasso.ops.host.lease.FleetReadiness
 import dev.picasso.ops.host.lease.LeaderState
 import dev.picasso.ops.host.lease.Readiness
 import dev.picasso.ops.host.lease.SendAuthority
@@ -52,7 +52,7 @@ data class RobotReadinessView(
     val unknownSeqResponses: Long = 0,
 )
 
-/** 실행 하나의 요구(계획의 기체 전부, 플릿 단위가 있으면 플릿)와 준비. [blockers] 가 비면 관측 중에도 그 실행의 기체 명령을 보낸다. */
+/** 실행 하나의 요구(기체 단위를 맡은 기체 전부, 플릿 단위가 있으면 플릿)와 준비. [blockers] 가 비면 관측 중에도 그 실행의 기체 명령을 보낸다. */
 data class ExecutionReadinessView(
     val executionId: String,
     val jobOrderId: String,
@@ -62,8 +62,23 @@ data class ExecutionReadinessView(
     val blockers: List<String>,
 )
 
-/** 대상별 준비. 관측([LeaderState.HOLDING]) 안에서만 발행을 가른다. [fleet] 은 플릿의 준비 까닭이다(이 단계에서는 늘 준비 아님). */
-data class ReadinessView(val robots: List<RobotReadinessView>, val executions: List<ExecutionReadinessView>, val fleet: String)
+/**
+ * 플릿 하나의 준비(HA 3단계 PR B2). [ready] 면 [basis] 가 `AUTO`(자동으로 열림)이고 [floor]·[fenceStatus]·[receiverBootId]·[confirmSeq] 는 연 근거(재대조
+ * 경계가 된 인수 확인)의 값이다. 아니면 [reasonCode]·[reason] 이 까닭([dev.picasso.ops.host.lease.FleetWaitReason])이고 나머지는 마지막으로 본 확인 답의 값이다.
+ */
+data class FleetReadinessView(
+    val ready: Boolean,
+    val basis: String?,
+    val reasonCode: String?,
+    val reason: String?,
+    val floor: Long?,
+    val fenceStatus: String?,
+    val receiverBootId: String?,
+    val confirmSeq: Long?,
+)
+
+/** 대상별 준비. 관측([LeaderState.HOLDING]) 안에서만 발행을 가른다. */
+data class ReadinessView(val robots: List<RobotReadinessView>, val executions: List<ExecutionReadinessView>, val fleet: FleetReadinessView)
 
 /**
  * `GET /host/leader`·`GET /host/ready` 의 본문. [ready] 는 발행하는 리더([LeaderState.ISSUING])이고 자기 차단 기한 전일 때만 참이다.
@@ -303,7 +318,10 @@ class LeaderController(private val leadership: HostLeadership, private val recor
                     val blockers = leadership.blockers(req)
                     ExecutionReadinessView(req.executionId, req.jobOrderId, req.robots.sorted(), req.fleet, blockers.isEmpty(), blockers)
                 },
-                fleet = FLEET_NOT_FENCED,
+                fleet = when (val f = leadership.fleetReadiness()) {
+                    is FleetReadiness.Ready -> FleetReadinessView(true, "AUTO", null, null, f.floor, f.fenceStatus, f.bootId, f.boundary)
+                    is FleetReadiness.Waiting -> FleetReadinessView(false, null, f.reason.name, f.reason.text, f.floor, f.fenceStatus, f.bootId, null)
+                },
             )
         }
 

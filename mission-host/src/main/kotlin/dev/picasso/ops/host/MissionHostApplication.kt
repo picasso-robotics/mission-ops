@@ -386,7 +386,14 @@ open class MissionHostApplication {
                 // 그 밖(4xx·3xx 등)은 오설정이 확실하다 — 그 주소에 플릿 세계 면이 없다.
                 else -> throw IllegalArgumentException("플릿 주소(host.fleet.url)가 현장 플릿 세계 면이 아니다: GET ${port.url}/fleet/world → HTTP $status")
             }
-            return HostFleetPort(GatedFleetPort(port, authority), clock, port.url, port::confirmController)
+            val gated = GatedFleetPort(port, authority)
+            return HostFleetPort(gated, clock, port.url, port::confirmController).also { host ->
+                // 응답 바닥값을 그 요청의 순번과 짝지어 넘긴다(관측 중 플릿 준비의 후퇴 판정).
+                port.onResponseFloor = host::floorObserved
+                // 참조와 함께 받은 취소는 그 송신까지 안쪽 송신 직전 확인에 참조를 고정한다(핸들 → 참조 표 축출과 무관하게).
+                host.onCancelReference = gated::remember
+                host.onCancelSettled = gated::release
+            }
         }
 
         /**

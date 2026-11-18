@@ -55,6 +55,13 @@ class HttpEpochFenceTest {
             host = startHost()
         }
 
+        /** 실행 호스트를 멈춤 기록 없이 죽이고(커넥션 풀을 먼저 닫음) 새로 띄운다 — 다음 보유자는 만료 인수로 관측에 든다. */
+        fun killHost() {
+            (host.getBean(javax.sql.DataSource::class.java) as AutoCloseable).close()
+            host.close()
+            host = startHost()
+        }
+
         val leadership: HostLeadership get() = host.getBean(HostLeadership::class.java)
         val base: String get() = "http://127.0.0.1:${site.cellPort}"
 
@@ -71,7 +78,7 @@ class HttpEpochFenceTest {
         }
     }
 
-    private fun start(): Stack {
+    private fun start(extraArgs: List<String> = emptyList()): Stack {
         PostgresSupport.reset()
         PostgresSupport.execute("DROP SCHEMA IF EXISTS ops CASCADE")
         PostgresSupport.execute("DROP SCHEMA IF EXISTS mission CASCADE")
@@ -99,6 +106,7 @@ class HttpEpochFenceTest {
                 "--spring.datasource.password=${db.password}",
                 "--host.mock-run.profile=${root.resolve("mission-host/mock-run/humanoid-a.json")}",
                 "--host.mock-run.schema=${root.resolve(SiteConfig.PROFILE_SCHEMA)}",
+                *extraArgs.toTypedArray(),
             )
         }
         val host = try {
@@ -161,7 +169,7 @@ class HttpEpochFenceTest {
             assertEquals(status, stack.site.fleet.world.status(mimicHandle), "취소가 닿지 않았다")
             // 바닥값(다음 세대) > 내 세대 — 옛 능동은 플릿 응답으로 밀려나 잃는다.
             assertEquals(LeaderState.LOST, old.state)
-            assertTrue(old.lostReason!!.contains("robot=플릿"), old.lostReason)
+            assertTrue(old.lostReason!!.contains("대상=플릿"), old.lostReason)
             eventually("종료 훅") { stack.exits.isNotEmpty() }
             // 잃은 능동의 실행 호스트 포트는 더 보내지 않는다(로컬 관문).
             assertFailsWith<CommandNotSent> { fleet.dispatch(TransportOrder("JO-3#HU-1042", "HU-1042", "OUT-07", "LINE-IN-03")) }
@@ -207,6 +215,56 @@ class HttpEpochFenceTest {
             assertEquals(0, stack.site.fleet.world.dispatches, "옛 세대의 늦은 맡기기가 닿지 않았다")
             assertEquals(listOf(Triple("플릿", first, next)), superseded.toList())
             assertEquals(LeaderState.ISSUING, stack.leadership.state)
+        }
+    }
+
+    @Test
+    fun `만료 인수 뒤 새 보유자는 현장 플릿 확인과 재대조 뒤 근거를 적고 관측 중 운영자 확인 없이 플릿 운반을 취소한다`() {
+        // 리스 주기 0.3초·만료 3초 — 만료 인수를 몇 초 안에 본다.
+        val lease = listOf(
+            "--host.lease.period=PT0.3S", "--host.lease.expiry=PT3S", "--host.lease.margin=PT1S",
+            "--host.lease.idle-in-transaction-timeout=PT2S", "--host.lease.statement-timeout=PT2S",
+        )
+        start(lease).use { stack ->
+            eventually("발행") { stack.leadership.state == LeaderState.ISSUING }
+            val hostUrl = "http://127.0.0.1:${(stack.host as org.springframework.boot.web.context.WebServerApplicationContext).webServer.port}"
+            val order = """{"jobOrderId":"JO-F","workMasterId":"${dev.picasso.middleware.DeliverContainer.WORK_MASTER}","version":1,"requiredEvidence":"E2",""" +
+                """"parameters":{},"materialRequirements":[],"equipmentRequirements":[""" +
+                """{"id":"OUT-07","equipmentUse":"source","properties":{"container":"HU-1042"}},{"id":"LINE-IN-03","equipmentUse":"destination","properties":{}}]}"""
+            val submitted = http.send(
+                HttpRequest.newBuilder(URI.create("$hostUrl/host/job-orders")).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString("""{"jobOrder":$order,"candidates":["quadruped-01"]}""")).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            )
+            assertEquals("ACCEPTED", json.readTree(submitted.body())["result"].asText(), submitted.body())
+            // 가상 시계를 밀지 않으므로 운반은 맡긴 채(ACCEPTED) 멈춰 있다.
+            eventually("맡김") { stack.site.fleet.world.dispatches == 1 }
+            stack.killHost()
+            eventually("새 보유자 관측", Duration.ofSeconds(20)) { stack.leadership.state == LeaderState.HOLDING }
+            val next = stack.leadership
+            assertEquals(2L, next.controllerEpoch())
+            // 플릿은 세대를 대조하는 현장이다. 확인 → 확인 뒤 상태 읽기로 재대조 → 근거 → 준비.
+            eventually("플릿 준비", Duration.ofSeconds(20)) { next.fleetReadiness() is dev.picasso.ops.host.lease.FleetReadiness.Ready }
+            assertEquals(2L, stack.site.httpFence.floor(SiteHttpFence.FLEET))
+            val evidence = stack.host.getBean(dev.picasso.ops.host.store.HostRecords::class.java).fleetReadinessEvidence(2).single()
+            assertEquals(stack.site.fleet.boot to "DURABLE_CONFIRMED", evidence.receiverBootId to evidence.fenceStatus)
+
+            // 관측 중 운반 취소(운영자 확인 없음) — 현장 플릿이 받는다.
+            val host = stack.host.getBean(dev.picasso.ops.host.MissionHost::class.java)
+            val executionId = host.executions().executions.single().executionId
+            host.cancel(executionId, dev.picasso.middleware.Approver("kim", dev.picasso.middleware.ApproverKind.PERSON), "관측 중 운반 취소", java.util.UUID.randomUUID().toString())
+            val cancelled = runCatching {
+                eventually("현장 운반 취소") {
+                    stack.site.fleet.world.find("JO-F#HU-1042")?.let { stack.site.fleet.world.status(it).state } == dev.picasso.middleware.TransportState.CANCELLED
+                }
+            }
+            val nextUrl = "http://127.0.0.1:${(stack.host as org.springframework.boot.web.context.WebServerApplicationContext).webServer.port}"
+            check(cancelled.isSuccess) {
+                "현장 운반 취소 안 됨: " + http.send(HttpRequest.newBuilder(URI.create("$nextUrl/host/executions")).build(), HttpResponse.BodyHandlers.ofString()).body() +
+                    " leader=" + http.send(HttpRequest.newBuilder(URI.create("$nextUrl/host/leader")).build(), HttpResponse.BodyHandlers.ofString()).body()
+            }
+            assertEquals(LeaderState.HOLDING, next.state)
+            assertEquals(false, PostgresSupport.queryOne("SELECT issuing FROM mission.host_lease_term") { it.getBoolean(1) })
         }
     }
 }

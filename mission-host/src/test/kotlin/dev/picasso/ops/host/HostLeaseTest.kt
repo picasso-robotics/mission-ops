@@ -341,7 +341,7 @@ class HostLeaseTest {
         // V19 아래에서 세대 3 을 쥔 보유자가 발행을 열었고 리스는 이미 만료했다.
         PostgresSupport.execute("UPDATE mission.host_lease SET holder = 'mw-old', generation = 3 WHERE role = 'host'")
         PostgresSupport.execute("UPDATE mission.host_lease_term SET issuing = true, expires_at = clock_timestamp() - interval '1 second' WHERE role = 'host'")
-        assertEquals(1, HostSchema.flyway(ds).migrate().migrationsExecuted)
+        assertEquals(1, org.flywaydb.core.Flyway.configure().configuration(HostSchema.flyway(ds).configuration).target("20").load().migrate().migrationsExecuted)
         fun grants() = PostgresSupport.queryAll("SELECT generation, holder, issuing_at IS NOT NULL FROM mission.host_lease_grant ORDER BY generation") {
             "${it.getLong(1)}|${it.getString(2)}|${it.getBoolean(3)}"
         }

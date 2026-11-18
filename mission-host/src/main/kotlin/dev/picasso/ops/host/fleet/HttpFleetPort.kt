@@ -166,9 +166,23 @@ class HttpFleetPort(
         .POST(HttpRequest.BodyPublishers.ofByteArray(body))
         .build()
 
+    /**
+     * 응답마다의 바닥값을 받는 쪽. 응답을 받은 뒤 **부른 스레드에서** 부른다(관측 중 플릿 준비의 후퇴 판정, [HostFleetPort.floorObserved]). 없으면 부르지 않는다.
+     */
+    @Volatile
+    var onResponseFloor: ((Long) -> Unit)? = null
+
     /** 보낸다. 바닥값은 머리말을 받은 순간(본문을 받기 전) 본다([HttpEpoch.observing]) — 본문 수신이 끊겨도 밀려남은 놓치지 않는다. */
     private fun send(request: HttpRequest, mine: Long): HttpResponse<ByteArray> = try {
-        http.send(request, epoch.observing(mine))
+        http.send(request, epoch.observing(mine)).also { response ->
+            // 준비 해제 판정에는 바닥값 헤더가 실린 성공 응답(2xx)과 세대 거부(409 STALE)만 넘긴다 — 헤더 없는 응답·그 밖의 오류는 읽기 실패이지 후퇴가 아니다.
+            // 높은 바닥값의 밀려남은 위의 [HttpEpoch.observing] 이 상태 코드와 무관하게 이미 봤다.
+            if (onResponseFloor != null && response.headers().firstValue(HttpEpoch.FLOOR_HEADER).isPresent &&
+                (response.statusCode() in 200..299 || stale(response))
+            ) {
+                onResponseFloor?.invoke(HttpEpoch.floorOf(response.headers()))
+            }
+        }
     } catch (e: InterruptedException) {
         Thread.currentThread().interrupt()
         throw FleetUnreachable("플릿 면 호출이 끊겼다: ${request.uri()}", e)

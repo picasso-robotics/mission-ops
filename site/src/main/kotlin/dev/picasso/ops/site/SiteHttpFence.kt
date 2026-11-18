@@ -45,6 +45,15 @@ class SiteHttpFence(
     /** [key] 의 바닥값. 대조 안 함이면 0. */
     fun floor(key: String): Long = fence.floor(key)
 
+    private val refusalCounts = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+
+    /** [key] 에서 세대로 거절한(409 `STALE_CONTROLLER`) 변경·인수 확인 수(측정·진단). */
+    fun refusals(key: String): Long = refusalCounts[key]?.get() ?: 0L
+
+    private fun countRefusal(key: String) {
+        refusalCounts.computeIfAbsent(key) { java.util.concurrent.atomic.AtomicLong() }.incrementAndGet()
+    }
+
     /** 요청 하나의 대조 자리를 연다. 헤더를 읽고, 닫으면 통과 표지를 닫는다. */
     fun scope(exchange: HttpExchange, key: String): Scope = Scope(exchange, key)
 
@@ -59,12 +68,12 @@ class SiteHttpFence(
      */
     fun confirm(key: String, epoch: Long, bootId: String): Pair<Int, Map<String, Any?>> {
         if (!fenced) return 200 to confirmed(0, UNSPECIFIED, bootId)
-        if (epoch <= 0L || epoch < fence.floor(key)) return 409 to stale(epoch, fence.floor(key))
+        if (epoch <= 0L || epoch < fence.floor(key)) return 409 to stale(epoch, fence.floor(key)).also { countRefusal(key) }
         val confirmation = try {
             fence.confirm(key, epoch, confirmWait)
         } catch (e: Exception) {
             return 503 to storeFailed(key, e)
-        } ?: return 409 to stale(epoch, fence.floor(key))
+        } ?: return 409 to stale(epoch, fence.floor(key)).also { countRefusal(key) }
         val status = confirmation.status(fence.durability, inDoubt = false).name.removePrefix(STATUS_PREFIX)
         return 200 to confirmed(epoch, status, bootId)
     }
@@ -146,6 +155,7 @@ class SiteHttpFence(
             return when (admission) {
                 is ControllerFence.Admission.Stale -> {
                     refused = true
+                    countRefusal(key)
                     409 to json.writeValueAsBytes(stale(admission.requested, admission.floor))
                 }
                 is ControllerFence.Admission.Admitted -> {

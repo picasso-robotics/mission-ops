@@ -92,7 +92,7 @@ class HostReadinessTest {
             assertEquals(LeaderState.HOLDING, leadership.state)
             assertEquals(false, PostgresSupport.queryOne("SELECT issuing FROM mission.host_lease_term") { it.getBoolean(1) })
 
-            // 플릿 단위가 든 실행은 기체가 모두 준비여도 쥐지 않는다(플릿은 이 단계에서 준비가 서지 않는다). 운반 참조로 되짚은 송신 직전 확인도 막는다.
+            // 플릿 단위가 든 실행은 기체가 모두 준비여도 쥐지 않는다(플릿 준비가 서지 않았다 — 플릿 인수 확인을 본 적이 없다). 운반 참조로 되짚은 송신 직전 확인도 막는다.
             leadership.requirements = listOf(Requirement("exec-3", "JO-3", setOf(QUADRUPED), fleet = true))
             val fleet = assertIs<Authority.NotHeld>(leadership.authorityOf(QUADRUPED))
             assertTrue("실행 exec-3(작업 지시 JO-3)의 플릿" in fleet.reason, fleet.reason)
