@@ -634,6 +634,23 @@ export const AUTHORITY_BLOCK_TEXT = {
   mixed: '까닭이 인수 확인 대기인 기체·플릿은 수신자의 자동 확인이나 운영자의 인수 확인으로 풀립니다.',
 }
 
+/**
+ * 수신자 재시작 의심으로 막힌 새 로봇 명령(까닭 `AUTHORITY_NOT_HELD`, 막는 주체가 «수신자 재시작 의심» 으로 시작). 만료 인수 뒤 앞 호스트가 보냈을 수 있는
+ * 단위가 수신자 장부에 보이지 않아(수신자가 다시 떠 장부를 잃었을 수 있음) 실행 호스트가 그 기체로 출발을 내지 않는다. 인수 확인과 달리 자동으로
+ * 풀리지 않고, 운영자 인수 확인으로도 풀리지 않는다 — 운영자 단위 해제로만 풀린다.
+ */
+export const RESTART_HOLD_BLOCK_TEXT = {
+  heading: '수신자 재시작 의심',
+  /** 실행 호스트의 재시작 의심 권위 까닭은 막는 주체가 이것으로 시작한다. */
+  subjectPrefix: '수신자 재시작 의심',
+  intro:
+    '앞 호스트가 이 기체에 보냈을 수 있는 명령을 수신자가 모릅니다(수신자가 다시 떠 장부를 잃었을 수 있음). 같은 명령을 다시 보내면 로봇이 같은 일을 두 번 할 수 있어 이 기체로 출발을 내지 않습니다.',
+  resume:
+    '현장에서 그 기체의 벤더 작업이 끝났거나 효과가 없음을 확인한 뒤 운영자가 그 의심을 단위 해제해야 풀립니다. 인수 확인(옛 호스트 종료 확인)으로는 풀리지 않습니다.',
+  notStop: '이 대기는 기체를 세우지 않습니다. 취소는 그대로 나갑니다.',
+  mixed: '까닭이 수신자 재시작 의심인 기체는 운영자 단위 해제로만 풀립니다.',
+}
+
 /** 허가 판정의 까닭(picasso PermitCause). */
 export const PERMIT_CAUSE_LABEL: Record<string, string> = {
   REPORTED: '원천 보고',
@@ -652,6 +669,7 @@ export const PERMIT_CAUSE_LABEL: Record<string, string> = {
  */
 export function permitCauseLabel(reason: { cause: string; subject: string | null }): string {
   if (reason.cause === 'AUTHORITY_NOT_HELD' && (reason.subject ?? '').startsWith(AUTHORITY_BLOCK_TEXT.subjectPrefix)) return AUTHORITY_BLOCK_TEXT.heading
+  if (reason.cause === 'AUTHORITY_NOT_HELD' && (reason.subject ?? '').startsWith(RESTART_HOLD_BLOCK_TEXT.subjectPrefix)) return RESTART_HOLD_BLOCK_TEXT.heading
   return PERMIT_CAUSE_LABEL[reason.cause] ?? reason.cause
 }
 

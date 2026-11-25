@@ -2,7 +2,7 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { Execution, PermitBlock } from '../api'
-import { AUTHORITY_BLOCK_TEXT as AUTHORITY, PERMIT_BLOCK_TEXT as TEXT, RETIRED_BLOCK_TEXT as RETIRED } from '../labels'
+import { AUTHORITY_BLOCK_TEXT as AUTHORITY, PERMIT_BLOCK_TEXT as TEXT, RESTART_HOLD_BLOCK_TEXT as RESTART, RETIRED_BLOCK_TEXT as RETIRED } from '../labels'
 import { ExecutionList } from './ExecutionList'
 import { WorkRequests } from './WorkRequests'
 
@@ -181,4 +181,33 @@ it('권위 까닭이라도 인수 확인 대기가 아니면(밀려남 따위) �
   // 행의 까닭 라벨도 «인수 확인 대기» 가 아니라 일반 라벨이다.
   expect(within(notice).getByText(/까닭 권위 없음 · 막는 주체 수신자가 답한 세대 거절/)).toBeVisible()
   expect(within(notice).queryByText(/까닭 인수 확인 대기/)).not.toBeInTheDocument()
+})
+
+const restartReason = {
+  source: null,
+  cause: 'AUTHORITY_NOT_HELD',
+  subject: '수신자 재시작 의심 — 기체 quadruped-01: 의심 #3 단위 T2.travel(태스크 JO-1#T2.travel) — 운영자 단위 해제 필요',
+  resumeBasis: '이 인스턴스가 그 기체의 권위를 쥘 때',
+  observedAt: null,
+}
+
+it('수신자 재시작 의심만으로 막힌 실행은 그 제목과 운영자 단위 해제 안내를 보이고 인수 확인 안내는 보이지 않는다', () => {
+  const held: PermitBlock = { ...block, robots: [{ robotId: 'quadruped-01', permit: 'INHIBITED', reasons: [restartReason] }] }
+  render(<ExecutionList read={{ value: { instanceId: 'mw-1', pumpedAt: 't', executions: [execution({ permitBlock: held })], ...NO_SETTLED }, error: null }} highlight={null} />)
+  expect(screen.queryByRole('region', { name: AUTHORITY.heading })).not.toBeInTheDocument()
+  const notice = screen.getByRole('region', { name: RESTART.heading })
+  expect(within(notice).getByText(RESTART.intro)).toBeVisible()
+  expect(within(notice).getByText(/까닭 수신자 재시작 의심 · 막는 주체 수신자 재시작 의심 — 기체 quadruped-01: 의심 #3/)).toBeVisible()
+  expect(within(notice).getByText(RESTART.resume)).toBeVisible()
+  expect(within(notice).getByText(RESTART.notStop)).toBeVisible()
+  expect(within(notice).queryByText(AUTHORITY.resume)).not.toBeInTheDocument()
+  expect(within(notice).queryByRole('button')).not.toBeInTheDocument()
+})
+
+it('작업 허가와 수신자 재시작 의심이 섞이면 운영자 단위 해제로만 풀린다는 줄을 더한다', () => {
+  const mixed: PermitBlock = { ...block, robots: [...block.robots, { robotId: 'quadruped-01', permit: 'INHIBITED', reasons: [restartReason] }] }
+  render(<ExecutionList read={{ value: { instanceId: 'mw-1', pumpedAt: 't', executions: [execution({ permitBlock: mixed })], ...NO_SETTLED }, error: null }} highlight={null} />)
+  const notice = screen.getByRole('region', { name: TEXT.heading })
+  expect(within(notice).getByText(RESTART.mixed)).toBeVisible()
+  expect(within(notice).queryByText(AUTHORITY.mixed)).not.toBeInTheDocument()
 })
