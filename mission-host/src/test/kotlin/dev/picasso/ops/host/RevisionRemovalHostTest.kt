@@ -62,6 +62,10 @@ class RevisionRemovalHostTest {
         it.toFile().deleteOnExit()
     }
 
+    /** 안내(`manifest.json`)가 센 제거 건수. 아직 안내가 없으면 널이다 — 안내는 이름 바꾸기로 놓이므로 반쯤 쓰인 것을 읽지 않는다. */
+    private fun manifestRemovals(export: Path): Int? = export.resolve(LedgerExport.MANIFEST)
+        .takeIf { Files.exists(it) }?.let { JSON.readTree(it.readText())["counts"]?.get("revisionRemovals")?.asInt() }
+
     private fun guard(value: String): String {
         val closed = "\"name\":\"guard_closed\",\"location\":null,\"kind\":\"BOOLEAN\",\"safety\":true,\"value\":\"true\""
         return HostBench.STANDARD_CELL.replace(closed, closed.replace("\"value\":\"true\"", "\"value\":\"$value\""))
@@ -99,9 +103,8 @@ class RevisionRemovalHostTest {
             assertTrue("T2" !in record.toString(), record.toString())
 
             // 내보내기(버전 10): 커밋한 제거 사건이 셋째 레지스터에 picasso 글자 그대로 실리고 안내가 그 수를 센다.
-            bench.eventually("제거 레지스터 파일") {
-                Files.exists(export.resolve(LedgerExport.REVISION_REMOVALS)) && export.resolve(LedgerExport.REVISION_REMOVALS).readLines().isNotEmpty()
-            }
+            // 안내는 한 벌의 맨 마지막에 바뀐다 — 레지스터만 보고 읽으면 앞 벌의 안내(0 건)를 읽는다. 안내의 건수를 기다린다.
+            bench.eventually("안내의 제거 건수") { manifestRemovals(export) == 1 }
             assertEquals(listOf(row.line), export.resolve(LedgerExport.REVISION_REMOVALS).readLines())
             val manifest = JSON.readTree(export.resolve(LedgerExport.MANIFEST).readText())
             assertEquals("10", manifest["schemaVersion"].asText(), manifest.toString())
@@ -257,10 +260,9 @@ class RevisionRemovalHostTest {
                 Fenced.execute("DROP FUNCTION mission.refuse_response()")
             }
             val file = export.resolve(LedgerExport.REVISION_REMOVALS)
-            bench.eventually("두 사건 게시") { Files.exists(file) && file.readLines().size == 2 }
+            bench.eventually("두 사건 게시") { manifestRemovals(export) == 2 }
             val rows = bench.records().revisionRemovalsOf(bench.host.instanceId)
             assertEquals(rows.map { it.line }, file.readLines())
-            assertEquals(2, JSON.readTree(export.resolve(LedgerExport.MANIFEST).readText())["counts"]["revisionRemovals"].asInt())
             val copy = bench.get("/host/executions/summary")["ledgerCopy"]["revisionRemovals"]
             assertEquals(listOf(2, 0, 0), listOf("copied", "pending", "evictedBeforeCopy").map { copy[it].asInt() }, copy.toString())
         }
