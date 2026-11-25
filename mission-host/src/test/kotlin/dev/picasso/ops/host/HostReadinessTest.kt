@@ -18,6 +18,7 @@ import dev.picasso.ops.host.lease.LeaseConnections
 import dev.picasso.ops.host.lease.LeaseTiming
 import dev.picasso.ops.host.lease.Readiness
 import dev.picasso.ops.host.lease.Requirement
+import dev.picasso.ops.host.lease.RestartHolds
 import dev.picasso.ops.host.lease.WaitReason
 import dev.picasso.ops.host.store.HostSchema
 import dev.picasso.registry.PostgresSupport
@@ -484,6 +485,282 @@ class HostReadinessTest {
             throw UnsupportedOperationException()
         override fun watch(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) = emptyList<dev.picasso.contracts.v1.WatchTaskResponse>()
         override fun cancel(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) = throw UnsupportedOperationException()
+    }
+
+    @Test
+    fun `수신자 재시작 의심 보류가 있는 기체는 관측 중이든 발행 중이든 출발만 막히고 취소는 지나며 권위는 의심 머리로 쥐지 않고 해제하면 풀린다`() {
+        holding().use { leadership ->
+            val mine = leadership.lease.generation!!
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", setOf(QUADRUPED), fleet = false))
+            val sent = mutableListOf<String>()
+            val intents = mutableListOf<String>()
+            leadership.startIntent = { robot, task, revision -> intents += "$robot $task $revision" }
+            val gated = GatedRobotPort(RoutedRobotPort(mapOf(QUADRUPED to Recording(sent), HUMANOID to Recording(sent))), leadership)
+            val cancel = dev.picasso.contracts.v1.TaskHandle.newBuilder().setTaskId("JO-1#T1").setRevision(1).setRobotId(QUADRUPED).build()
+
+            // 래치된 기체에 후보 하나 — 겉으로는 재시작 의심(밑의 판정이 준비), 근거 없이 출발만 막힘.
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.pendingReady().single().let(leadership::latch)
+            val hold = RestartHolds.Hold(QUADRUPED, "JO-1", "exec-1", "T2.travel", 0, "JO-1#T2.travel", 1, 7, 3)
+            leadership.restartHolds.hold(listOf(hold))
+            assertEquals(WaitReason.RESTART_SUSPECT, (leadership.readinessOf(QUADRUPED) as Readiness.Waiting).reason)
+            assertFalse(leadership.mayStart(QUADRUPED))
+            assertTrue(leadership.mayIssue(QUADRUPED), "재시작 의심 보류는 취소의 송신 직전 확인을 막지 않는다")
+            assertFailsWith<CommandNotSent> { gated.start(QUADRUPED, "JO-1#T3", 1, "navigate_to", emptyMap()) }
+            assertIs<dev.picasso.middleware.Issue.NotSent>(gated.issue(QUADRUPED, "JO-1#T3", 1, "navigate_to", emptyMap()))
+            gated.cancel(QUADRUPED, cancel)
+            assertEquals(listOf("cancel JO-1#T1"), sent)
+            assertEquals(emptyList(), intents, "막힌 출발의 송신 의도를 적었다")
+            // 관측 중 대조 중인 후보는 인수 확인 대기의 겉으로 실린다.
+            val holdingRefusal = assertIs<Authority.NotHeld>(leadership.authorityOf(QUADRUPED))
+            assertTrue(holdingRefusal.reason.startsWith(HostLeadership.AWAITING_CONFIRMATION), holdingRefusal.reason)
+            assertTrue(WaitReason.RESTART_SUSPECT.text in holdingRefusal.reason, holdingRefusal.reason)
+
+            // 발행 중(운영자 확인 뒤)에도 그대로 막히고 권위는 의심 머리로 쥐지 않는다. 다른 기체는 쥔다.
+            assertTrue(leadership.confirmed())
+            assertEquals(LeaderState.ISSUING, leadership.state)
+            val issuing = assertIs<Authority.NotHeld>(leadership.authorityOf(QUADRUPED))
+            assertTrue(issuing.reason.startsWith(HostLeadership.RESTART_SUSPECT_HELD), issuing.reason)
+            assertTrue("JO-1#T2.travel" in issuing.reason, issuing.reason)
+            assertEquals(Authority.Held, leadership.authorityOf(HUMANOID))
+            assertFailsWith<CommandNotSent> { gated.start(QUADRUPED, "JO-1#T3", 1, "navigate_to", emptyMap()) }
+            gated.start(HUMANOID, "JO-9#T1", 2, "navigate_to", emptyMap())
+            assertEquals(listOf("$HUMANOID JO-9#T1 2"), intents)
+            gated.cancel(QUADRUPED, cancel)
+            assertEquals(listOf("cancel JO-1#T1", "start JO-9#T1", "cancel JO-1#T1"), sent)
+
+            // 적격 읽기에서 안 보여 의심으로 확정 → 저장 → 해제하면 풀린다.
+            assertTrue(leadership.restartHolds.observe(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), mine))
+            leadership.restartHolds.persisted("JO-1#T2.travel", 11, mine)
+            assertTrue(leadership.restartHolds.suspected(QUADRUPED))
+            assertEquals(null, leadership.restartHolds.release(12))
+            assertEquals("JO-1#T2.travel", leadership.restartHolds.release(11)?.taskId)
+            assertTrue(leadership.mayStart(QUADRUPED))
+            assertEquals(Authority.Held, leadership.authorityOf(QUADRUPED))
+            gated.start(QUADRUPED, "JO-1#T3", 1, "navigate_to", emptyMap())
+            assertEquals(listOf("$HUMANOID JO-9#T1 2", "$QUADRUPED JO-1#T3 1"), intents)
+        }
+    }
+
+    @Test
+    fun `송신 의도는 바깥 관문과 안쪽 관문을 함께 지나도 한 번만 적고 적지 못하면 위임하지 않는다`() {
+        holding().use { leadership ->
+            assertTrue(leadership.confirmed())
+            val sent = mutableListOf<String>()
+            val intents = mutableListOf<String>()
+            leadership.startIntent = { _, task, _ -> intents += task }
+            val outer = GatedRobotPort(GatedRobotPort(RoutedRobotPort(mapOf(QUADRUPED to Recording(sent))), leadership), leadership)
+            outer.start(QUADRUPED, "JO-1#T1", 1, "navigate_to", emptyMap())
+            assertEquals(listOf("JO-1#T1"), intents)
+            assertEquals(listOf("start JO-1#T1"), sent)
+            leadership.startIntent = { _, _, _ -> throw CommandNotSent("주입: 의도 쓰기 실패") }
+            assertFailsWith<CommandNotSent> { outer.start(QUADRUPED, "JO-1#T2", 1, "navigate_to", emptyMap()) }
+            assertEquals(listOf("start JO-1#T1"), sent, "송신 의도를 적지 못했는데 보냈다")
+            // 다음 출발은 다시 적는다(앞 실패가 스레드 표시를 남기지 않음).
+            leadership.startIntent = { _, task, _ -> intents += task }
+            outer.start(QUADRUPED, "JO-1#T3", 1, "navigate_to", emptyMap())
+            assertEquals(listOf("JO-1#T1", "JO-1#T3"), intents)
+        }
+    }
+
+    @Test
+    fun `송신 의도를 커밋한 뒤 위임 직전에 권위와 기체 보류를 다시 보아 그 사이 보류가 서거나 리스를 잃으면 보내지 않는다`() {
+        holding().use { leadership ->
+            assertTrue(leadership.confirmed())
+            val sent = mutableListOf<String>()
+            val gated = GatedRobotPort(RoutedRobotPort(mapOf(QUADRUPED to Recording(sent))), leadership)
+            // 의도 커밋 중에 늦은 복원이 그 기체에 보류를 세웠다.
+            leadership.startIntent = { robot, task, _ ->
+                leadership.restartHolds.hold(listOf(RestartHolds.Hold(robot, "JO-L", "exec-9", "T1", 0, "JO-L#T1", 1, 1, null)))
+                assertTrue(task.isNotEmpty())
+            }
+            val held = assertFailsWith<CommandNotSent> { gated.start(QUADRUPED, "JO-1#T1", 1, "navigate_to", emptyMap()) }
+            assertTrue(held.message!!.startsWith(dev.picasso.ops.host.lease.SendAuthority.RESTART_HELD), held.message)
+            assertEquals(emptyList(), sent)
+            leadership.restartHolds.closeIssued("JO-L#T1")
+            // 의도 커밋 중에 리스를 잃었다(자기 차단 기한·밀려남과 같은 자리).
+            leadership.startIntent = { _, _, _ -> leadership.lost("주입: 의도 커밋 중 리스를 잃음") }
+            val lost = assertFailsWith<CommandNotSent> { gated.start(QUADRUPED, "JO-1#T2", 1, "navigate_to", emptyMap()) }
+            assertTrue(lost.message!!.startsWith(dev.picasso.ops.host.lease.SendAuthority.NOT_ISSUING), lost.message)
+            assertEquals(emptyList(), sent, "의도 커밋 뒤 권위를 잃었는데 보냈다")
+        }
+    }
+
+    @Test
+    fun `관측 중 수신자 재시작 의심 보류가 막는 기체는 미리 읽기가 확인을 보여도 매 pump 지금 읽지 않고 간격 회복으로만 읽으며 보류가 풀리면 다시 대상이 된다`() {
+        val clock = java.util.concurrent.atomic.AtomicLong(0)
+        holding(clock::get).use { leadership ->
+            val mine = leadership.lease.generation!!
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", setOf(QUADRUPED), fleet = false))
+            leadership.restartHolds.hold(listOf(RestartHolds.Hold(QUADRUPED, "JO-1", "exec-1", "T1", 0, "JO-1#T1", 1, 1, null)))
+            // 첫 관측(간격 회복 차례)은 한 번 지금 읽는다.
+            assertEquals(setOf(QUADRUPED), leadership.freshTargets())
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.pendingReady().single().let(leadership::holdBack)
+            // 그 뒤 미리 읽기가 확인을 보여도 간격 안에서는 지금 읽기 대상이 아니다.
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet())
+            assertEquals(emptySet(), leadership.freshTargets(), "보류 기체를 매 pump 잠금 아래 지금 읽기 대상에 넣었다")
+            assertFalse(leadership.mayReadNow(QUADRUPED))
+            assertEquals(WaitReason.RESTART_SUSPECT, (leadership.readinessOf(QUADRUPED) as Readiness.Waiting).reason)
+            // 간격이 지나면 한 번 읽는다(미리 읽기가 끝나지 않는 기체에도 판별·래치의 길).
+            clock.addAndGet(HostLeadership.DEFAULT_UNREAD_RETRY.toNanos() + 1)
+            assertEquals(setOf(QUADRUPED), leadership.freshTargets())
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.pendingReady().single().let(leadership::holdBack)
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet())
+            // 보류가 풀리면 미리 읽기 확인으로 다시 대상이 된다.
+            leadership.restartHolds.closeIssued("JO-1#T1")
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet())
+            assertTrue(leadership.mayReadNow(QUADRUPED))
+            assertEquals(setOf(QUADRUPED), leadership.freshTargets())
+        }
+    }
+
+    @Test
+    fun `보류 기체는 래치됐든 발행 중이든 매 pump 지금 읽지 않고 간격 회복만 하며 한 pump 의 회복 읽기는 보류 기체 하나다`() {
+        val clock = java.util.concurrent.atomic.AtomicLong(0)
+        holding(clock::get).use { leadership ->
+            val mine = leadership.lease.generation!!
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", setOf(QUADRUPED, HUMANOID), fleet = false))
+            // 두 기체 모두 래치된 뒤 보류가 생겼다.
+            listOf(QUADRUPED, HUMANOID).forEach { robot ->
+                leadership.observeFresh(robot, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            }
+            leadership.pendingReady().forEach(leadership::latch)
+            leadership.restartHolds.hold(
+                listOf(QUADRUPED, HUMANOID).map { RestartHolds.Hold(it, "JO-1", "exec-1", "T-$it", 0, "JO-1#T-$it", 1, 1, null) },
+            )
+            clock.addAndGet(HostLeadership.DEFAULT_UNREAD_RETRY.toNanos() + 1)
+            leadership.beginRound()
+            // 간격이 지났어도 한 pump 에 보류 기체 하나만 회복 읽기를 한다.
+            assertEquals(1, listOf(QUADRUPED, HUMANOID).count { leadership.mayReadNow(it) })
+            val read = listOf(QUADRUPED, HUMANOID).single { leadership.mayReadNow(it) }
+            leadership.observeFresh(read, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.beginRound()
+            assertFalse(leadership.mayReadNow(read), "래치된 보류 기체를 간격 안에서 다시 지금 읽었다")
+            // 발행 중에도 같다.
+            assertTrue(leadership.confirmed())
+            leadership.beginRound()
+            assertFalse(leadership.mayReadNow(read))
+            assertFalse(leadership.allowUnreadFallback(read))
+            leadership.observeFresh(read, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.beginRound()
+            assertFalse(leadership.mayReadNow(read), "발행 중 보류 기체를 매 pump 지금 읽었다")
+            // 보류가 풀리면 발행 중에는 늘 읽는다(오늘 거동).
+            leadership.restartHolds.closeIssued("JO-1#T-$read")
+            assertTrue(leadership.mayReadNow(read))
+        }
+    }
+
+    @Test
+    fun `보류 기체 셋은 pump 마다 가장 오래 회복 읽기를 못 한 기체가 몫을 받아 차례가 돌고 발행 중에도 출발을 앞두지 않은 기체가 몫을 받는다`() {
+        val clock = java.util.concurrent.atomic.AtomicLong(0)
+        holding(clock::get).use { leadership ->
+            val mine = leadership.lease.generation!!
+            val robots = listOf(QUADRUPED, HUMANOID, "robot-3")
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", robots.toSet(), fleet = false))
+            leadership.restartHolds.hold(robots.map { RestartHolds.Hold(it, "JO-1", "exec-1", "T-$it", 0, "JO-1#T-$it", 1, 1, null) })
+            assertTrue(leadership.confirmed())
+            val turns = mutableListOf<String>()
+            repeat(3) {
+                clock.addAndGet(HostLeadership.DEFAULT_UNREAD_RETRY.toNanos() + 1)
+                leadership.beginRound()
+                val target = leadership.heldRecoveryTargets().single()
+                // 같은 pump 의 다른 보류 기체는 몫이 없다.
+                assertEquals(listOf(target), robots.filter { leadership.mayReadNow(it) })
+                turns += target
+                leadership.observeFresh(target, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            }
+            assertEquals(robots.toSet(), turns.toSet(), "보류 기체의 회복 차례가 돌지 않았다: $turns")
+        }
+    }
+
+    @Test
+    fun `읽히지 않는 보류 기체는 회복 몫을 잡지 않아 도는 실행의 보류 기체가 미리 읽기가 계속 실패해도 실제 기체 포트로 간격마다 회복 읽기를 받는다`() {
+        val clock = java.util.concurrent.atomic.AtomicLong(0)
+        holding(clock::get).use { leadership ->
+            // A(humanoid-01): 도는 실행이 없는 보류 기체(종결·포기 행의 후보 따위 — 미들웨어가 읽지 않음). B(quadruped-01): 도는 실행의 보류 기체.
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", setOf(QUADRUPED), fleet = false))
+            leadership.restartHolds.hold(
+                listOf(
+                    RestartHolds.Hold(HUMANOID, "JO-OLD", null, "T1", 0, "JO-OLD#T1", 1, 1, null),
+                    RestartHolds.Hold(QUADRUPED, "JO-1", "exec-1", "T1", 0, "JO-1#T1", 1, 1, null),
+                ),
+            )
+            assertTrue(leadership.confirmed())
+            val fresh = mutableListOf<String>()
+            // B 의 읽기는 모두 실패한다(미리 읽기 실패가 이어짐).
+            val failing = object : dev.picasso.middleware.RobotPort {
+                override fun snapshot(robotId: String): RobotSnapshot? = throw IllegalStateException("주입: 읽기 실패")
+                override fun replay(robotId: String, from: Long): dev.picasso.middleware.Replay? = null
+                override fun start(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>) =
+                    throw UnsupportedOperationException()
+                override fun watch(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) = emptyList<dev.picasso.contracts.v1.WatchTaskResponse>()
+                override fun cancel(robotId: String, handle: dev.picasso.contracts.v1.TaskHandle) = throw UnsupportedOperationException()
+            }
+            HostRobotPort(failing, HostClock { Instant.parse("2026-11-17T00:00:00Z") }, java.util.concurrent.Executor { it.run() }).use { port ->
+                port.onFreshRead = { r, s, n, at -> fresh += r; leadership.observeFresh(r, s, n, at) }
+                port.onOtherRead = { r, s, n -> leadership.observePrefetched(r, s, n) }
+                port.unreadFallback = leadership::allowUnreadFallback
+                repeat(3) {
+                    clock.addAndGet(HostLeadership.DEFAULT_UNREAD_RETRY.toNanos() + 1)
+                    // pump 한 번 — 실행 호스트와 같은 순서(몫을 새로 셈 → 지금 읽을 기체 → 미들웨어가 도는 실행의 기체를 읽음).
+                    leadership.beginRound()
+                    port.readNowFor(leadership.heldRecoveryTargets())
+                    port.prefetched(QUADRUPED)
+                }
+            }
+            assertEquals(listOf(QUADRUPED, QUADRUPED, QUADRUPED), fresh, "읽히지 않는 보류 기체가 회복 몫을 잡았다")
+        }
+    }
+
+    @Test
+    fun `붙음 보류는 송신 의도 커밋 뒤 재확인을 지나야 닫히고 재확인에서 막혀 보내지 않으면 남는다`() {
+        holding().use { leadership ->
+            val mine = leadership.lease.generation!!
+            assertTrue(leadership.confirmed())
+            val sent = mutableListOf<String>()
+            val gated = GatedRobotPort(RoutedRobotPort(mapOf(QUADRUPED to Recording(sent))), leadership)
+            leadership.restartHolds.hold(listOf(RestartHolds.Hold(QUADRUPED, "JO-1", "exec-1", "T1", 0, "JO-1#T1", 1, 1, null)))
+            leadership.restartHolds.observe(
+                QUADRUPED,
+                snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED).copy(tasks = mapOf("JO-1#T1" to dev.picasso.contracts.v1.TaskState.TASK_STATE_RUNNING), revisions = mapOf("JO-1#T1" to 1)),
+                seq.incrementAndGet(), mine, issuing = true,
+            )
+            assertFalse(leadership.restartHolds.blocks(QUADRUPED))
+            // 의도는 커밋됐는데 재확인에서 리스를 잃어 보내지 않았다 — 붙음 보류는 남는다.
+            leadership.startIntent = { _, _, _ -> leadership.lost("주입: 의도 커밋 중 리스를 잃음") }
+            assertFailsWith<CommandNotSent> { gated.start(QUADRUPED, "JO-1#T1", 1, "inspect", emptyMap()) }
+            assertEquals(emptyList(), sent)
+            assertTrue(leadership.restartHolds.has("JO-1#T1"), "보내지 않은 출발로 붙음 보류를 닫았다")
+        }
+    }
+
+    @Test
+    fun `래치 뒤 요청 순번상 가장 뒤의 성공한 응답이 같은 세대 DURABLE_PENDING 이면 표시만 하고 읽기 실패와 늦은 앞 순번 응답은 덮지 않는다`() {
+        holding().use { leadership ->
+            val mine = leadership.lease.generation!!
+            leadership.requirements = listOf(Requirement("exec-1", "JO-1", setOf(QUADRUPED), fleet = false))
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            leadership.pendingReady().single().let(leadership::latch)
+            assertFalse(leadership.latchedPending(QUADRUPED))
+            val early = seq.incrementAndGet()
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_PENDING), seq.incrementAndGet(), Instant.EPOCH)
+            assertTrue(leadership.latchedPending(QUADRUPED))
+            assertIs<Readiness.Ready>(leadership.readinessOf(QUADRUPED))
+            leadership.observeFresh(QUADRUPED, null, seq.incrementAndGet(), Instant.EPOCH)
+            assertTrue(leadership.latchedPending(QUADRUPED), "읽기 실패가 표시를 덮었다")
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), early)
+            assertTrue(leadership.latchedPending(QUADRUPED), "늦게 소비한 앞 순번 응답이 표시를 덮었다")
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet())
+            assertFalse(leadership.latchedPending(QUADRUPED))
+            // 발행 중에도 따라간다.
+            assertTrue(leadership.confirmed())
+            leadership.observePrefetched(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_PENDING), seq.incrementAndGet())
+            assertTrue(leadership.latchedPending(QUADRUPED), "발행 중 같은 세대 미확정을 따라가지 않았다")
+            leadership.observeFresh(QUADRUPED, snapshot(mine, FenceStatus.FENCE_STATUS_DURABLE_CONFIRMED), seq.incrementAndGet(), Instant.EPOCH)
+            assertFalse(leadership.latchedPending(QUADRUPED))
+        }
     }
 
     /**

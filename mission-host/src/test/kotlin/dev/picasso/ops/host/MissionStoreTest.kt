@@ -23,7 +23,7 @@ class MissionStoreTest {
     @BeforeTest
     fun freshSchema() {
         Fenced.execute("DROP SCHEMA IF EXISTS mission CASCADE")
-        assertEquals(21, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
+        assertEquals(22, HostSchema.flyway(dataSource).migrate().migrationsExecuted)
     }
 
     private fun draft(workMaster: String = PSR) = store.saveDraft(workMaster, "{}", "lee", UUID.randomUUID())
@@ -39,7 +39,7 @@ class MissionStoreTest {
             listOf(
                 "draft", "execution_cancel", "execution_close", "execution_close_confirmed", "execution_fault_release", "execution_journal", "execution_journal_event", "execution_journal_revision", "execution_judgment_record",
                 "flyway_schema_history",
-                "host_fleet_readiness_evidence", "host_fleet_receiver_boot", "host_instance", "host_lease", "host_lease_grant", "host_lease_term", "host_readiness_evidence", "host_takeover_confirmation", "incident_copy", "incident_copy_resolution", "incident_copy_revision", "job_order_withdrawal", "job_response_log", "mission_version",
+                "host_fleet_readiness_evidence", "host_fleet_receiver_boot", "host_instance", "host_issue_intent", "host_lease", "host_lease_grant", "host_lease_term", "host_readiness_evidence", "host_restart_release", "host_restart_suspicion", "host_takeover_confirmation", "incident_copy", "incident_copy_resolution", "incident_copy_revision", "job_order_withdrawal", "job_response_log", "mission_version",
                 "mock_run", "remedy_approval", "remedy_search_copy", "result_outbox",
                 "result_producer", "revision_removal", "robot_residual_hold", "robot_residual_hold_clearing", "robot_residual_hold_conflict", "robot_residual_hold_recovery",
             ),

@@ -24,21 +24,53 @@ import dev.picasso.middleware.TransportOrder
  * 있든 없든)도 막는다.
  */
 class GatedRobotPort(private val delegate: RobotPort, private val authority: SendAuthority) : RobotPort by delegate {
+    /**
+     * 출발. 리더 확인([SendAuthority.mayIssue] `robotId`) 뒤 수신자 재시작 의심 보류([SendAuthority.mayStart])를 보고, 지나면 송신 의도를 적은 뒤
+     * ([SendAuthority.beforeStart] — 실패하면 보내지 않음) 위임한다. 감싼 포트 안에서 같은 스레드가 다시 이 포트의 출발에 들면(바깥 관문 → 안쪽 관문)
+     * 의도는 바깥에서 한 번만 적는다.
+     */
     override fun start(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>): StartTaskResponse =
         authority.sending("출발 robot=$robotId task=$taskId 리비전 $revision", { authority.mayIssue(robotId) }) {
-            delegate.start(robotId, taskId, revision, skillType, parameters)
+            if (!authority.mayStart(robotId)) throw CommandNotSent("${SendAuthority.RESTART_HELD}: 출발 robot=$robotId task=$taskId 리비전 $revision")
+            if (INTENT.get() == true) {
+                delegate.start(robotId, taskId, revision, skillType, parameters)
+            } else {
+                authority.beforeStart(robotId, taskId, revision)
+                // 의도 커밋에 걸린 시간 동안 권위를 잃었거나(자기 차단 기한·밀려남) 늦은 복원이 이 기체에 보류를 세웠으면 보내지 않는다. 이 재확인 뒤에 선
+                // 보류는 이 출발을 막지 못하지만, 의도 행이 이미 커밋돼 다음 인수가 그 태스크를 후보로 세운다(경계: 의도 커밋 → 재확인 → 위임).
+                if (!authority.mayIssue(robotId)) throw CommandNotSent("${SendAuthority.NOT_ISSUING}: 출발 robot=$robotId task=$taskId 리비전 $revision(의도 커밋 뒤 재확인)")
+                if (!authority.mayStart(robotId)) throw CommandNotSent("${SendAuthority.RESTART_HELD}: 출발 robot=$robotId task=$taskId 리비전 $revision(의도 커밋 뒤 재확인)")
+                // 재확인을 지났다 — 이 세대가 낸 출발이다(그 태스크의 붙음·후보 보류를 닫는다).
+                authority.started(robotId, taskId, revision)
+                INTENT.set(true)
+                try {
+                    delegate.start(robotId, taskId, revision, skillType, parameters)
+                } finally {
+                    INTENT.remove()
+                }
+            }
         }
 
     override fun cancel(robotId: String, handle: TaskHandle): CancelTaskResponse =
         authority.sending("취소 robot=$robotId task=${handle.taskId}", { authority.mayIssue(robotId) }) { delegate.cancel(robotId, handle) }
 
-    override fun issue(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>): Issue? =
-        if (authority.mayIssue(robotId)) delegate.issue(robotId, taskId, revision, skillType, parameters)
-        else Issue.NotSent("${SendAuthority.NOT_ISSUING}: 출발 robot=$robotId task=$taskId 리비전 $revision")
+    override fun issue(robotId: String, taskId: String, revision: Int, skillType: String, parameters: Map<String, String>): Issue? = when {
+        !authority.mayIssue(robotId) -> Issue.NotSent("${SendAuthority.NOT_ISSUING}: 출발 robot=$robotId task=$taskId 리비전 $revision")
+        !authority.mayStart(robotId) -> Issue.NotSent("${SendAuthority.RESTART_HELD}: 출발 robot=$robotId task=$taskId 리비전 $revision")
+        else -> {
+            authority.noteIssue(robotId, taskId, revision)
+            delegate.issue(robotId, taskId, revision, skillType, parameters)
+        }
+    }
 
     override fun issueCancel(robotId: String, handle: TaskHandle): CancelIssue? =
         if (authority.mayIssue(robotId)) delegate.issueCancel(robotId, handle)
         else CancelIssue.Failed(CommandNotSent("${SendAuthority.NOT_ISSUING}: 취소 robot=$robotId task=${handle.taskId}"))
+
+    private companion object {
+        /** 이 스레드가 이미 바깥 관문에서 송신 의도를 적고 위임 중인가. */
+        val INTENT = ThreadLocal<Boolean>()
+    }
 }
 
 /**

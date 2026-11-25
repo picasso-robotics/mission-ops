@@ -83,6 +83,9 @@ class HostRobotPort private constructor(
         /** 다음 요청 순번. 요청을 보내기 직전에 뽑는다. */
         fun number(): Long = next.incrementAndGet()
 
+        /** 지금까지 뽑은 가장 큰 요청 순번. */
+        fun current(): Long = next.get()
+
         /** 순번 [n] 으로 지금 읽는다(슬롯을 건드리지 않는다). */
         fun read(robotId: String, n: Long): RobotSnapshot? = inner.snapshot(robotId)
 
@@ -109,6 +112,9 @@ class HostRobotPort private constructor(
             const val RECENT = 4
         }
     }
+
+    /** 지금까지 뽑은 가장 큰 요청 순번 — 이보다 큰 순번의 응답은 이 시점 뒤에 보낸 요청의 답이다(수신자 재시작 의심 후보의 기준). */
+    fun currentSeq(): Long = delegate.current()
 
     /** 이번 라운드에 지금 읽은 기체. 그 기체의 재생도 위임 포트에 묻는다. */
     private val direct = HashSet<String>()

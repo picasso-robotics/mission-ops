@@ -137,6 +137,57 @@ data class FleetReadinessEvidenceRow(
     val recordedAt: Instant,
 )
 
+/** 한 태스크의 송신 의도 요약(V22 `host_issue_intent`): 가장 큰 의도 순번과 가장 큰 리비전, 그 태스크의 기체·단위(가장 뒤 줄의 값). */
+data class IntentBasis(val intentId: Long, val revision: Int, val robotId: String = "", val unitId: String = "", val attempt: Int = 0)
+
+/** 수신자 재시작 의심 한 줄(V22 `host_restart_suspicion`). [releasedBy] 는 해제됐으면 해제한 사람이다. */
+data class RestartSuspicionRow(
+    val suspicionId: Long,
+    val generation: Long,
+    val instanceId: String,
+    val robotId: String,
+    val jobOrderId: String,
+    val executionId: String?,
+    val unitId: String,
+    val attempt: Int,
+    val taskId: String,
+    val revision: Int?,
+    val basisKind: String,
+    val basisIntentId: Long,
+    val basisRecordId: Long?,
+    val observedFloor: Long?,
+    val observedStatus: String?,
+    val recordedAt: Instant,
+    val releasedBy: String? = null,
+)
+
+/** 적을 의심 한 줄. */
+data class RestartSuspicionWrite(
+    val robotId: String,
+    val jobOrderId: String,
+    val executionId: String?,
+    val unitId: String,
+    val attempt: Int,
+    val taskId: String,
+    val revision: Int?,
+    val basisKind: String,
+    val basisIntentId: Long,
+    val basisRecordId: Long?,
+    val observedFloor: Long?,
+    val observedStatus: String?,
+)
+
+/** 운영자 단위 해제의 결과(V22 `host_restart_release`). */
+sealed interface RestartReleaseOutcome {
+    data class Released(val suspicion: RestartSuspicionRow, val releasedUptoIntent: Long) : RestartReleaseOutcome
+    data object NotFound : RestartReleaseOutcome
+    data class TargetChanged(val suspicion: RestartSuspicionRow) : RestartReleaseOutcome
+
+    /** 요청이 겨눈 호스트(인스턴스·세대)가 가드가 확인한 지금 리스와 다르다. */
+    data class HostChanged(val holder: String, val generation: Long) : RestartReleaseOutcome
+    data class AlreadyReleased(val suspicion: RestartSuspicionRow) : RestartReleaseOutcome
+}
+
 /** 자동 확인 근거 한 줄(V20 `host_readiness_evidence`). */
 data class ReadinessEvidenceRow(
     val generation: Long,
@@ -1721,6 +1772,214 @@ class HostRecords(
             .optional()
             .orElse(null)
 
+    // ── 수신자 재시작 의심 보류(V22)
+
+    /**
+     * 송신 의도 한 줄을 적는다(리스 가드 안, 그 자체로 한 트랜잭션 — 커밋한 뒤 돌아온다). 출발을 실제로 보내기 직전 송신 스레드가 부른다. 새 의도
+     * 순번을 돌려준다.
+     */
+    fun recordIssueIntent(
+        generation: Long, instanceId: String, robotId: String, jobOrderId: String, executionId: String?, unitId: String, attempt: Int, taskId: String,
+        revision: Int, sessionBefore: String?,
+    ): Long =
+        writes.sql(
+            """
+            INSERT INTO mission.host_issue_intent
+                (generation, instance_id, robot_id, job_order_id, execution_id, unit_id, attempt, task_id, revision, session_before)
+            VALUES (:generation, :instanceId, :robotId, :jobOrderId, :executionId, :unitId, :attempt, :taskId, :revision, :session)
+            RETURNING intent_id
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("robotId", robotId)
+            .param("jobOrderId", jobOrderId)
+            .param("executionId", executionId, Types.VARCHAR)
+            .param("unitId", unitId)
+            .param("attempt", attempt)
+            .param("taskId", taskId)
+            .param("revision", revision)
+            .param("session", sessionBefore?.takeIf { it.isNotEmpty() }, Types.VARCHAR)
+            .query(Long::class.java)
+            .single()
+
+    /** 그 작업 지시의 태스크마다 송신 의도 요약(가장 큰 순번·리비전, 가장 뒤 줄의 기체·단위). 의도가 없는 태스크는 빠진다. */
+    fun intentBases(jobOrderId: String): Map<String, IntentBasis> =
+        jdbc.sql(
+            """
+            SELECT task_id, max(intent_id) AS intent_id, max(revision) AS revision,
+                   (array_agg(robot_id ORDER BY intent_id DESC))[1] AS robot_id, (array_agg(unit_id ORDER BY intent_id DESC))[1] AS unit_id,
+                   (array_agg(attempt ORDER BY intent_id DESC))[1] AS attempt
+            FROM mission.host_issue_intent WHERE job_order_id = :jobOrderId GROUP BY task_id
+            """.trimIndent(),
+        )
+            .param("jobOrderId", jobOrderId)
+            .query { rs, _ ->
+                rs.getString("task_id") to IntentBasis(
+                    rs.getLong("intent_id"), rs.getInt("revision"), rs.getString("robot_id"), rs.getString("unit_id"), rs.getInt("attempt"),
+                )
+            }
+            .list()
+            .toMap()
+
+    /** 그 작업 지시의 송신 의도가 하나라도 있는가. */
+    fun hasIssueIntents(jobOrderId: String): Boolean =
+        jdbc.sql("SELECT EXISTS (SELECT 1 FROM mission.host_issue_intent WHERE job_order_id = :jobOrderId)")
+            .param("jobOrderId", jobOrderId)
+            .query(Boolean::class.java)
+            .single()
+
+    /**
+     * 그 작업 지시의 태스크마다 운영자 해제가 덮는 송신 의도 순번(가장 큰 `released_upto_intent`). 해제가 없는 태스크는 빠진다. 시스템 해제
+     * (`system:attached`)는 덮지 않는다 — 붙음을 보아 닫은 의심도 다음 판별이 다시 대조한다.
+     */
+    fun restartReleaseCoverage(jobOrderId: String): Map<String, Long> =
+        jdbc.sql(
+            """
+            SELECT task_id, max(released_upto_intent) AS upto
+            FROM mission.host_restart_release WHERE job_order_id = :jobOrderId AND released_by <> 'system:attached' GROUP BY task_id
+            """.trimIndent(),
+        )
+            .param("jobOrderId", jobOrderId)
+            .query { rs, _ -> rs.getString("task_id") to rs.getLong("upto") }
+            .list()
+            .toMap()
+
+    /**
+     * 의심 한 줄을 적는다(리스 가드 안). 같은 태스크·같은 근거 의도 순번의 **열린** 줄이 이미 있으면(앞 보유자가 같은 근거로 적음) 그 줄의 id 를
+     * 돌려준다. 해제된 줄만 있으면(시스템 해제 뒤 다시 사라짐) 새 줄이다.
+     */
+    fun recordRestartSuspicion(generation: Long, instanceId: String, write: RestartSuspicionWrite): Long = inTransaction {
+        writes.sql(
+            """
+            SELECT s.suspicion_id FROM mission.host_restart_suspicion s
+            WHERE s.task_id = :taskId AND s.basis_intent_id = :basisIntent
+              AND NOT EXISTS (SELECT 1 FROM mission.host_restart_release r WHERE r.suspicion_id = s.suspicion_id)
+            ORDER BY s.suspicion_id DESC LIMIT 1
+            """.trimIndent(),
+        )
+            .param("taskId", write.taskId)
+            .param("basisIntent", write.basisIntentId)
+            .query(Long::class.java)
+            .optional()
+            .orElse(null)
+            ?.let { return@inTransaction it }
+        writes.sql(
+            """
+            INSERT INTO mission.host_restart_suspicion
+                (generation, instance_id, robot_id, job_order_id, execution_id, unit_id, attempt, task_id, revision, basis_kind, basis_intent_id,
+                 basis_record_id, observed_floor, observed_status)
+            VALUES (:generation, :instanceId, :robotId, :jobOrderId, :executionId, :unitId, :attempt, :taskId, :revision, :basisKind, :basisIntent,
+                    :basisRecord, :floor, :status)
+            RETURNING suspicion_id
+            """.trimIndent(),
+        )
+            .param("generation", generation)
+            .param("instanceId", instanceId)
+            .param("robotId", write.robotId)
+            .param("jobOrderId", write.jobOrderId)
+            .param("executionId", write.executionId, Types.VARCHAR)
+            .param("unitId", write.unitId)
+            .param("attempt", write.attempt)
+            .param("taskId", write.taskId)
+            .param("revision", write.revision, Types.INTEGER)
+            .param("basisKind", write.basisKind)
+            .param("basisIntent", write.basisIntentId)
+            .param("basisRecord", write.basisRecordId, Types.BIGINT)
+            .param("floor", write.observedFloor, Types.BIGINT)
+            .param("status", write.observedStatus, Types.VARCHAR)
+            .query(Long::class.java)
+            .single()
+    }
+
+    /** 해제되지 않은 의심 전부(적은 순서). */
+    fun openRestartSuspicions(): List<RestartSuspicionRow> =
+        jdbc.sql("$SUSPICION_SELECT WHERE r.release_id IS NULL ORDER BY s.suspicion_id")
+            .query { rs, _ -> suspicionRow(rs) }
+            .list()
+
+    /**
+     * 시스템 해제(`system:attached`)된 의심 가운데 다시 대조할 것 — 그 해제 뒤 그 태스크의 송신 의도가 없고(이 세대든 뒤 세대든 그 출발을 내지 않음), 그
+     * 태스크의 더 뒤 의심이나 그 해제 범위를 덮는 운영자 해제가 없는 것(적은 순서). [intents] 가 거짓이면 송신 의도를 보지 않는다(의도 표를 못 읽을 때
+     * 막는 쪽으로 — 시스템 해제된 의심 전부를 다시 대조).
+     */
+    fun systemReleasedSuspicions(intents: Boolean = true): List<RestartSuspicionRow> =
+        jdbc.sql(
+            """
+            $SUSPICION_SELECT
+            WHERE r.released_by = 'system:attached'
+              ${if (intents) "AND NOT EXISTS (SELECT 1 FROM mission.host_issue_intent i WHERE i.task_id = s.task_id AND i.intent_id > r.released_upto_intent)" else ""}
+              AND NOT EXISTS (SELECT 1 FROM mission.host_restart_suspicion n WHERE n.task_id = s.task_id AND n.suspicion_id > s.suspicion_id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM mission.host_restart_release o
+                  WHERE o.task_id = s.task_id AND o.released_by <> 'system:attached' AND o.released_upto_intent >= r.released_upto_intent)
+            ORDER BY s.suspicion_id
+            """.trimIndent(),
+        )
+            .query { rs, _ -> suspicionRow(rs) }
+            .list()
+
+    /** 의심 전부(해제 포함, 적은 순서). */
+    fun restartSuspicions(): List<RestartSuspicionRow> =
+        jdbc.sql("$SUSPICION_SELECT ORDER BY s.suspicion_id")
+            .query { rs, _ -> suspicionRow(rs) }
+            .list()
+
+    /**
+     * 해제(리스 가드 안 한 트랜잭션). 가드가 잠근 리스 행이 요청이 겨눈 호스트([instanceId]·[generation])인지 같은 트랜잭션에서 보고, 의심 행을 잠가
+     * 대상([robotId]·[taskId])과 열림을 확인한 뒤, 그 태스크의 지금 가장 큰 송신 의도 순번까지를 덮는 해제 한 줄을 적는다. 동시에 같은 의심을 해제하면
+     * 하나만 이긴다(유일 제약).
+     */
+    fun releaseRestartSuspicion(
+        suspicionId: Long, robotId: String, taskId: String, generation: Long, instanceId: String, releasedBy: String, reason: String,
+    ): RestartReleaseOutcome = inTransaction {
+        val lease = writes.sql("SELECT holder, generation FROM mission.host_lease WHERE role = 'host'")
+            .query { rs, _ -> rs.getString(1) to rs.getLong(2) }
+            .single()
+        if (lease.first != instanceId || lease.second != generation) return@inTransaction RestartReleaseOutcome.HostChanged(lease.first, lease.second)
+        val row = writes.sql("$SUSPICION_SELECT WHERE s.suspicion_id = :id FOR UPDATE OF s")
+            .param("id", suspicionId)
+            .query { rs, _ -> suspicionRow(rs) }
+            .optional()
+            .orElse(null)
+        when {
+            row == null -> RestartReleaseOutcome.NotFound
+            row.releasedBy != null -> RestartReleaseOutcome.AlreadyReleased(row)
+            row.robotId != robotId || row.taskId != taskId -> RestartReleaseOutcome.TargetChanged(row)
+            else -> {
+                val upto = writes.sql("SELECT coalesce(max(intent_id), 0) FROM mission.host_issue_intent WHERE task_id = :taskId")
+                    .param("taskId", taskId)
+                    .query(Long::class.java)
+                    .single()
+                writes.sql(
+                    """
+                    INSERT INTO mission.host_restart_release
+                        (suspicion_id, job_order_id, task_id, released_upto_intent, generation, instance_id, released_by, reason)
+                    VALUES (:id, :jobOrderId, :taskId, :upto, :generation, :instanceId, :by, :reason)
+                    """.trimIndent(),
+                )
+                    .param("id", suspicionId)
+                    .param("jobOrderId", row.jobOrderId)
+                    .param("taskId", row.taskId)
+                    .param("upto", upto)
+                    .param("generation", generation)
+                    .param("instanceId", instanceId)
+                    .param("by", releasedBy)
+                    .param("reason", reason)
+                    .update()
+                RestartReleaseOutcome.Released(row, upto)
+            }
+        }
+    }
+
+    private fun suspicionRow(rs: ResultSet) = RestartSuspicionRow(
+        rs.getLong("suspicion_id"), rs.getLong("generation"), rs.getString("instance_id"), rs.getString("robot_id"), rs.getString("job_order_id"),
+        rs.getString("execution_id"), rs.getString("unit_id"), rs.getInt("attempt"), rs.getString("task_id"),
+        rs.getObject("revision")?.let { (it as Number).toInt() }, rs.getString("basis_kind"), rs.getLong("basis_intent_id"),
+        rs.getObject("basis_record_id")?.let { (it as Number).toLong() }, rs.getObject("observed_floor")?.let { (it as Number).toLong() },
+        rs.getString("observed_status"), instant(rs, "recorded_at"), rs.getString("released_by"),
+    )
+
     /** 그 세대의 자동 확인 근거(기체 이름 순). */
     fun readinessEvidence(generation: Long): List<ReadinessEvidenceRow> =
         jdbc.sql(
@@ -1969,6 +2228,12 @@ class HostRecords(
     private fun instant(rs: ResultSet, column: String): Instant = rs.getObject(column, OffsetDateTime::class.java).toInstant()
 
     private companion object {
+        const val SUSPICION_SELECT = """
+            SELECT s.suspicion_id, s.generation, s.instance_id, s.robot_id, s.job_order_id, s.execution_id, s.unit_id, s.attempt, s.task_id, s.revision,
+                   s.basis_kind, s.basis_intent_id, s.basis_record_id, s.observed_floor, s.observed_status, s.recorded_at, r.released_by
+            FROM mission.host_restart_suspicion s LEFT JOIN mission.host_restart_release r USING (suspicion_id)
+        """
+
         const val JOURNAL_COLUMNS =
             "journal_id, job_order_id, robot_id, job_order, work_master_id, mission_version, instance_id, execution_id, received_at"
         const val EVENT_COLUMNS = "event_id, job_order_id, kind, instance_id, execution_id, detail, recorded_at"

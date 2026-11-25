@@ -3,6 +3,7 @@ import {
   AUTHORITY_BLOCK_TEXT as AUTHORITY,
   PERMIT_BLOCK_TEXT as TEXT,
   permitCauseLabel,
+  RESTART_HOLD_BLOCK_TEXT as RESTART,
   RETIRED_BLOCK_TEXT as RETIRED,
   WITHHELD_ISSUE_LABEL,
   WORK_PERMIT_LABEL,
@@ -21,6 +22,9 @@ import {
  * `인수 확인 대기` 로 시작)일 때만이다 — 같은 까닭이 밀려남·권위 포트 읽기 실패에도 실리고 그때 «자동으로 풀림» 안내는 틀리다. 까닭이 모두 인수 확인
  * 대기면 그 제목과 안내를 보이고(막는 기체와 까닭은 막는 주체에 실린다), 다른 까닭과 섞였으면 그 안내에 한 줄을 더한다. 그 밖의 권위 까닭은 일반
  * 문구로 보인다.
+ *
+ * 수신자 재시작 의심(막는 주체가 `수신자 재시작 의심` 으로 시작하는 권위 까닭)은 자동으로도, 인수 확인으로도 풀리지 않는다 — 까닭이 모두 그것이면 그
+ * 제목과 안내(운영자 단위 해제)를 보이고, 섞였으면 한 줄을 더한다.
  */
 export function PermitBlockNotice({ block }: { block: PermitBlock }) {
   const reasons = block.robots.flatMap((robot) => robot.reasons)
@@ -31,11 +35,15 @@ export function PermitBlockNotice({ block }: { block: PermitBlock }) {
     (reason) => reason.cause === 'AUTHORITY_NOT_HELD' && (reason.subject ?? '').startsWith(AUTHORITY.subjectPrefix),
   ).length
   const authorityOnly = causes.length > 0 && authorityCount === causes.length
-  const heading = authorityOnly ? AUTHORITY.heading : retiredOnly ? RETIRED.heading : TEXT.heading
+  const restartCount = reasons.filter(
+    (reason) => reason.cause === 'AUTHORITY_NOT_HELD' && (reason.subject ?? '').startsWith(RESTART.subjectPrefix),
+  ).length
+  const restartOnly = causes.length > 0 && restartCount === causes.length
+  const heading = restartOnly ? RESTART.heading : authorityOnly ? AUTHORITY.heading : retiredOnly ? RETIRED.heading : TEXT.heading
   return (
     <section className="permit-block" aria-label={heading}>
       <h4>{heading}</h4>
-      <p>{authorityOnly ? AUTHORITY.intro : retiredOnly ? RETIRED.intro : TEXT.intro}</p>
+      <p>{restartOnly ? RESTART.intro : authorityOnly ? AUTHORITY.intro : retiredOnly ? RETIRED.intro : TEXT.intro}</p>
       <dl>
         <dt>{TEXT.unit}</dt>
         <dd>{block.unitId}</dd>
@@ -65,7 +73,12 @@ export function PermitBlockNotice({ block }: { block: PermitBlock }) {
           </li>
         ))}
       </ul>
-      {authorityOnly ? (
+      {restartOnly ? (
+        <>
+          <p>{RESTART.resume}</p>
+          <p>{RESTART.notStop}</p>
+        </>
+      ) : authorityOnly ? (
         <>
           <p>{AUTHORITY.resume}</p>
           <p>{AUTHORITY.notStop}</p>
@@ -80,6 +93,7 @@ export function PermitBlockNotice({ block }: { block: PermitBlock }) {
           <p>{TEXT.notOperator}</p>
           {retiredCount > 0 && <p>{RETIRED.mixed}</p>}
           {authorityCount > 0 && <p>{AUTHORITY.mixed}</p>}
+          {restartCount > 0 && <p>{RESTART.mixed}</p>}
           <p>{TEXT.notSafety}</p>
         </>
       )}

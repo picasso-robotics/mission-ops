@@ -82,6 +82,24 @@ interface SendAuthority {
     /** 운반 참조 [reference](태스크 id)의 맡기기·취소를 보내도 되는가. 기본은 전역 [mayIssue] 다. */
     fun mayDispatch(reference: String): Boolean = mayIssue()
 
+    /**
+     * 기체 [robotId] 로 **출발**(`StartTask` — 첫 출발·개정 갱신·미확정 조회)을 보내도 되는가 — [mayIssue] `robotId` 에 더해 묻는다. 기본은 늘 참이다.
+     * 실행 호스트는 수신자 재시작 의심 보류([RestartHolds])가 있는 기체에 거짓으로 답한다(리더 상태와 무관). 취소는 묻지 않는다.
+     */
+    fun mayStart(robotId: String): Boolean = true
+
+    /**
+     * 출발을 실제로 보내기 직전(확인을 지난 뒤, 위임 호출 앞) 부른다. 실행 호스트는 여기서 송신 의도 한 줄을 커밋한다 — 커밋하지 못하면
+     * [CommandNotSent] 를 던져 보내지 않는다. 기본은 아무것도 하지 않는다.
+     */
+    fun beforeStart(robotId: String, taskId: String, revision: Int) {}
+
+    /** 출발을 큐에 넣는 자리(송신 관문의 `issue`, 호스트 잠금 아래)에서 부른다. 실행 호스트는 그 출발의 실행·단위를 적어 둔다. 기본은 아무것도 안 한다. */
+    fun noteIssue(robotId: String, taskId: String, revision: Int) {}
+
+    /** 송신 의도 커밋 뒤 위임 직전 재확인을 지났다(곧 위임한다). 실행 호스트는 그 태스크의 붙음·후보 보류를 닫는다. 기본은 아무것도 안 한다. */
+    fun started(robotId: String, taskId: String, revision: Int) {}
+
     /** 보낼 수 없으면 [CommandNotSent] 를 던진다(보내지 않았음을 아는 실패라 미들웨어가 미확정으로 읽지 않는다). */
     fun checkIssue(what: String) {
         if (!mayIssue()) throw CommandNotSent("$NOT_ISSUING: $what")
@@ -98,6 +116,9 @@ interface SendAuthority {
 
     companion object {
         const val NOT_ISSUING = "리스로 발행하는 리더가 아니어서 보내지 않았다"
+
+        /** 수신자 재시작 의심 보류로 보내지 않은 출발의 문구 머리. */
+        const val RESTART_HELD = "수신자 재시작 의심 보류로 출발을 보내지 않았다"
 
         /** 언제나 보낸다. 리스 없이 쓰는 자리(시험, 모의 실행)만 쓴다. */
         val ALWAYS = object : SendAuthority {
@@ -155,6 +176,33 @@ class HostLeadership(
 
     override fun mayIssue(): Boolean = state == LeaderState.ISSUING && lease.withinDeadline()
 
+    /** 수신자 재시작 의심 보류(HA 후속 D1 완화). 실행 호스트가 복원·읽기·해제로 바꾸고 송신 관문이 읽는다. */
+    val restartHolds = RestartHolds()
+
+    /** 출발 송신 직전 송신 의도를 커밋하는 쪽([beforeStart]). 실행 호스트가 건다. 실패하면 [CommandNotSent] 를 던져야 한다. */
+    @Volatile
+    var startIntent: ((String, String, Int) -> Unit)? = null
+
+    /** 수신자 재시작 의심 보류가 있는 기체로는 리더 상태와 무관하게 출발을 보내지 않는다. */
+    override fun mayStart(robotId: String): Boolean = !restartHolds.blocks(robotId)
+
+    override fun beforeStart(robotId: String, taskId: String, revision: Int) {
+        startIntent?.invoke(robotId, taskId, revision)
+    }
+
+    /** 출발을 큐에 넣을 때 실행 호스트가 거는 쪽([noteIssue]). */
+    @Volatile
+    var issueNote: ((String, String, Int) -> Unit)? = null
+
+    override fun noteIssue(robotId: String, taskId: String, revision: Int) {
+        issueNote?.invoke(robotId, taskId, revision)
+    }
+
+    /** 재확인을 지나 곧 위임하는 출발 — 그 태스크의 붙음·후보 보류를 닫는다(이 세대가 낸 출발이 되었다). */
+    override fun started(robotId: String, taskId: String, revision: Int) {
+        restartHolds.closeIssued(taskId)
+    }
+
     /**
      * 송신 중인 수를 먼저 올리고 확인한다 — [stopping] 이 상태를 바꾼 뒤 [awaitQuiet] 가 0 을 보면, 그 뒤에 확인을 지나는 송신은 없다(올린 뒤
      * 확인하므로 상태 변경 전에 지난 송신은 수에 이미 들어 있다).
@@ -201,6 +249,27 @@ class HostLeadership(
     /** 기체마다 마지막 지금 읽기를 한 단조 시각(나노초). [allowUnreadFallback] 의 간격을 잰다. */
     private val lastFreshNanos = ConcurrentHashMap<String, Long>()
 
+    /**
+     * 래치된 기체마다 요청 순번상 가장 뒤의 성공한 응답(순번, 바닥값, 확인 답). 읽기 실패와 그보다 앞 순번의 늦은 미리 읽기는 덮지 않는다. [latchedPending]
+     * 이 읽는다(표시만 — 래치는 이것으로 바뀌지 않는다).
+     */
+    private val latestAnswer = ConcurrentHashMap<String, Triple<Long, Long, dev.picasso.contracts.v1.FenceStatus>>()
+
+    private fun noteAnswer(robotId: String, seq: Long, snapshot: RobotSnapshot) {
+        latestAnswer.merge(robotId, Triple(seq, snapshot.controllerFloor, snapshot.fenceStatus)) { old, new -> if (new.first > old.first) new else old }
+    }
+
+    /**
+     * 래치된 기체인데 요청 순번상 가장 뒤의 성공한 응답이 같은 세대 `DURABLE_PENDING` 인가(D4 표시). 그 미확정은 이 세대 자신의 것이라 래치를 풀지 않는다
+     * ([retreats]) — 화면이 그것을 보이게 할 뿐이다.
+     */
+    fun latchedPending(robotId: String): Boolean {
+        val latched = ready[robotId] ?: return false
+        val answer = latestAnswer[robotId] ?: return false
+        return answer.first > latched.seq && answer.second == latched.floor &&
+            answer.third == dev.picasso.contracts.v1.FenceStatus.FENCE_STATUS_DURABLE_PENDING
+    }
+
     /** «실행 → 필수 기체·플릿» 표. 실행 호스트가 호스트 잠금 아래에서 바꾸고, 송신 스레드는 이 참조 하나를 읽는다. */
     @Volatile
     var requirements: List<Requirement> = emptyList()
@@ -211,13 +280,20 @@ class HostLeadership(
      * 아니면 까닭을 둔다. 래치된 기체는 응답이 후퇴([retreats])를 보이면 푼다([unlatch]). 바닥값이 이 세대보다 높으면 밀려남이다([superseded]).
      */
     fun observeFresh(robotId: String, snapshot: RobotSnapshot?, seq: Long, at: Instant) {
-        if (state != LeaderState.HOLDING) return
+        // 래치된 기체의 가장 뒤 성공한 응답은 발행 중에도 따라간다([latchedPending] 표시).
+        if (snapshot != null && ready.containsKey(robotId)) noteAnswer(robotId, seq, snapshot)
+        // 보류 기체의 회복 간격은 발행 중에도 잰다(지금 읽기마다).
+        if (state != LeaderState.HOLDING) {
+            lastFreshNanos[robotId] = nanoTime()
+            return
+        }
         val mine = lease.generation ?: return
         snapshot?.let { superseded(robotId, mine, it.controllerFloor) }
         lastFreshSeq.merge(robotId, seq, ::maxOf)
         lastFreshNanos[robotId] = nanoTime()
         val judged = judgeReadiness(robotId, mine, snapshot, at)
         if (ready.containsKey(robotId)) {
+            snapshot?.let { noteAnswer(robotId, seq, it) }
             if (snapshot != null && judged is Readiness.Waiting && retreats(mine, snapshot)) unlatch(judged)
             return
         }
@@ -243,6 +319,7 @@ class HostLeadership(
      * ([freshTargets]), 아니면 까닭을 둔다.
      */
     fun observePrefetched(robotId: String, snapshot: RobotSnapshot?, seq: Long?) {
+        if (snapshot != null && seq != null && ready.containsKey(robotId)) noteAnswer(robotId, seq, snapshot)
         if (state != LeaderState.HOLDING || snapshot == null) return
         val mine = lease.generation ?: return
         superseded(robotId, mine, snapshot.controllerFloor)
@@ -255,11 +332,13 @@ class HostLeadership(
         val judged = judgeReadiness(robotId, mine, snapshot, Instant.EPOCH)
         if (retreats(mine, snapshot)) candidates.remove(robotId)
         if (ready.containsKey(robotId)) {
+            noteAnswer(robotId, seq, snapshot)
             if (judged is Readiness.Waiting && retreats(mine, snapshot)) unlatch(judged)
             return
         }
         when (judged) {
-            is Readiness.Ready -> prefetchConfirmed.add(robotId)
+            // 수신자 재시작 의심 보류가 막는 기체는 지금 읽기 대상에 넣지 않는다 — 보류 판별은 미리 읽기 응답으로 하고, 풀리면 다음 미리 읽기가 넣는다.
+            is Readiness.Ready -> if (!restartHolds.blocks(robotId)) prefetchConfirmed.add(robotId)
             is Readiness.Waiting -> {
                 prefetchConfirmed.remove(robotId)
                 waiting[robotId] = judged
@@ -271,8 +350,51 @@ class HostLeadership(
      * 관측 중 이 기체를 호스트 잠금 아래에서 지금 읽어도 되는가 — 이미 열렸거나 마지막 미리 읽기가 준비를 보였다. 준비가 설 수 없는 기체(대조 안 함·
      * 휘발)는 어차피 출발하지 못하므로 출발을 앞뒀어도 지금 읽지 않는다. 관측이 아니면 늘 참이다.
      */
-    fun mayReadNow(robotId: String): Boolean =
-        state != LeaderState.HOLDING || ready.containsKey(robotId) || robotId in prefetchConfirmed || dueForRetry(robotId)
+    fun mayReadNow(robotId: String): Boolean {
+        // 수신자 재시작 의심 보류가 막는 기체는 상태·래치와 무관하게 간격 회복 읽기만 — 출발을 앞뒀어도 매 pump 지금 읽지 않는다.
+        if (restartHolds.blocks(robotId)) return claimHeldRead(robotId)
+        return state != LeaderState.HOLDING || ready.containsKey(robotId) || robotId in prefetchConfirmed || dueForRetry(robotId)
+    }
+
+    /**
+     * 보류 기체의 간격 회복 읽기 차례인가 — 마지막 지금 읽기에서 [unreadRetry] 넘게 지났고, 이번 pump 에 보류 기체의 회복 읽기를 아직 [HELD_READS] 개
+     * 넘게 하지 않았다(여러 보류 기체가 한 pump 에 몰려 호스트 잠금 아래의 동기 읽기가 쌓이지 않게). 판별은 미리 읽기 응답으로 한다.
+     */
+    private fun heldRecoveryDue(robotId: String): Boolean =
+        dueForRetry(robotId) && (robotId in heldReadsThisRound || heldReadsThisRound.size < HELD_READS && robotId == oldestDueHeld())
+
+    /**
+     * 회복 차례인 보류 기체 가운데 가장 오래 지금 읽지도 몫을 받지도 못한 것(한 번도 없으면 맨 앞, 같으면 이름 순) — 그 pump 의 회복 몫은 이 기체가
+     * 받는다(먼저 순회한 기체가 아니라). 대상은 이번 pump 에 실제로 읽힐 기체 — 도는 실행의 요구 표에 든 기체 — 뿐이다(읽히지 않는 보류 기체가 몫을 잡아
+     * 다른 보류 기체의 회복을 막지 않게). 몫을 줄 때 시각을 찍으므로 같은 기체가 연달아 잡지 못한다. 모든 기체를 막는 표시면 요구 표의 기체 전부가 대상이다.
+     */
+    private fun oldestDueHeld(): String? {
+        val readable = requirements.flatMapTo(HashSet()) { it.robots + it.subjects }
+        val held = if (restartHolds.blocks(RestartHolds.ALL_ROBOTS)) readable else restartHolds.blockedRobots().filterTo(HashSet()) { it in readable }
+        return held.filter(::dueForRetry)
+            .minWithOrNull(compareBy<String>({ maxOf(lastFreshNanos[it] ?: Long.MIN_VALUE, lastHeldSlotNanos[it] ?: Long.MIN_VALUE) }, { it }))
+    }
+
+    /** 보류 기체마다 마지막으로 회복 몫을 준 단조 시각(나노초). */
+    private val lastHeldSlotNanos = ConcurrentHashMap<String, Long>()
+
+    /** 이번 pump 에 회복 읽기를 할 보류 기체(몫을 센다). 관측·발행 모두 — 출발을 앞두지 않았거나 미리 읽기가 계속 실패하는 보류 기체도 차례가 온다. */
+    fun heldRecoveryTargets(): Set<String> = oldestDueHeld()?.takeIf(::claimHeldRead)?.let(::setOf) ?: emptySet()
+
+    /** 이번 pump 에 회복 읽기를 허락한 보류 기체. [beginRound] 가 비운다. */
+    private val heldReadsThisRound: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** pump 앞에서 부른다 — 보류 기체 회복 읽기의 pump 당 상한을 새로 센다. */
+    fun beginRound() {
+        heldReadsThisRound.clear()
+    }
+
+    /** 보류 기체의 회복 읽기 하나를 이번 pump 몫으로 센다([heldRecoveryDue] 가 참일 때 부르는 쪽이 셈). */
+    private fun claimHeldRead(robotId: String): Boolean {
+        if (!heldRecoveryDue(robotId)) return false
+        if (heldReadsThisRound.add(robotId)) lastHeldSlotNanos[robotId] = nanoTime()
+        return true
+    }
 
     /**
      * 관측 중 미준비 기체를 미리 읽기 결과와 관계없이 지금 읽을 차례인가 — 이번 보유에서 아직 지금 읽은 적이 없거나(첫 관측) 마지막 지금 읽기에서
@@ -310,7 +432,8 @@ class HostLeadership(
      * 호스트 잠금을 쥐는 일을 그 간격에 한 번으로 묶는 값이다. 지금 읽기 대상([dev.picasso.ops.host.HostRobotPort.readNowFor])이면 이것과 관계없이
      * 읽는다. 관측이 아니면(발행 중 포함) 늘 참이다.
      */
-    fun allowUnreadFallback(robotId: String): Boolean = state != LeaderState.HOLDING || dueForRetry(robotId)
+    fun allowUnreadFallback(robotId: String): Boolean =
+        if (restartHolds.blocks(robotId)) claimHeldRead(robotId) else state != LeaderState.HOLDING || dueForRetry(robotId)
 
     /** 래치된 준비를 푼다 — 응답이 후퇴를 보였다(더 막는 쪽). 그 라운드의 후보도 지운다. 그 뒤 다시 지금 읽기로 판정한다. */
     private fun unlatch(waitingNow: Readiness.Waiting) {
@@ -334,10 +457,22 @@ class HostLeadership(
     /** 근거를 적은 뒤 공개한다(래치). 응답이 후퇴([retreats])를 보이기 전까지는 풀리지 않는다. */
     fun latch(readiness: Readiness.Ready) {
         if (candidates.remove(readiness.robotId, readiness)) {
+            latestAnswer.remove(readiness.robotId)
             ready.putIfAbsent(readiness.robotId, readiness)
             waiting.remove(readiness.robotId)
             prefetchConfirmed.remove(readiness.robotId)
             log.info("기체 {} 준비(세대 {}, 바닥값 {}, {})", readiness.robotId, lease.generation, readiness.floor, readiness.fenceStatus)
+        }
+    }
+
+    /**
+     * 수신자 재시작 의심 보류가 있는 기체의 후보를 공개하지 않고 버린다 — 근거를 적지 않고 래치하지 않는다. 까닭은 [WaitReason.RESTART_SUSPECT] 로
+     * 두고(바닥값·확인 답은 그 읽기의 값), 보류가 풀린 뒤 다음 지금 읽기가 다시 판정한다.
+     */
+    fun holdBack(readiness: Readiness.Ready) {
+        if (candidates.remove(readiness.robotId, readiness)) {
+            prefetchConfirmed.remove(readiness.robotId)
+            waiting[readiness.robotId] = Readiness.Waiting(readiness.robotId, WaitReason.RESTART_SUSPECT, readiness.floor, readiness.fenceStatus)
         }
     }
 
@@ -346,8 +481,24 @@ class HostLeadership(
         candidates.remove(robotId)
     }
 
-    /** 이 기체의 준비. 읽은 적이 없으면 까닭 [WaitReason.UNREAD] 다. 판독값 하나를 돌려준다 — 부르는 쪽은 형으로 가른다. */
-    fun readinessOf(robotId: String): Readiness = ready[robotId] ?: waiting[robotId] ?: Readiness.Waiting(robotId, WaitReason.UNREAD)
+    /**
+     * 이 기체의 준비. 읽은 적이 없으면 까닭 [WaitReason.UNREAD] 다. 판독값 하나를 돌려준다 — 부르는 쪽은 형으로 가른다.
+     *
+     * 수신자 재시작 의심 보류([restartHolds])가 있으면 확정한 의심이 있거나 밑의 판정이 준비일 때 [WaitReason.RESTART_SUSPECT] 로 보인다(래치는 그대로
+     * 두고 겉만 바꾼다 — 보류가 풀리면 밑의 판정이 다시 보인다). 아직 대조 중인 후보뿐이고 밑의 판정이 기다림이면 그 까닭을 그대로 보인다.
+     */
+    fun readinessOf(robotId: String): Readiness {
+        val base = rawReadinessOf(robotId)
+        if (!restartHolds.blocks(robotId)) return base
+        if (base !is Readiness.Ready && !restartHolds.suspected(robotId)) return base
+        return when (base) {
+            is Readiness.Ready -> Readiness.Waiting(robotId, WaitReason.RESTART_SUSPECT, base.floor, base.fenceStatus)
+            is Readiness.Waiting -> Readiness.Waiting(robotId, WaitReason.RESTART_SUSPECT, base.floor, base.fenceStatus)
+        }
+    }
+
+    /** 보류를 겹치지 않은 준비(래치·까닭 그대로). 취소의 송신 직전 확인이 쓴다 — 재시작 의심 보류는 출발만 막는다. */
+    private fun rawReadinessOf(robotId: String): Readiness = ready[robotId] ?: waiting[robotId] ?: Readiness.Waiting(robotId, WaitReason.UNREAD)
 
     /**
      * 관측 중 이번 pump 에서 지금 읽을 기체 — 표의 기체 가운데 아직 래치되지 않았고, 마지막 미리 읽기가 (마지막 지금 읽기보다 뒤 순번으로) 준비를
@@ -356,14 +507,21 @@ class HostLeadership(
      */
     fun freshTargets(): Set<String> =
         if (state != LeaderState.HOLDING) emptySet()
-        else requirements.flatMapTo(sortedSetOf()) { it.robots }.filterTo(sortedSetOf()) { !ready.containsKey(it) && (it in prefetchConfirmed || dueForRetry(it)) }
+        else requirements.flatMapTo(sortedSetOf()) { it.robots }.filterTo(sortedSetOf()) {
+            // 수신자 재시작 의심 보류가 막는 기체는 미리 읽기가 확인을 보여도 매 pump 지금 읽지 않는다 — 간격 회복([dueForRetry]) 말고는 판별을 미리 읽기
+            // 응답으로 한다(미리 읽기가 끝나지 않는 기체도 간격마다 한 번은 지금 읽혀 판별·래치의 길이 남는다).
+            !ready.containsKey(it) && if (restartHolds.blocks(it)) claimHeldRead(it) else (it in prefetchConfirmed || dueForRetry(it))
+        }
 
     /**
      * **공통 판정 함수.** 요구 [requirement] 가 아직 준비되지 않은 까닭들(비면 준비). 기체·플릿 모두 래치된 준비만 준비로 친다([fleetReadiness]).
      */
-    fun blockers(requirement: Requirement): List<String> = buildList {
+    fun blockers(requirement: Requirement): List<String> = blockers(requirement, holds = true)
+
+    /** [holds] 가 거짓이면 재시작 의심 보류를 겹치지 않은 준비로 판정한다(취소·운반의 송신 직전 확인). */
+    private fun blockers(requirement: Requirement, holds: Boolean): List<String> = buildList {
         requirement.robots.sorted().forEach { robot ->
-            when (val r = readinessOf(robot)) {
+            when (val r = if (holds) readinessOf(robot) else rawReadinessOf(robot)) {
                 is Readiness.Ready -> Unit
                 is Readiness.Waiting -> add("실행 ${requirement.executionId}(작업 지시 ${requirement.jobOrderId})의 기체 $robot: ${r.reason.text}")
             }
@@ -560,18 +718,28 @@ class HostLeadership(
      * 기체 [robotId] 의 권위. 발행하는 리더면 쥐었다. 관측 중(자기 차단 기한 전)이면 그 기체가 든 실행들의 요구가 **모두** 준비일 때만 쥐었다
      * (든 실행이 없으면 그 기체 자신이 준비여야 한다). 그 밖은 쥐지 않았다.
      */
-    fun authorityOf(robotId: String): Authority {
+    fun authorityOf(robotId: String): Authority = authorityOf(robotId, holds = true)
+
+    /**
+     * [holds] 가 참이면(미들웨어 발행 관문 — 새 발행만 묻는다) 수신자 재시작 의심 보류도 본다: 발행 중이거나 확정한 의심이 있으면 머리
+     * [RESTART_SUSPECT_HELD] 로 쥐지 않았다고 답하고, 관측 중 대조 중인 후보는 준비 판정의 겉([readinessOf])으로 인수 확인 대기에 실린다. 거짓이면(취소의
+     * 송신 직전 확인) 보류를 보지 않는다.
+     */
+    private fun authorityOf(robotId: String, holds: Boolean): Authority {
+        if (holds && restartHolds.blocks(robotId) && (mayIssue() || restartHolds.suspected(robotId))) {
+            return Authority.NotHeld("$RESTART_SUSPECT_HELD — 기체 $robotId: ${restartHolds.describe(robotId) ?: WaitReason.RESTART_SUSPECT.text}")
+        }
         if (mayIssue()) return Authority.Held
         val s = state
         if (s != LeaderState.HOLDING || !lease.withinDeadline()) return Authority.NotHeld("발행하는 리더가 아니다: $s")
         val holding = requirements.filter { robotId in it.subjects || robotId in it.robots }
         val reasons = if (holding.isEmpty()) {
-            when (val r = readinessOf(robotId)) {
+            when (val r = if (holds) readinessOf(robotId) else rawReadinessOf(robotId)) {
                 is Readiness.Ready -> emptyList()
                 is Readiness.Waiting -> listOf("기체 $robotId: ${r.reason.text}")
             }
         } else {
-            holding.flatMap(::blockers).distinct()
+            holding.flatMap { blockers(it, holds) }.distinct()
         }
         return if (reasons.isEmpty()) Authority.Held else Authority.NotHeld("$AWAITING_CONFIRMATION — ${reasons.joinToString("; ")}")
     }
@@ -586,8 +754,8 @@ class HostLeadership(
      */
     override fun mayIssue(robotId: String): Boolean {
         if (mayIssue()) return true
-        if (readinessOf(robotId) !is Readiness.Ready) return false
-        return authorityOf(robotId) == Authority.Held
+        if (rawReadinessOf(robotId) !is Readiness.Ready) return false
+        return authorityOf(robotId, holds = false) == Authority.Held
     }
 
     /**
@@ -599,7 +767,7 @@ class HostLeadership(
         if (state != LeaderState.HOLDING || !lease.withinDeadline()) return false
         val jobOrderId = reference.substringBefore('#')
         val requirement = requirements.firstOrNull { it.jobOrderId == jobOrderId } ?: return false
-        return blockers(requirement.copy(fleet = true)).isEmpty()
+        return blockers(requirement.copy(fleet = true), holds = false).isEmpty()
     }
 
     /**
@@ -805,5 +973,11 @@ class HostLeadership(
 
         /** 관측 중 준비되지 않은 기체의 권위 거절 문구 머리. 화면이 `AUTHORITY_NOT_HELD` 와 함께 싣는다. */
         const val AWAITING_CONFIRMATION = "인수 확인 대기"
+
+        /** 보류 기체 회복 읽기의 pump 당 상한. */
+        const val HELD_READS = 1
+
+        /** 수신자 재시작 의심 보류로 쥐지 않은 권위의 문구 머리(관측·발행 모두). 화면이 `AUTHORITY_NOT_HELD` 와 함께 싣는다. */
+        const val RESTART_SUSPECT_HELD = "수신자 재시작 의심"
     }
 }

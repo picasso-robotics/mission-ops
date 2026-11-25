@@ -50,6 +50,34 @@ data class RobotReadinessView(
     val fenceStatus: String?,
     /** 순번을 몰라 옛 응답으로 다룬 미리 읽기 응답의 누계(0 이 아니면 응답 객체의 동일성이 깨졌을 수 있다). */
     val unknownSeqResponses: Long = 0,
+    /**
+     * 래치된 기체인데 요청 순번상 가장 뒤의 성공한 응답이 같은 세대 `DURABLE_PENDING` 인가(이 세대 자신의 결과 모르는 변경 호출 — 래치는 그대로,
+     * [fenceStatus] 는 래치 근거의 값). 읽기 실패나 늦게 소비한 앞 순번 응답은 이것을 덮지 않는다.
+     */
+    val latchedPending: Boolean = false,
+)
+
+/**
+ * 수신자 재시작 의심 보류 하나(HA 후속 D1 완화). [state] 는 `CANDIDATE`(앞 세대가 보냈을 수 있어 수신자 장부와 대조 중 — 막음)·`ATTACHED`(수신자
+ * 장부에 붙어 보여 막지 않되 응답마다 다시 봄 — 이 세대가 그 출발을 내거나 단위가 판정을 얻으면 닫힘)·`SUSPECT`(의심 — 막음, 운영자 단위 해제나 뒤의
+ * 붙음으로 닫힘). [suspicionId] 는 저장한 의심 행이고 후보·붙음이거나 의심을 아직 못 적었으면(다음 pump 에 다시 적음) `null` 이다 — `null` 인 의심은
+ * 해제할 수 없다. [basisKind] 는 의심의 근거 종류(`ABSENT`·`REVISION_UNKNOWN`·`ISSUING_PENDING`·`DRIVE_ENDED`·`RESTORE_ABANDONED`, 의심이 아니면
+ * `null`). [executionId] 는 그 보류를 세운 보유자의 실행 id 다(앞 보유자의 것이거나 없을 수 있다). [basisIntentId] 는 판정 때 그 태스크의 가장 큰 송신
+ * 의도 순번(없으면 0)이다.
+ */
+data class RestartHoldView(
+    val suspicionId: Long?,
+    val state: String,
+    val basisKind: String?,
+    val robotId: String,
+    val jobOrderId: String,
+    val executionId: String?,
+    val unitId: String,
+    val attempt: Int,
+    val taskId: String,
+    val revision: Int?,
+    val basisIntentId: Long,
+    val generation: Long?,
 )
 
 /** 실행 하나의 요구(기체 단위를 맡은 기체 전부, 플릿 단위가 있으면 플릿)와 준비. [blockers] 가 비면 관측 중에도 그 실행의 기체 명령을 보낸다. */
@@ -101,7 +129,14 @@ data class LeaderView(
     val unresolvedHistoryComplete: Boolean? = null,
     val issuingBasis: String? = null,
     val readiness: ReadinessView? = null,
+    /** 수신자 재시작 의심 보류(관측·발행 모두, 붙음 포함). */
+    val restartHolds: List<RestartHoldView> = emptyList(),
+    /** 복원을 미뤄(`DEFERRED`) 다시 지을 때까지 막는 작업 지시와 그 기체들(의심 ID 없음 — 다시 짓거나 포기·종결하면 후보·의심으로 넘어감). */
+    val restartDeferred: List<RestartDeferredView> = emptyList(),
 )
+
+/** 복원을 미뤄 막는 작업 지시 하나와 그 기체들. */
+data class RestartDeferredView(val jobOrderId: String, val robotIds: List<String>)
 
 /**
  * 발행하는 리더가 아니어서 받지 않은 변경 요청(503). [holder]·[generation] 은 DB 의 리스 행이다. [holder] 는 인스턴스 id(`mw-<UUID>`)이지 주소가
@@ -140,6 +175,20 @@ data class TakeoverConfirmationRequest(
  * 있는 것, [complete] 는 발행을 연 세대(또는 세대 1)까지 이력을 빈틈없이 보았는가다.
  */
 data class UnresolvedHolders(val holders: List<String>, val live: List<String>, val complete: Boolean)
+
+/**
+ * `POST /host/restart-holds/release` 의 본문. 해제할 의심([suspicionId])과 그 대상(기체 [robotId]·태스크 [taskId], `GET /host/leader` 의 `restartHolds`
+ * 에서 본 값), 지금 호스트([instanceId]·[generation]), 누가([releasedBy]) 무엇을 확인했는가([reason] — 벤더 작업이 끝났거나 효과가 없음).
+ */
+data class RestartHoldReleaseRequest(
+    val suspicionId: Long? = null,
+    val robotId: String? = null,
+    val taskId: String? = null,
+    val instanceId: String? = null,
+    val generation: Long? = null,
+    val releasedBy: String? = null,
+    val reason: String? = null,
+)
 
 /**
  * 리더 조회와 만료 인수 뒤 운영자 확인(HA 설계 기록 §7). 운영 서비스는 고치지 않는다 — `ops.host.url` 을 사람이 바꾸거나 앞단 프록시가 [ready] 를 본다.
@@ -235,10 +284,74 @@ class LeaderController(private val leadership: HostLeadership, private val recor
         return ResponseEntity.ok(view(leadership, records))
     }
 
+    /**
+     * 수신자 재시작 의심의 운영자 단위 해제(HA 후속 D1 완화). 관측·발행 모두 받는다. 운영자는 현장에서 그 태스크의 벤더 작업이 끝났거나 효과가 없음을
+     * 확인한 뒤 보낸다 — 해제 뒤 그 기체로 출발이 다시 나가고, 그 단위가 아직 돌면 같은 태스크 키를 다시 보낸다. 같은 가드 트랜잭션에서 지금 보유자·세대와
+     * 의심 행(열림·대상)을 확인하고, 효력은 해제 당시 그 태스크의 가장 큰 송신 의도 순번까지다(그 뒤 새 송신은 다음 인수가 새로 판정). 커밋 뒤 관문에서 닫는다.
+     * - 칸이 비면 400 `BAD_REQUEST`, 의심이 없으면 404 `NOT_FOUND`.
+     * - 본문의 인스턴스·세대가 지금과 다르면 409 `TAKEOVER_TARGET_CHANGED`, 대상(기체·태스크)이 그 의심과 다르면 409 `RESTART_HOLD_TARGET_CHANGED`,
+     *   이미 해제됐으면 409 `RESTART_HOLD_RELEASED`.
+     */
+    @PostMapping(RELEASE_PATH, consumes = [MediaType.APPLICATION_JSON_VALUE])
+    @Synchronized
+    fun release(@RequestBody(required = false) body: RestartHoldReleaseRequest?): ResponseEntity<Any> {
+        val by = body?.releasedBy?.trim().orEmpty()
+        val reason = body?.reason?.trim().orEmpty()
+        if (by.isEmpty() || reason.isEmpty() || body?.suspicionId == null || body.robotId.isNullOrBlank() || body.taskId.isNullOrBlank() ||
+            body.instanceId.isNullOrBlank() || body.generation == null
+        ) {
+            return ResponseEntity.badRequest().body(
+                HostRejection(HostRequests.BAD_REQUEST, "suspicionId·robotId·taskId·instanceId·generation·releasedBy·reason 이 비어 있다"),
+            )
+        }
+        // 해제한 사람 칸의 `system:` 머리는 실행 호스트의 시스템 해제 몫이다 — 운영자 해제가 시스템 해제로 읽혀 다음 판별의 해제 범위에서 빠지지 않게.
+        if (by.startsWith(RESERVED_RELEASER_PREFIX)) {
+            return ResponseEntity.badRequest().body(HostRejection(HostRequests.BAD_REQUEST, "releasedBy 는 '$RESERVED_RELEASER_PREFIX' 로 시작할 수 없다(예약값)"))
+        }
+        val target = checkNotNull(body)
+        fun changed(holder: String?, generation: Long?) = conflict(
+            TAKEOVER_TARGET_CHANGED,
+            "해제한 대상 호스트(${target.instanceId}, 세대 ${target.generation})가 지금 리스($holder, 세대 $generation)와 다르다",
+        )
+        // 요청이 겨눈 호스트(인스턴스·세대)는 가드가 잠근 리스 행과 같은 트랜잭션에서 비교한다. 그 사이 인수돼 가드가 이 인스턴스를 거절해도 겨눈 호스트가
+        // 지금 리스와 다르면 낡은 요청이라 409 다(503 은 겨눈 호스트가 지금 리스인데 이 인스턴스가 쓰지 못할 때).
+        val outcome = try {
+            records.releaseRestartSuspicion(
+                checkNotNull(target.suspicionId), checkNotNull(target.robotId), checkNotNull(target.taskId), checkNotNull(target.generation),
+                checkNotNull(target.instanceId), by, reason,
+            )
+        } catch (e: RuntimeException) {
+            if (e !is NotAuthority && e !is AuthorityLost) throw e
+            val row = runCatching { records.leaseRow() }.getOrNull()
+            if (row != null && (row.holder != target.instanceId || row.generation != target.generation)) return changed(row.holder, row.generation)
+            throw e
+        }
+        return when (outcome) {
+            is dev.picasso.ops.host.store.RestartReleaseOutcome.HostChanged -> changed(outcome.holder, outcome.generation)
+            is dev.picasso.ops.host.store.RestartReleaseOutcome.Released -> {
+                leadership.restartHolds.release(outcome.suspicion.suspicionId)
+                ResponseEntity.ok(view(leadership, records))
+            }
+            dev.picasso.ops.host.store.RestartReleaseOutcome.NotFound ->
+                ResponseEntity.status(HttpStatus.NOT_FOUND).body(HostRejection(RESTART_HOLD_NOT_FOUND, "수신자 재시작 의심 #${target.suspicionId} 이 없다"))
+            is dev.picasso.ops.host.store.RestartReleaseOutcome.TargetChanged -> conflict(
+                RESTART_HOLD_TARGET_CHANGED,
+                "의심 #${target.suspicionId} 의 대상(기체 ${outcome.suspicion.robotId}, 태스크 ${outcome.suspicion.taskId})이 본문(${target.robotId}, ${target.taskId})과 다르다",
+            )
+            is dev.picasso.ops.host.store.RestartReleaseOutcome.AlreadyReleased ->
+                conflict(RESTART_HOLD_RELEASED, "의심 #${target.suspicionId} 은 이미 ${outcome.suspicion.releasedBy} 가 해제했다")
+        }
+    }
+
     private fun conflict(error: String, detail: String): ResponseEntity<Any> = ResponseEntity.status(HttpStatus.CONFLICT).body(HostRejection(error, detail))
 
     companion object {
         const val CONFIRM_PATH = "/host/leader/takeover-confirmation"
+        const val RELEASE_PATH = "/host/restart-holds/release"
+        const val RESTART_HOLD_TARGET_CHANGED = "RESTART_HOLD_TARGET_CHANGED"
+        const val RESTART_HOLD_RELEASED = "RESTART_HOLD_RELEASED"
+        const val RESTART_HOLD_NOT_FOUND = "NOT_FOUND"
+        const val RESERVED_RELEASER_PREFIX = "system:"
         const val NOT_HOLDING = "NOT_HOLDING"
         const val TAKEOVER_TARGET_CHANGED = "TAKEOVER_TARGET_CHANGED"
         const val PREVIOUS_HOLDER_LIVE = "PREVIOUS_HOLDER_LIVE"
@@ -298,6 +411,18 @@ class LeaderController(private val leadership: HostLeadership, private val recor
                     else -> null
                 },
                 readiness = readiness(leadership),
+                restartHolds = leadership.restartHolds.holds().map {
+                    RestartHoldView(
+                        it.suspicionId,
+                        when (it.state) {
+                            dev.picasso.ops.host.lease.RestartHolds.State.PENDING -> "CANDIDATE"
+                            dev.picasso.ops.host.lease.RestartHolds.State.ATTACHED -> "ATTACHED"
+                            dev.picasso.ops.host.lease.RestartHolds.State.SUSPECT -> "SUSPECT"
+                        },
+                        it.basis?.name, it.robotId, it.jobOrderId, it.executionId, it.unitId, it.attempt, it.taskId, it.revision, it.basisIntentId, it.generation,
+                    )
+                },
+                restartDeferred = leadership.restartHolds.deferredHolds().map { (job, robots) -> RestartDeferredView(job, robots.sorted()) },
             )
         }
 
@@ -309,9 +434,14 @@ class LeaderController(private val leadership: HostLeadership, private val recor
                 robots = robots.map { robot ->
                     when (val r = leadership.readinessOf(robot)) {
                         is Readiness.Ready ->
-                            RobotReadinessView(robot, true, "AUTO", null, null, r.floor, r.fenceStatus.name, leadership.unknownSeqResponses(robot))
+                            RobotReadinessView(
+                                robot, true, "AUTO", null, null, r.floor, r.fenceStatus.name, leadership.unknownSeqResponses(robot), leadership.latchedPending(robot),
+                            )
                         is Readiness.Waiting ->
-                            RobotReadinessView(robot, false, null, r.reason.name, r.reason.text, r.floor, r.fenceStatus?.name, leadership.unknownSeqResponses(robot))
+                            RobotReadinessView(
+                                robot, false, null, r.reason.name, r.reason.text, r.floor, r.fenceStatus?.name, leadership.unknownSeqResponses(robot),
+                                leadership.latchedPending(robot),
+                            )
                     }
                 },
                 executions = requirements.sortedBy { it.executionId }.map { req ->
@@ -342,7 +472,8 @@ class LeaderGate(private val leadership: HostLeadership, private val records: Ho
     override fun doFilterInternal(request: HttpServletRequest, response: HttpServletResponse, chain: FilterChain) {
         val state = leadership.state
         val path = request.requestURI
-        val passes = request.method in READS || leadership.mayIssue() ||
+        // 수신자 재시작 의심 해제는 상태와 무관하게 들인다 — 낡은 요청(겨눈 호스트가 지금 리스가 아님)은 409, 그 밖에 쓰지 못하면 503 을 컨트롤러가 정한다.
+        val passes = request.method in READS || leadership.mayIssue() || path == LeaderController.RELEASE_PATH ||
             state == LeaderState.HOLDING && (path == LeaderController.CONFIRM_PATH || path == ELIGIBILITY)
         if (passes) {
             chain.doFilter(request, response)

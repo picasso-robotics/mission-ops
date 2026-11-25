@@ -31,7 +31,10 @@ import dev.picasso.middleware.IncidentDecision
 import dev.picasso.middleware.InspectAsset
 import dev.picasso.middleware.JobOrder
 import dev.picasso.middleware.JobResponse
+import dev.picasso.middleware.CommandNotSent
+import dev.picasso.middleware.JudgmentRecord
 import dev.picasso.middleware.JudgmentRecordWire
+import dev.picasso.middleware.RobotSnapshot
 import dev.picasso.middleware.LedgerExport
 import dev.picasso.middleware.LogicalCapability
 import dev.picasso.middleware.Middleware
@@ -65,6 +68,8 @@ import dev.picasso.ops.host.lease.GatedRobotPort
 import dev.picasso.ops.host.lease.HostLeadership
 import dev.picasso.ops.host.lease.LeaderState
 import dev.picasso.ops.host.lease.LeadershipListener
+import dev.picasso.ops.host.lease.ObservingRobotPort
+import dev.picasso.ops.host.lease.RestartHolds
 import dev.picasso.ops.host.lease.Requirement
 import dev.picasso.ops.host.lease.SendAuthority
 import dev.picasso.ops.host.mission.MockRunner
@@ -79,6 +84,7 @@ import dev.picasso.ops.host.permit.RobotPermitView
 import dev.picasso.ops.host.permit.WorkPermitsView
 import dev.picasso.ops.host.web.BadRequest
 import dev.picasso.ops.host.web.HostRequests
+import dev.picasso.ops.host.store.RestartSuspicionWrite
 import dev.picasso.ops.host.store.CancelRow
 import dev.picasso.ops.host.store.CloseRow
 import dev.picasso.ops.host.store.ApprovalFactWrite
@@ -716,8 +722,15 @@ class MissionHost(
      * 진다(picasso §15.322): 인시던트 id 는 재기동마다 `incident-1` 부터 다시 세므로, 고정하면 다른 사건이 같은 열쇠를 얻어 읽는 쪽이
      * 서로 다른 보류를 한 사건으로 접는다. 실행 일지·사본·송신 기록의 인스턴스 칸도 이 값이다.
      */
+    /**
+     * 기체 포트가 [HostRobotPort] 가 아니면(요청 순번이 없는 시험 배선) 미들웨어가 읽은 스냅숏을 수신자 재시작 의심 판별에 넘기는 포트. [HostRobotPort] 면
+     * 그 지금 읽기·미리 읽기 갈고리가 요청 순번과 함께 넘긴다(init).
+     */
+    private val observing: ObservingRobotPort? =
+        if (robots is HostRobotPort) null else ObservingRobotPort(robots) { robot, snapshot, seq -> observeRestartHolds(robot, snapshot, seq) }
+
     private val middleware = Middleware(
-        robots = GatedRobotPort(robots, leadership), cell = signals,
+        robots = GatedRobotPort(observing ?: robots, leadership), cell = signals,
         fleet = if (fleetPort === AmrFleetPort.None) fleetPort else GatedFleetPort(fleetPort, leadership),
         now = clock::now, missions = catalog, siteTimings = siteTimings, permits = permits,
         retirements = retirements, entitlements = entitlements, retention = retention, instanceId = leadership.instanceId,
@@ -726,9 +739,16 @@ class MissionHost(
 
     init {
         // 지금 읽은 스냅숏만 준비 판정에 간다(미리 읽은 값은 넘기지 않는다). 포트가 [HostRobotPort] 가 아니면 관측 중 자동으로 열리는 기체가 없다.
-        (robots as? HostRobotPort)?.onFreshRead = { robot, snapshot, seq, at -> leadership.observeFresh(robot, snapshot, seq, at) }
+        // 수신자 재시작 의심 판별도 같은 갈고리로 응답을 요청 순번과 함께 받는다 — 소비한 미리 읽기와 그것을 덮은 지금 읽기 둘 다다.
+        (robots as? HostRobotPort)?.onFreshRead = { robot, snapshot, seq, at ->
+            leadership.observeFresh(robot, snapshot, seq, at)
+            observeRestartHolds(robot, snapshot, seq)
+        }
         // 미리 읽은 값은 열지 않고 지금 읽기 대상을 거르고 래치 뒤 후퇴를 보는 데만 쓴다.
-        (robots as? HostRobotPort)?.onOtherRead = { robot, snapshot, seq -> leadership.observePrefetched(robot, snapshot, seq) }
+        (robots as? HostRobotPort)?.onOtherRead = { robot, snapshot, seq ->
+            leadership.observePrefetched(robot, snapshot, seq)
+            observeRestartHolds(robot, snapshot, seq)
+        }
         // 관측 중 미리 읽은 값이 없는 미준비 기체는 첫 관측 뒤로는 기체별 간격마다 한 번만 잠금 아래에서 동기로 읽는다.
         (robots as? HostRobotPort)?.unreadFallback = leadership::allowUnreadFallback
         // 플릿 인수 확인의 답(호스트 잠금 밖의 확인 스레드)과 플릿 읽기 응답의 바닥값을 준비 판정에 넘긴다(HA 3단계 PR B2).
@@ -746,7 +766,271 @@ class MissionHost(
         // 발행에 든 순간 그 시점의 확인 기동을 곧바로 기준으로 적는다(다음 확인을 기다리는 창을 두지 않는다). 그 기동을 본 확인의 순번을 싣는다.
         if (fleetHost != null) leadership.onIssuing = { noteFleetBoot(fleetHost.url, lastFleetBoot.get()) }
         fleetHost?.onReadFloor = leadership::observeFleetFloor
+        // 출발을 실제로 보내기 직전(송신 스레드) 송신 의도 한 줄을 커밋한다 — 커밋하지 못하면 보내지 않는다(수신자 재시작 의심 판별의 흔적).
+        leadership.startIntent = ::recordStartIntent
+        // 출발을 큐에 넣는 자리(호스트 잠금 아래)에서 그 출발을 낸 실행·단위를 적어 둔다 — 송신 스레드가 의도 행에 그대로 싣는다.
+        leadership.issueNote = ::noteIssueContext
     }
+
+    // ── 수신자 재시작 의심 보류(HA 후속 D1 완화, picasso 한계 대장 §15.330 의 실행 호스트 쪽 완화)
+
+    /**
+     * 이번 보유가 앞 세대 송신 후보를 판별하는가 — 획득 결과가 정상 종료 인수([Acquired.graceful])가 아닐 때다. 그 범위: 만료 인수(다른 인스턴스가
+     * 넘겨받음), 비정상 종료한 단일 프로세스의 재기동(리스 만료 뒤 같은 DB 로 다시 뜸), 관측(`HOLDING`) 중에 정상 종료한 보유자의 후임(앞 세대가 발행을
+     * 열지 않았으므로 정상 종료 인수가 아님), 획득 결과를 조회로 복구한 획득([Acquired.recovered]), 다른 인스턴스가 살아 있는 첫 획득. 곧바로 발행하는
+     * 정상 종료 인수의 신규 판별은 이번 범위 밖이고(알려진 한계, 다음 과제) 저장된 의심은 그 경로에서도 관문에 적용된다.
+     */
+    @Volatile
+    private var discriminate = false
+
+    /** 출발을 낸 실행·단위(송신 의도 행의 문맥). */
+    private data class IssueContext(val jobOrderId: String, val executionId: String, val unitId: String, val attempt: Int)
+
+    /** 태스크 id → 그 출발을 큐에 넣을 때 본 문맥. 큐 입구(호스트 잠금 아래)에서 적고 송신 스레드가 읽는다. 최근 [ISSUE_CONTEXTS] 개만 둔다. */
+    private val issueContexts: MutableMap<String, IssueContext> = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, IssueContext>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, IssueContext>?): Boolean = size > ISSUE_CONTEXTS
+        },
+    )
+
+    /** 그 태스크를 지금 시도로 든 실행의 단위를 찾는다. 호스트 잠금 아래에서만 부른다. */
+    private fun resolveIssueContext(taskId: String): IssueContext? {
+        for (execution in middleware.executions()) {
+            val unit = execution.units.firstOrNull { restartTaskId(execution.order.jobOrderId, it.unitId, it.attempt) == taskId } ?: continue
+            return IssueContext(execution.order.jobOrderId, execution.executionId, unit.unitId, unit.attempt)
+        }
+        return null
+    }
+
+    /** 출발을 큐에 넣는다(호스트 잠금 아래) — 그 출발의 실행·단위를 적어 둔다. */
+    private fun noteIssueContext(robotId: String, taskId: String, revision: Int) {
+        if (lock.isHeldByCurrentThread) resolveIssueContext(taskId)?.let { issueContexts[taskId] = it }
+    }
+
+    /**
+     * 송신 의도 한 줄(V22 `host_issue_intent`, 리스 가드 안)을 커밋한다. 송신 스레드(또는 동기 출발이면 호스트 잠금 아래)에서 불린다. 그 출발의 실행·단위는
+     * 큐 입구에서 적어 둔 문맥에서 받고, 없으면(호스트 잠금 아래의 동기 출발) 지금 찾는다 — 그래도 없으면 보내지 않는다. 실패하면 [CommandNotSent] 다.
+     * 그 태스크의 붙음·후보 보류는 커밋 뒤 위임 직전 재확인을 지난 뒤에 닫는다([HostLeadership.started] — 이 세대가 낸 출발이 되었다, 그 뒤의 수신자
+     * 재시작은 같은 세대 한계).
+     */
+    private fun recordStartIntent(robotId: String, taskId: String, revision: Int) {
+        val claim = leadership.claim() ?: throw CommandNotSent("${SendAuthority.NOT_ISSUING}: 송신 의도를 적을 리스가 없다(robot=$robotId task=$taskId)")
+        val context = issueContexts[taskId] ?: (if (lock.isHeldByCurrentThread) resolveIssueContext(taskId) else null)
+            ?: throw CommandNotSent("송신 문맥(실행·단위)을 몰라 송신 의도를 적지 않고 보내지 않았다: robot=$robotId task=$taskId")
+        try {
+            records.recordIssueIntent(
+                claim.generation, instanceId, robotId, context.jobOrderId, context.executionId, context.unitId, context.attempt, taskId, revision,
+                leadership.restartHolds.session(robotId),
+            )
+        } catch (e: Exception) {
+            throw CommandNotSent("송신 의도를 적지 못해 보내지 않았다: robot=$robotId task=$taskId 리비전 $revision — $e")
+        }
+    }
+
+    /** 스냅숏 응답 하나(요청 순번 [seq], 모르면 `null`)를 보류 판별에 넘긴다. 호스트 잠금 아래에서 불린다. */
+    private fun observeRestartHolds(robotId: String, snapshot: RobotSnapshot?, seq: Long?) {
+        if (leadership.restartHolds.observe(robotId, snapshot, seq, leadership.controllerEpoch(), leadership.mayIssue())) {
+            log.warn("기체 {} 에서 수신자 재시작 의심을 확정했다 — 앞 세대가 보냈을 수 있는 단위가 수신자 장부에 없다: {}", robotId, leadership.restartHolds.describe(robotId))
+        }
+    }
+
+    /** 지금까지 보낸 스냅숏 요청의 가장 큰 순번 — 후보는 이보다 뒤에 보낸 요청의 응답으로만 판정한다. */
+    private fun currentSeq(): Long = (robots as? HostRobotPort)?.currentSeq() ?: observing?.current() ?: 0L
+
+    /** 저장된 열린 의심을 관문에 올린다. 리스 획득 때 복원보다 먼저 부른다 — 읽지 못하면 예외가 나가 재대조가 실패한다(잃음, 복원 이벤트 없음). */
+    private fun loadRestartHolds() {
+        val rows = records.openRestartSuspicions()
+        leadership.restartHolds.load(
+            rows.map {
+                RestartHolds.Hold(
+                    it.robotId, it.jobOrderId, it.executionId, it.unitId, it.attempt, it.taskId, it.revision, it.basisIntentId, it.basisRecordId,
+                    state = RestartHolds.State.SUSPECT, basis = runCatching { RestartHolds.Basis.valueOf(it.basisKind) }.getOrNull(),
+                    suspicionId = it.suspicionId, generation = it.generation, observedFloor = it.observedFloor, observedStatus = it.observedStatus,
+                    afterSeq = currentSeq(),
+                )
+            },
+        )
+        if (rows.isNotEmpty()) log.warn("열린 수신자 재시작 의심 {} 건을 올렸다 — 그 기체로 가는 출발은 해제까지 막는다", rows.size)
+        // 시스템 해제된 의심 가운데 그 뒤 송신 의도도 단위 판정도 없는 것은 다시 대조할 후보로 올린다(복원 대상에서 빠진 종결·포기 행이어도).
+        val rejudged = (
+            try {
+                records.systemReleasedSuspicions()
+            } catch (e: Exception) {
+                // 송신 의도를 못 읽으면 그 뒤 출발을 냈는지 모른다 — 시스템 해제된 의심 전부를 다시 대조한다(막는 쪽).
+                log.warn("시스템 해제 뒤 송신 의도를 읽지 못해 시스템 해제된 의심 전부를 다시 대조한다: {}", e.toString())
+                records.systemReleasedSuspicions(intents = false)
+            }
+            ).filter { row -> !verdictedSince(row) }
+        leadership.restartHolds.loadRejudged(
+            rejudged.map {
+                RestartHolds.Hold(
+                    it.robotId, it.jobOrderId, null, it.unitId, it.attempt, it.taskId, it.revision, it.basisIntentId, it.basisRecordId,
+                    afterSeq = currentSeq(),
+                )
+            },
+        )
+        if (rejudged.isNotEmpty()) log.warn("시스템 해제된 의심 {} 건을 수신자 장부와 다시 대조할 후보로 올렸다", rejudged.size)
+    }
+
+    /** 그 의심의 단위가 그 시도에서 판정을 얻었는가(최근 판단 기록). 못 읽으면 거짓(다시 대조). */
+    private fun verdictedSince(row: dev.picasso.ops.host.store.RestartSuspicionRow): Boolean =
+        runCatching {
+            records.latestJudgmentRecord(row.jobOrderId)?.let { JudgmentRecordWire.decode(it.record) }?.units
+                ?.any { it.unitId == row.unitId && it.attempt == row.attempt && it.verdict != null } == true
+        }.getOrDefault(false)
+
+    /** 복원 전에 읽어 둔 그 작업 지시의 송신 흔적(송신 의도 요약·해제가 덮는 순번). 다시 짓기 전에 읽어, 읽지 못하면 다시 짓지 않는다. */
+    private data class IssueTrace(val intents: Map<String, dev.picasso.ops.host.store.IntentBasis>, val covered: Map<String, Long>)
+
+    private fun issueTrace(jobOrderId: String): IssueTrace? =
+        if (!discriminate) null else IssueTrace(records.intentBases(jobOrderId), records.restartReleaseCoverage(jobOrderId))
+
+    /**
+     * 다시 지은 실행의 앞 세대 송신 후보를 막는다(판별하는 획득만). 후보는 기체 단위 가운데 판단 기록의 같은 시도에 판정이 없고, 앞 세대 요청 흔적
+     * (`requestedAt`)이나 그 시도 태스크의 송신 의도 행이 있는 것이다. 해제가 그 태스크의 가장 큰 송신 의도 순번까지 덮었거나 이미 보류가 있으면 빠진다.
+     * DB 를 읽지 않는다 — 흔적은 다시 짓기 전에 읽었다([issueTrace]).
+     */
+    private fun holdCandidates(execution: Middleware.Execution, record: JudgmentRecord?, recordId: Long?, trace: IssueTrace?) {
+        if (trace == null) return
+        val jobOrderId = execution.order.jobOrderId
+        val units = execution.units.map { RestartUnit(it.unitId, it.attempt, execution.robotOf(it), it.route == Route.ROBOT) }
+        val candidates = restartCandidates(
+            jobOrderId, execution.executionId, units, record, recordId, trace.intents, trace.covered, leadership.restartHolds::has,
+        ).map { it.copy(afterSeq = currentSeq()) }
+        if (candidates.isEmpty()) return
+        leadership.restartHolds.hold(candidates)
+        log.info("앞 세대가 보냈을 수 있는 단위 {} 개를 수신자 장부와 대조할 때까지 막는다: {}", candidates.size, candidates.joinToString { it.taskId })
+    }
+
+    /**
+     * 복원을 미룬 실행의 기체를 다시 지을 때까지 막는다(판별하는 획득만). 그 작업 지시에 송신 의도 행이 있거나 최근 판단 기록에 판정 없는 요청 흔적이
+     * 있을 때만이다. 막는 기체는 일지 행의 기체와 송신 의도 행의 기체 전부다. 읽지 못하면 다시 읽을 때까지 모든 기체를 막는다.
+     */
+    private fun deferRestartHold(row: JournalRow) {
+        if (!discriminate) return
+        val robotsOf = try {
+            val intents = records.intentBases(row.jobOrderId)
+            val traced = records.latestJudgmentRecord(row.jobOrderId)?.let { stored ->
+                JudgmentRecordWire.decode(stored.record).units.any { it.requestedAt != null && it.verdict == null }
+            } == true
+            if (intents.isEmpty() && !traced) null else intents.values.mapTo(linkedSetOf(row.robotId)) { it.robotId }
+        } catch (e: Exception) {
+            // 흔적을 못 읽으면 그 작업 지시의 단위가 어느 기체에 갔는지 모른다 — 다시 읽을 때까지 모든 기체를 막는다.
+            setOf(RestartHolds.ALL_ROBOTS)
+        }
+        robotsOf?.let { leadership.restartHolds.deferHold(row.jobOrderId, it) }
+    }
+
+    /** 의심으로 넘기지 못한 복원 못 한 행(다음 pump 에 다시 넘긴다 — 그동안 미룬 복원의 보류가 그 기체를 막는다). */
+    private val abandonPending = LinkedHashMap<String, JournalRow>()
+
+    /**
+     * 복원하지 못한 행(포기 `GAVE_UP`·미룬 채 운영자 종결)의 판정 없는 송신 흔적을 해제 가능한 의심([RestartHolds.Basis.RESTORE_ABANDONED])으로 넘긴 뒤
+     * 미룬 복원의 보류를 걷는다(판별하는 획득만). 흔적은 최근 판단 기록의 판정 없는 요청 흔적과, 판정 없는 단위의 송신 의도 행이다 — 해제가 덮은 것과
+     * 이미 보류가 있는 것은 빠진다. 읽지 못하면 미룬 복원의 보류를 남기고 다음 pump 에 다시 한다. 호스트 잠금 아래에서 부른다.
+     */
+    private fun abandonRestartHolds(row: JournalRow) {
+        if (!discriminate) {
+            leadership.restartHolds.clearDeferred(row.jobOrderId)
+            return
+        }
+        val jobOrderId = row.jobOrderId
+        try {
+            val holds = abandonedHolds(row)
+            leadership.restartHolds.hold(holds)
+            abandonPending.remove(jobOrderId)
+            leadership.restartHolds.clearDeferred(jobOrderId)
+            if (holds.isNotEmpty()) log.warn("복원하지 못한 작업 지시 {} 의 송신 흔적 {} 개를 해제 가능한 의심으로 넘겼다", jobOrderId, holds.size)
+        } catch (e: Exception) {
+            abandonPending[jobOrderId] = row
+            // 넘기지 못한 동안 그 기체를 막는다(처음부터 포기한 행이라 미룬 복원의 보류가 없을 수 있다) — 다음 pump 의 미들웨어 pump 앞에서 다시 넘긴다.
+            // 흔적을 못 읽었으니 그 작업 지시의 단위가 어느 기체에 갔는지 모른다 — 다시 넘길 때까지 모든 기체를 막는다.
+            leadership.restartHolds.deferHold(jobOrderId, setOf(RestartHolds.ALL_ROBOTS))
+            log.warn("복원하지 못한 작업 지시 {} 의 송신 흔적을 의심으로 넘기지 못했다(그 기체를 막은 채 다시 한다): {}", jobOrderId, e.toString())
+        }
+    }
+
+    /**
+     * 복원하지 못한 행의 판정 없는 송신 흔적 — 최근 판단 기록의 판정 없는 요청 흔적과 판정 없는 단위의 송신 의도 행 — 을 해제 가능한 의심
+     * ([RestartHolds.Basis.RESTORE_ABANDONED])으로 짓는다. 해제(운영자)가 덮은 것과 이미 보류가 있는 것은 빠진다. DB 를 읽고, 읽지 못하면 던진다.
+     */
+    private fun abandonedHolds(row: JournalRow): List<RestartHolds.Hold> {
+        val jobOrderId = row.jobOrderId
+        val record = records.latestJudgmentRecord(jobOrderId)?.let { stored ->
+            runCatching { JudgmentRecordWire.decode(stored.record) }.getOrNull()?.let { it to stored.recordId }
+        }
+        val intents = records.intentBases(jobOrderId)
+        val covered = records.restartReleaseCoverage(jobOrderId)
+        val units = record?.first?.units.orEmpty()
+        val verdicted = units.filter { it.verdict != null }.mapTo(HashSet()) { restartTaskId(jobOrderId, it.unitId, it.attempt) }
+        val traced = units.filter { it.requestedAt != null && it.verdict == null }
+            .associateBy { restartTaskId(jobOrderId, it.unitId, it.attempt) }
+        val tasks = (traced.keys + intents.keys.filter { it !in verdicted }).distinct()
+        return tasks.mapNotNull { taskId ->
+            val intent = intents[taskId]
+            val basis = intent?.intentId ?: 0L
+            if ((covered[taskId] ?: -1L) >= basis || leadership.restartHolds.has(taskId)) return@mapNotNull null
+            val trace = traced[taskId]
+            RestartHolds.Hold(
+                intent?.robotId ?: row.robotId, jobOrderId, null, trace?.unitId ?: intent!!.unitId, trace?.attempt ?: intent!!.attempt, taskId,
+                intent?.revision, basis, record?.second, state = RestartHolds.State.SUSPECT, basis = RestartHolds.Basis.RESTORE_ABANDONED,
+                afterSeq = currentSeq(),
+            )
+        }
+    }
+
+    /** 의심으로 넘기지 못한 복원 못 한 행을 다시 넘긴다 — pump 가 미들웨어 pump 앞에서 부른다(그동안 그 기체는 막혀 있다). */
+    private fun retryAbandoned() {
+        abandonPending.values.toList().forEach(::abandonRestartHolds)
+    }
+
+    /**
+     * pump 마다 보류를 손본다(호스트 잠금 아래): 판정을 얻은 단위의 붙음·후보를 닫고, 구동이 끝난 실행의 후보를 의심으로 확정한다. 새 의심의 저장은
+     * pump 뒤 기록의 트랜잭션이 한다([recordAfterPump]).
+     */
+    private fun tendRestartHolds() {
+        val holds = leadership.restartHolds
+        val live = middleware.executions().filter { it.physicalState.pumps }
+        holds.closeVerdicts(
+            live.flatMapTo(HashSet()) { e ->
+                e.units.filter { it.state in VERDICT_STATES }.map { restartTaskId(e.order.jobOrderId, it.unitId, it.attempt) }
+            },
+        )
+        holds.confirmOrphans(live.mapTo(HashSet()) { it.executionId })
+    }
+
+    /**
+     * 붙음을 본 의심의 시스템 해제(`system:attached`)를 의심마다 따로 적는다(리스 가드 안). 커밋하면 그 보류를 붙음으로 되돌린다 — 막지 않되 이 세대가
+     * 그 출발을 내거나 단위가 판정을 얻을 때까지 다시 본다([RestartHolds.systemReleased]). 실패하면 그 의심을 막은 채 다음 pump 에 다시 한다. 호스트 잠금
+     * 아래에서 부른다.
+     */
+    private fun commitSystemReleases(generation: Long) {
+        leadership.restartHolds.systemReleases().forEach { h ->
+            val id = checkNotNull(h.suspicionId)
+            try {
+                val outcome = records.releaseRestartSuspicion(
+                    id, h.robotId, h.taskId, generation, instanceId, SYSTEM_RELEASER, "수신자 장부에 그 태스크가 같은 리비전 이상으로 붙어 보임(재전송 멱등)",
+                )
+                when {
+                    outcome is dev.picasso.ops.host.store.RestartReleaseOutcome.Released ||
+                        outcome is dev.picasso.ops.host.store.RestartReleaseOutcome.AlreadyReleased && outcome.suspicion.releasedBy == SYSTEM_RELEASER -> {
+                        leadership.restartHolds.systemReleased(id)
+                        log.info("수신자 재시작 의심 #{} 을 닫았다 — 뒤에 수신자 장부에 붙어 보였다(시스템 해제, 붙음으로 계속 봄)", id)
+                    }
+                    // 운영자가 먼저 해제했다 — 운영자 해제가 이긴다(보류를 닫는다).
+                    outcome is dev.picasso.ops.host.store.RestartReleaseOutcome.AlreadyReleased -> leadership.restartHolds.release(id)
+                }
+            } catch (e: Exception) {
+                log.warn("수신자 재시작 의심 #{} 의 시스템 해제를 적지 못했다(막은 채 다음 pump 에 다시 한다): {}", id, e.toString())
+            }
+        }
+    }
+
+    /** 저장할 의심 한 줄. */
+    private fun suspicionWrite(h: RestartHolds.Hold) = RestartSuspicionWrite(
+        h.robotId, h.jobOrderId, h.executionId, h.unitId, h.attempt, h.taskId, h.revision, (h.basis ?: RestartHolds.Basis.ABSENT).name, h.basisIntentId,
+        h.basisRecordId, h.observedFloor, h.observedStatus,
+    )
 
     /** 인시던트 고리로 내는 파일. [export] 를 주었을 때만 있다. 호스트 잠금 아래에서만 부른다. */
     private val exported: IncidentExport? = export?.let { IncidentExport(it, middleware.instanceId) }
@@ -944,6 +1228,9 @@ class MissionHost(
     override fun acquired(acquired: Acquired) {
         // 앞 근거의 현장 플릿 기동 ID 를 기준으로 둔다 — 이번 확인의 기동 ID 가 다르면 현장이 그 사이 다시 떴다(운영자 확인).
         readFleetBaseline()
+        discriminate = discriminates(acquired)
+        // 저장된 열린 의심을 복원보다 먼저 관문에 올린다 — 복원·재대조 사이에 그 기체로 출발이 나가지 않게(정상 종료 인수 포함).
+        lock.withLock { loadRestartHolds() }
         lock.withLock { catalog.restore(store.activeVersions()) }
         restore()
         leadership.reconciled()
@@ -991,6 +1278,8 @@ class MissionHost(
         records.openJournal().forEach { row -> restoreRow(row) }
         // 이번 기동에서 포기한 행은 attempt 가 이미 넣었고 그 GAVE_UP 이벤트도 일지에 있다. 작업 지시마다 한 번만 든다.
         val abandoned = records.gaveUpJournal()
+        // 포기한 채인 행(이전 기동의 것 포함)의 판정 없는 송신 흔적도 해제 가능한 의심으로 넘긴다(판별하는 획득만, 이미 넘긴 것은 해제·보류가 거른다).
+        abandoned.forEach(::abandonRestartHolds)
         gaveUp += abandoned.filter { row -> gaveUp.none { it.jobOrderId == row.jobOrderId } }
         abandoned.filter { it.jobOrderId !in unclosed }.forEach { row ->
             val event = records.events(row.jobOrderId).last { it.kind == JournalEventKind.GAVE_UP }
@@ -1029,6 +1318,11 @@ class MissionHost(
     private fun publishReadiness() {
         val generation = leadership.lease.generation ?: return
         leadership.pendingReady().forEach { ready ->
+            // 수신자 재시작 의심 보류가 있는 기체는 확인 답이 DURABLE_CONFIRMED 여도 열지 않고 근거를 적지 않는다.
+            if (leadership.restartHolds.blocks(ready.robotId)) {
+                leadership.holdBack(ready)
+                return@forEach
+            }
             try {
                 records.recordReadiness(generation, instanceId, ready.robotId, ready.floor, ready.fenceStatus.name, ready.observedAt)
                 leadership.latch(ready)
@@ -1185,7 +1479,11 @@ class MissionHost(
      * 미룬 행을 다시 시도한다(T3). pump 가 미들웨어 pump 전에 잠금 아래에서 부른다. 이벤트를 못 적으면 다음 pump 에 다시 한다.
      */
     private fun retryDeferred() {
-        deferred.toList().forEach { waiting ->
+        // 한 pump 에 다시 시도하는 미룬 행은 [RESTORE_RETRIES] 개다(복원의 스냅숏 읽기가 호스트 잠금 아래에서 쌓이지 않게). 시도한 행은 뒤로 돌려 차례를 돌린다.
+        val batch = deferred.take(RESTORE_RETRIES)
+        deferred.removeAll(batch)
+        deferred.addAll(batch)
+        batch.forEach { waiting ->
             val previous = restoreRows[waiting.index].let { RestoredFromView(it.previousInstanceId, it.previousExecutionId) }
             try {
                 // 다른 인스턴스가 그 사이 종결했으면 이 인스턴스의 메모리가 든 채로 리빌드하지 않는다. 일지는 DB 가 원본이다.
@@ -1203,6 +1501,7 @@ class MissionHost(
     private fun attempt(waiting: Deferred, previous: RestoredFromView, first: Boolean) {
         val (result, executionId, reason) = prepare(waiting)?.let { Triple(RestoreResult.GAVE_UP, null, it) } ?: resumed(waiting)
         if (result == RestoreResult.DEFERRED) {
+            deferRestartHold(waiting.row)
             if (first) {
                 deferred += waiting
                 settleRestore(waiting.row, waiting.index, previous, result, null, reason)
@@ -1214,6 +1513,8 @@ class MissionHost(
         }
         val event = settleRestore(waiting.row, waiting.index, previous, result, executionId, reason, waiting.order?.version)
         deferred.remove(waiting)
+        // 다시 지었으면 후보가 섰다 — 미룬 복원의 보류를 걷는다. 포기면 판정 없는 송신 흔적을 해제 가능한 의심으로 넘긴 뒤에 걷는다.
+        if (result == RestoreResult.GAVE_UP) abandonRestartHolds(waiting.row) else leadership.restartHolds.clearDeferred(waiting.row.jobOrderId)
         if (result == RestoreResult.GAVE_UP) {
             gaveUp += waiting.row
             unclosed[waiting.row.jobOrderId] = Unclosed(waiting.row, previous, reason.orEmpty(), event.recordedAt)
@@ -1272,13 +1573,20 @@ class MissionHost(
                 return Triple(RestoreResult.GAVE_UP, null, "$RECORD_UNREADABLE: record=${it.recordId}, ${e.message}")
             }
         }
+        // 송신 흔적은 다시 짓기 전에 읽는다 — 읽지 못하면 예외가 나가 이번에는 다시 짓지 않는다(다시 지은 뒤에 못 읽어 후보 없이 복원을 마치는 일이 없게).
+        val trace = issueTrace(waiting.row.jobOrderId)
         return when (val submission = middleware.resume(checkNotNull(waiting.order), waiting.row.robotId, checkNotNull(waiting.mission), record)) {
             is Middleware.Submission.Accepted -> {
                 stored?.let { recorded[waiting.row.jobOrderId] = it.record }
+                holdCandidates(submission.execution, record, stored?.recordId, trace)
                 cancel?.let { carryCancel(it, submission.execution) }
                 Triple(RestoreResult.RESTORED, submission.execution.executionId, null)
             }
-            is Middleware.Submission.Idempotent -> Triple(RestoreResult.RESTORED, submission.execution.executionId, null)
+            is Middleware.Submission.Idempotent -> {
+                // 앞 시도가 다시 지은 뒤 이벤트를 못 적은 경우다 — 같은 흔적으로 후보를 다시 세운다(이미 있는 보류는 그대로).
+                holdCandidates(submission.execution, record, stored?.recordId, trace)
+                Triple(RestoreResult.RESTORED, submission.execution.executionId, null)
+            }
             is Middleware.Submission.Rejected ->
                 if (submission.reason.startsWith(Middleware.RESUME_SNAPSHOT_UNREADABLE)) {
                     Triple(RestoreResult.DEFERRED, null, submission.reason)
@@ -1337,6 +1645,8 @@ class MissionHost(
                 permits?.observe(cell, fetchedAt)
                 val at = clock.now()
                 retryDeferred()
+                // 의심으로 넘기지 못한 복원 못 한 행을 미들웨어 pump 앞에서 다시 넘긴다(그 기체는 그동안 막혀 있다).
+                retryAbandoned()
                 // 값 없는 승인으로 섰는데 적지 못한 실행도 pump 전에 다시 적는다(일지 없이 그 실행의 로봇 명령이 나가지 않게).
                 saveApprovals()
                 // 다시 돈 실행의 기록이 커밋되기 전에는 미들웨어 pump 를 돌리지 않는다(그 실행의 로봇 명령이 pump 에서 나간다).
@@ -1347,12 +1657,18 @@ class MissionHost(
                 refreshRequirements()
                 // 이 라운드의 후보는 이 라운드의 지금 읽기에서만 선다(앞 라운드의 잔류 후보를 재대조 없이 래치하지 않는다).
                 leadership.clearCandidates()
+                // 보류 기체 회복 읽기의 pump 당 상한을 새로 센다.
+                leadership.beginRound()
                 // 관측 중이면 미리 읽기가 준비를 보인 미준비 기체를 지금 읽는다(그 읽기만 준비 판정에 간다).
                 // 관측 중에는 출발을 앞둔 기체도 열렸거나 미리 읽기가 준비를 보인 것만 지금 읽는다(준비가 설 수 없는 기체는 어차피 출발하지 못한다).
-                (robots as? HostRobotPort)?.readNowFor(startingRobots().filterTo(HashSet(), leadership::mayReadNow) + leadership.freshTargets())
+                // 보류 기체는 가장 오래 회복 읽기를 못 한 기체 하나가 그 pump 의 회복 몫을 받는다(관측·발행 모두, 출발을 앞두지 않았어도).
+                (robots as? HostRobotPort)?.readNowFor(
+                    startingRobots().filterTo(HashSet(), leadership::mayReadNow) + leadership.freshTargets() + leadership.heldRecoveryTargets(),
+                )
                 fleetHost?.beginPump(fresh)
                 middleware.pump()
                 val reconciled = fleetHost?.endPump()
+                tendRestartHolds()
                 publishReadiness()
                 publishFleetReadiness(reconciled)
                 pumpedAt = at
@@ -2327,9 +2643,14 @@ class MissionHost(
         val judgments = changedRecords(latest)
         // 받은 리비전의 제거 사건은 보통 [recordReruns] 가 개정판 행과 함께 적었다. 남은 것(그 트랜잭션 밖에서 선 것)이 있으면 여기서 적는다.
         val freshRemovals = freshRemovals()
+        // 확정했으나 못 적은 수신자 재시작 의심과 붙음을 본 의심의 시스템 해제도 이 트랜잭션에 넣는다 — 정착·판정만 커밋되고 의심을 잃는 일이 없게.
+        val generation = leadership.claim()?.generation
+        val suspicions = if (generation == null) emptyList() else leadership.restartHolds.unpersisted()
+        // 붙음을 본 의심의 시스템 해제는 따로 적는다 — 실패해도 정착·판단 기록·응답을 롤백하지 않고 다음 pump 에 다시 한다(그동안 그 기체는 막혀 있다).
+        if (generation != null) commitSystemReleases(generation)
         if (
             pending.isEmpty() && fresh.isEmpty() && revised.isEmpty() && freshSearches.isEmpty() && resolved.isEmpty() &&
-            settled.isEmpty() && judgments.isEmpty() && freshRemovals.isEmpty()
+            settled.isEmpty() && judgments.isEmpty() && freshRemovals.isEmpty() && suspicions.isEmpty()
         ) {
             reackUnchanged(unchanged)
             publish(incidents, searches, responses)
@@ -2348,9 +2669,12 @@ class MissionHost(
             SearchCopyWrite(record.searchId, record.jobOrderId, record.robotId, json.readTree(line).path("outcome").asText(), line)
         }
         val marked = mutableListOf<ResidualHoldRow>()
+        val suspicionIds = mutableMapOf<String, Long>()
         try {
             records.inTransaction {
                 marked.clear()
+                suspicionIds.clear()
+                suspicions.forEach { h -> suspicionIds[h.taskId] = records.recordRestartSuspicion(checkNotNull(generation), instanceId, suspicionWrite(h)) }
                 // 판단 기록을 송신 기록과 같이 커밋한다. 상위가 받은 응답의 판정은 기록에도 있다. 이 pump 의 것을 한 문장으로 적는다.
                 records.judgmentRecords(
                     instanceId, JudgmentRecordWire.SCHEMA_VERSION,
@@ -2389,6 +2713,10 @@ class MissionHost(
         } catch (e: Exception) {
             log.warn("pump 뒤 기록 실패, 다음 pump 에 다시 한다: {}", e.toString())
             return
+        }
+        suspicionIds.forEach { (taskId, id) ->
+            leadership.restartHolds.persisted(taskId, id, checkNotNull(generation))
+            log.warn("수신자 재시작 의심 #{} 을 적었다: 태스크 {}", id, taskId)
         }
         fresh.forEach { copiedLines[it.incidentId] = CopiedLine(it, 1, freshLines.getValue(it.incidentId)) }
         revised.forEach { copiedLines[it.bundle.incidentId] = it }
@@ -3175,7 +3503,23 @@ class MissionHost(
             }
         }
         val inputs = closeInputs(journal)
+        // 종결과 그 행의 판정 없는 송신 흔적의 의심을 한 트랜잭션에 적는다 — 종결만 커밋되고 의심을 잃으면 다음 보유자는 종결한 행을 복원·포기 목록에서
+        // 읽지 않아 그 기체를 막을 근거가 없다. 미룬 행이면 흔적을 지금 읽어 의심으로 짓고(못 읽으면 종결하지 않는다), 포기한 행의 아직 못 적은 의심도 함께 적는다.
+        val generation = leadership.claim()?.generation
+        val abandonedNow = if (discriminate && leadership.restartHolds.isDeferred(jobOrderId)) {
+            try {
+                abandonedHolds(journal)
+            } catch (e: Exception) {
+                return answer(CloseResult.NOT_CLOSABLE, "그 작업 지시의 송신 흔적을 읽지 못해 종결하지 않았다(다시 시도): $e")
+            }
+        } else {
+            emptyList()
+        }
+        val pendingSuspicions = abandonedNow + leadership.restartHolds.unpersisted().filter { it.jobOrderId == jobOrderId }
+        val suspicionIds = mutableMapOf<String, Long>()
         val closed = records.inTransaction {
+            suspicionIds.clear()
+            pendingSuspicions.forEach { h -> suspicionIds[h.taskId] = records.recordRestartSuspicion(checkNotNull(generation), instanceId, suspicionWrite(h)) }
             val row = records.closeUnrestored(
                 jobOrderId, instanceId, previous.instanceId, previous.executionId, journal.robotId,
                 if (abandoned != null) RestoreResult.GAVE_UP.name else RestoreResult.DEFERRED.name, restoreReason, basis,
@@ -3187,6 +3531,9 @@ class MissionHost(
             row
         }
         // 커밋한 뒤에만 메모리를 고친다.
+        leadership.restartHolds.hold(abandonedNow)
+        suspicionIds.forEach { (taskId, id) -> leadership.restartHolds.persisted(taskId, id, checkNotNull(generation)) }
+        leadership.restartHolds.clearDeferred(jobOrderId)
         forgetClosed(journal, closed)
         return CloseView(CloseResult.CLOSED, jobOrderId, basis, closed.responseId, null, requestId)
     }
@@ -3197,6 +3544,8 @@ class MissionHost(
      */
     private fun forgetClosed(journal: JournalRow, closed: CloseRow) {
         val jobOrderId = journal.jobOrderId
+        // 미룬 채 종결한 행은 판정 없는 송신 흔적을 해제 가능한 의심으로 넘긴 뒤 미룬 복원의 보류를 걷는다(의심 ID 없는 영구 보류가 남지 않게).
+        if (leadership.restartHolds.isDeferred(jobOrderId)) abandonRestartHolds(journal)
         unclosed.remove(jobOrderId)
         gaveUp.removeAll { it.jobOrderId == jobOrderId }
         deferred.removeAll { it.row.jobOrderId == jobOrderId }
@@ -3497,6 +3846,57 @@ class MissionHost(
         }
 
         /** 실행 id 의 생성 차례. picasso 는 `exec-N` 의 N 을 인스턴스 안에서 늘리기만 하고 다시 쓰지 않는다(`Middleware.forget`). */
+        /**
+         * 앞 세대 송신 후보(순수 함수). 기체 경로 단위([RestartUnit.robot]) 가운데 판단 기록([record])의 같은 시도에 판정이 없고, 앞 세대 요청 흔적
+         * (`requestedAt`)이나 그 시도 태스크의 송신 의도([intents])가 있는 것이다. 해제가 그 태스크의 가장 큰 송신 의도 순번까지 덮었거나([covered], 의도가
+         * 없으면 0) 이미 보류가 있으면([held]) 빠진다. 기록이 다른 시도를 들고 있으면(재작업이 넘김) 그 시도의 태스크가 아니다.
+         */
+        internal fun restartCandidates(
+            jobOrderId: String,
+            executionId: String?,
+            units: List<RestartUnit>,
+            record: JudgmentRecord?,
+            recordId: Long?,
+            intents: Map<String, dev.picasso.ops.host.store.IntentBasis>,
+            covered: Map<String, Long>,
+            held: (String) -> Boolean,
+        ): List<RestartHolds.Hold> {
+            val traces = record?.units.orEmpty().associateBy { it.unitId }
+            return units.filter { it.robot }.mapNotNull { unit ->
+                val trace = traces[unit.unitId]
+                if (trace != null && (trace.verdict != null || trace.attempt != unit.attempt)) return@mapNotNull null
+                val taskId = restartTaskId(jobOrderId, unit.unitId, unit.attempt)
+                val intent = intents[taskId]
+                if (trace?.requestedAt == null && intent == null) return@mapNotNull null
+                val basis = intent?.intentId ?: 0L
+                if ((covered[taskId] ?: -1L) >= basis) return@mapNotNull null
+                if (held(taskId)) return@mapNotNull null
+                RestartHolds.Hold(unit.robotId, jobOrderId, executionId, unit.unitId, unit.attempt, taskId, intent?.revision, basis, recordId)
+            }
+        }
+
+        /** 후보 판정에 쓰는 단위 한 줄: 단위·시도·맡은 기체·기체 경로인가(플릿 운반이면 거짓). */
+        internal data class RestartUnit(val unitId: String, val attempt: Int, val robotId: String, val robot: Boolean)
+
+        /** 그 획득이 앞 세대 송신 후보를 판별하는가 — 정상 종료 인수([Acquired.graceful])가 아니면 참이다([discriminate] 의 범위). */
+        internal fun discriminates(acquired: Acquired): Boolean = !acquired.graceful
+
+        /** 시스템 해제(의심 뒤 붙음)의 해제한 사람 칸. */
+        const val SYSTEM_RELEASER = "system:attached"
+
+        /** 한 pump 에 다시 시도하는 미룬 복원 행 수. */
+        internal const val RESTORE_RETRIES = 2
+
+        /** 송신 문맥 표의 상한. */
+        private const val ISSUE_CONTEXTS = 10_000
+
+        /** 판정 상태(picasso `UnitVerdict.STATES`) — 그 단위의 보류는 판정을 얻으면 닫는다. */
+        private val VERDICT_STATES = dev.picasso.middleware.UnitVerdict.STATES
+
+        /** picasso 가 단위의 그 시도에 쓰는 태스크 id(`작업지시#단위`, 재작업 시도면 `@r<시도>`). 플릿 운반 참조와 같은 식이다. */
+        internal fun restartTaskId(jobOrderId: String, unitId: String, attempt: Int): String =
+            "$jobOrderId#$unitId" + if (attempt > 0) "@r$attempt" else ""
+
         internal fun creationOrder(executionId: String): Long = executionId.substringAfterLast('-').toLongOrNull() ?: Long.MAX_VALUE
 
         /** 현장 시간값 미적용 동안 판정이 기체마다 더하는 이유(S3c 스펙 T8). 화면에 그대로 보인다. */
